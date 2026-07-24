@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or os.environ.get("MEM0_QDRANT_API_KEY")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
@@ -111,6 +112,7 @@ def build_memory(rerank: bool, dynamics_enabled: bool = True):
             "config": {
                 "collection_name": ARGS.collection,
                 "url": QDRANT_URL,
+                "api_key": QDRANT_API_KEY,
                 "embedding_model_dims": EMBED_DIMS,
                 # production Qdrant now requires auth (locked 2026-07); pass the
                 # key when present so this eval runs against the live instance.

@@ -50,6 +50,7 @@ import requests
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or os.environ.get("MEM0_QDRANT_API_KEY")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
@@ -102,6 +103,7 @@ def build_memory():
             "config": {
                 "collection_name": ARGS.collection,
                 "url": QDRANT_URL,
+                "api_key": QDRANT_API_KEY,
                 "embedding_model_dims": EMBED_DIMS,
             },
         },
@@ -141,10 +143,11 @@ def seed_and_update(memory) -> dict:
 
 def cleanup(collection: str) -> bool:
     ok = True
+    qh = {"api-key": QDRANT_API_KEY} if QDRANT_API_KEY else {}
     for cname in (collection, collection + "_entities"):
         try:
-            requests.delete(f"{QDRANT_URL}/collections/{cname}", timeout=15)
-            still = requests.get(f"{QDRANT_URL}/collections/{cname}", timeout=10)
+            requests.delete(f"{QDRANT_URL}/collections/{cname}", headers=qh, timeout=15)
+            still = requests.get(f"{QDRANT_URL}/collections/{cname}", headers=qh, timeout=10)
             if still.status_code == 200 and still.json().get("result"):
                 ok = False
                 print(f"  !! cleanup FALHOU: {cname} ainda existe")

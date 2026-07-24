@@ -225,6 +225,15 @@ def _build_memory_instance(mocker, memory_cls):
     mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
     memory = memory_cls()
     memory.config = mocker.MagicMock()
+    # DeepMem0: a MagicMock config makes the temporality/dynamics sub-configs truthy,
+    # which routes update() through the versioned transition (a new-record + supersede
+    # flow the fully-mocked store can't satisfy) AND feeds a MagicMock window into the
+    # v0.2 reinforcement block (should_reinforce compares it to an int -> TypeError,
+    # a pre-existing breakage of these mock tests). Both sub-configs are None here so
+    # these pure in-place-mechanics tests exercise the legacy path cleanly; versioning
+    # and dynamics have their own dedicated + integration coverage.
+    memory.config.temporality = None
+    memory.config.dynamics = None
     memory.config.custom_instructions = None
     memory.config.custom_update_memory_prompt = None
     memory.api_version = "v1.1"

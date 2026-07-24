@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or os.environ.get("MEM0_QDRANT_API_KEY")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
@@ -93,6 +94,7 @@ def build_memory(rerank: bool, temporality_enabled: bool = True):
             "config": {
                 "collection_name": ARGS.collection,
                 "url": QDRANT_URL,
+                "api_key": QDRANT_API_KEY,
                 "embedding_model_dims": EMBED_DIMS,
             },
         },
@@ -156,7 +158,8 @@ def seed_and_supersede(memory) -> dict:
         marked = _mark_superseded(
             memory.vector_store, memory.db, ids[pair["v2"]], pair["v2"], [ids[pair["v1"]]]
         )
-        assert marked == [ids[pair["v1"]]], f"marking failed for {pair['v1'][:40]!r}"
+        # _mark_superseded returns (superseded_id, superseding_id) PAIRS (v0.4).
+        assert marked == [(ids[pair["v1"]], ids[pair["v2"]])], f"marking failed for {pair['v1'][:40]!r}"
         payload = dict(memory.vector_store.get(vector_id=ids[pair["v1"]]).payload)
         payload["superseded_at"] = t1
         memory.vector_store.update(vector_id=ids[pair["v1"]], payload=payload)

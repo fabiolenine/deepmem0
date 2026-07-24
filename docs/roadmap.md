@@ -149,11 +149,21 @@ How it shipped:
   `created_at`/`superseded_at` (created online on existing collections at startup).
 - **`event_date`** (optional, extraction-time): ISO date when the text clearly anchors *when* a
   fact happened — event-time recorded and exposed; ranking use is future work.
-- Known limitation: in-place `update()` content is visible to earlier anchors (update versioning
-  is future work; the history table keeps the audit trail). The leak is reproduced
-  deterministically by `eval/eval_update_versioning.py` — the executable acceptance criterion
-  for the future work: it XFAILs today by design (ternary verdict: known leak / true fix /
-  unexpected), and `--expect-fixed` turns it into the hard gate once versioning ships.
+- **Update versioning (v0.7)** — SHIPPED. In-place `update()` used to rewrite content while
+  preserving `created_at`, so an earlier `as_of` anchor saw the NEW text (record-time leak). Now,
+  when `temporality.version_on_update` is on (default), `update()` MINTS A NEW VERSION
+  (`created_at` = operation time, current) and marks the prior head superseded — reusing the v0.3
+  supersession retrieval logic, so `as_of` before the edit restores the old text for free. The old
+  id becomes the historical version; `update`/`delete` on a reused (superseded) id resolve to the
+  chain head, so repeated updates never branch. Metadata policy is inherit-by-blacklist (owner,
+  actor_id, classification and arbitrary custom fields carry forward; bookkeeping/derived/prior
+  usage/provenance reset; `event_date` re-inferred from the new text). The transition is strict
+  (verify + compensate; never two currents). Set `version_on_update=false` to keep the legacy
+  in-place behavior (byte-identical storage side-effects). `eval/eval_update_versioning.py`
+  (ternary verdict) now PASSES `--expect-fixed` and is the hard gate; structural invariants
+  (present=v2, exactly-one-current, bidirectional lineage, anti-branching) are covered by
+  `eval/eval_update_versioning_invariants.py` and the pure-helper units in
+  `tests/deepmem0/test_v07_update_versioning.py`.
 
 ## Phase 4 — Ingest-time decoupling (v0.4) — SHIPPED
 

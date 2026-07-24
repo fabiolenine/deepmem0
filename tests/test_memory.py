@@ -612,6 +612,9 @@ def test_update_infer_true_caches_embedding_on_llm_rewrite(mock_sqlite, mock_llm
 
     from mem0.memory.main import Memory as MemoryClass
     memory = MemoryClass(MemoryConfig())
+    # DeepMem0 v0.7: this exercises in-place update mechanics via the infer=True
+    # pipeline; pin the legacy path (versioned update is covered separately).
+    memory.config.temporality.version_on_update = False
 
     memory.add("I love Python now", user_id="test_user", infer=True)
 
@@ -1108,6 +1111,14 @@ class TestHybridSearchWarning:
 
 
 class TestPreserveCustomMetadata:
+
+    @pytest.fixture(autouse=True)
+    def _pin_legacy_update(self, monkeypatch):
+        # DeepMem0 v0.7: these tests assert in-place update MECHANICS (the payload
+        # handed to vector_store.update). Versioning routes update through a
+        # new-record + supersede flow instead, so pin the legacy path here; the
+        # versioned metadata policy is covered by test_v07_* + integration.
+        monkeypatch.setattr("mem0.memory.main._temporality_config", lambda cfg: None)
 
     @patch('mem0.utils.factory.EmbedderFactory.create')
     @patch('mem0.utils.factory.VectorStoreFactory.create')

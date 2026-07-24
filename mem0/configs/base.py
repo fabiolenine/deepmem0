@@ -147,6 +147,16 @@ class MemoryTemporalityConfig(BaseModel):
         default=RERANK_TIE_BAND,
         ge=0,
     )
+    version_on_update: bool = Field(
+        description="DeepMem0 v0.7 (update versioning): when enabled, an in-place update() no longer"
+        " rewrites content while preserving created_at (which leaks new content into older as_of"
+        " anchors). Instead it MINTS A NEW VERSION (created_at=operation time, current) and marks the"
+        " prior version superseded (kept, demoted, restorable by an as_of anchor before superseded_at)."
+        " Active only when ``enabled`` is True. When off (or temporality disabled), update() keeps the"
+        " legacy in-place behavior byte-for-byte. Default on: temporality users get correct record-time"
+        " as_of on updates.",
+        default=True,
+    )
 
 
 class MemoryConfig(BaseModel):
