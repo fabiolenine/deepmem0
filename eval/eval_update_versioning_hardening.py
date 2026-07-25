@@ -44,8 +44,10 @@ def build():
     })
 
 
-def all_points(m):
-    return m.vector_store.list(filters={"user_id": USER})[0]
+def all_points(m, uid=USER):
+    # top_k high enough to enumerate the WHOLE collection in one scroll — the default
+    # (100) silently truncates (critic #10). Test collections hold <1k points.
+    return m.vector_store.list(filters={"user_id": uid}, top_k=10000)[0]
 
 
 def heads(pts):
@@ -250,6 +252,98 @@ def scenario_fault_injection(m):
     check(not (m.vector_store.get(vector_id=v1).payload or {}).get("superseded_by"), "[C] head no longer marked superseded")
 
 
+def scenario_many_to_one_semantic(m):
+    # v0.7.1 CORE FIX: delete of a record involved in v0.3 semantic supersedence
+    # (one fact supersedes MANY) must NOT over-collect the semantic siblings — only
+    # the dedicated update-version lineage is a delete unit.
+    print("== many-to-one semantic supersedence: delete does NOT over-delete siblings ==")
+    wipe(m)
+    a = add(m, "O worker do atlas usa 2 GiB.")
+    b = add(m, "O worker do atlas usa 1 CPU.")
+    c = add(m, "O worker do atlas usa 4 GiB e 2 CPUs.")  # semantically supersedes A and B
+    for x in (a, b):  # semantic marks (NO _mem0_version_* — this is v0.3, not v0.7)
+        p = dict(m.vector_store.get(vector_id=x).payload); p["superseded_by"] = c
+        m.vector_store.update(vector_id=x, payload=p)
+    pc = dict(m.vector_store.get(vector_id=c).payload); pc["supersedes"] = [a, b]
+    m.vector_store.update(vector_id=c, payload=pc)
+    m.delete(a)  # delete a semantically-superseded record
+    left = {p.id for p in all_points(m)}
+    check(a not in left, "delete(A) removed A")
+    check(b in left and c in left, f"semantic siblings B and C SURVIVE (no over-delete) (left={left})")
+    m.delete(c)  # delete the semantic successor
+    left2 = {p.id for p in all_points(m)}
+    check(c not in left2 and b in left2, "delete(C) removed only C; B still survives")
+
+
+def scenario_born_superseded_delete(m):
+    print("== born-superseded record is collected by delete (not left behind) ==")
+    wipe(m)
+    head = add(m, "O servidor nyx roda na versao 9.")
+    now = datetime.now(timezone.utc)
+    p = dict(m.vector_store.get(vector_id=head).payload)
+    p["created_at"] = now.isoformat(); p["updated_at"] = p["created_at"]
+    m.vector_store.update(vector_id=head, payload=p)
+    m.update(head, data="O servidor nyx roda na versao 3.", metadata={"created_at": (now - timedelta(days=10)).isoformat()})
+    born = [pt.id for pt in all_points(m) if pt.id != head]
+    check(len(born) == 1, f"born-superseded record exists ({born})")
+    m.delete(head)  # delete via the current head
+    left = {pt.id for pt in all_points(m)}
+    check(head not in left and (not born or born[0] not in left),
+          f"delete(head) removed head AND the born-superseded record (left={left})")
+
+
+def scenario_reserved_injection(m):
+    print("== reserved lineage fields are stripped from caller metadata (anti-injection) ==")
+    from mem0.utils.temporality import FIELD_VERSION_NEXT, FIELD_VERSION_PREV
+    wipe(m)
+    r = m.add("Fato com injecao de linhagem.", user_id=USER, infer=False,
+              metadata={FIELD_VERSION_NEXT: "evil-id", FIELD_VERSION_PREV: ["evil"], "custom": "ok"})
+    mid = r["results"][0]["id"]
+    pl = m.vector_store.get(vector_id=mid).payload or {}
+    check(FIELD_VERSION_NEXT not in pl and FIELD_VERSION_PREV not in pl, "add: injected _mem0_version_* stripped")
+    check(pl.get("custom") == "ok", "add: legit custom metadata kept")
+    # via legacy/versioned update too
+    r2 = m.update(mid, data="Fato atualizado.", metadata={FIELD_VERSION_NEXT: "evil2"})
+    cur = r2.get("id", mid)
+    check(FIELD_VERSION_NEXT not in (m.vector_store.get(vector_id=cur).payload or {})
+          or (m.vector_store.get(vector_id=cur).payload or {}).get(FIELD_VERSION_NEXT) != "evil2",
+          "update: caller cannot inject _mem0_version_next")
+
+
+def scenario_scope_guard(m):
+    print("== cross-scope version lineage aborts fail-closed (no mutation) ==")
+    wipe(m)
+    va = add(m, "Fato do user A.", uid=USER)
+    vb = m.add("Fato do user B.", user_id="v07_hard_other", infer=False)["results"][0]["id"]
+    # corrupt A's lineage to point across scope
+    pa = dict(m.vector_store.get(vector_id=va).payload); pa["_mem0_version_next"] = vb
+    m.vector_store.update(vector_id=va, payload=pa)
+    raised = False
+    try:
+        m.delete(va)
+    except ValueError:
+        raised = True
+    check(raised, "delete crossing scope raises (fail-closed)")
+    check(m.vector_store.get(vector_id=va) is not None and m.vector_store.get(vector_id=vb) is not None,
+          "neither A nor B deleted (no mutation before abort)")
+    try:
+        m.vector_store.delete(vector_id=vb)
+    except Exception:
+        pass
+
+
+def scenario_pagination(m):
+    print("== all_points enumerates >100 (pagination) ==")
+    import uuid
+    wipe(m)
+    n = 130
+    for i in range(n):
+        m.vector_store.insert(vectors=[[0.01] * 1024], ids=[str(uuid.uuid4())],
+                              payloads=[{"data": f"pag {i}", "user_id": USER}])
+    check(len(all_points(m)) == n, f"all_points returned all {n} (got {len(all_points(m))})")
+    wipe(m)
+
+
 if __name__ == "__main__":
     m = build()
     try:
@@ -257,6 +351,11 @@ if __name__ == "__main__":
         scenario_out_of_order(m)
         scenario_concurrency(m)
         scenario_fault_injection(m)
+        scenario_many_to_one_semantic(m)
+        scenario_born_superseded_delete(m)
+        scenario_reserved_injection(m)
+        scenario_scope_guard(m)
+        scenario_pagination(m)
     finally:
         cleanup()
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FALHAS: {FAILS}")

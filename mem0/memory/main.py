@@ -83,9 +83,14 @@ from mem0.utils.scoring import (
 )
 from mem0.utils.temporality import (
     FIELD_EVENT_DATE,
+    FIELD_LINEAGE_SCHEMA,
     FIELD_SUPERSEDED_AT,
     FIELD_SUPERSEDED_BY,
     FIELD_SUPERSEDES,
+    FIELD_VERSION_NEXT,
+    FIELD_VERSION_PREV,
+    LINEAGE_SCHEMA_VERSION,
+    RESERVED_LINEAGE_FIELDS,
     event_proximity,
     expand_event_window,
     infer_event_anchor_from_query,
@@ -380,7 +385,12 @@ def _build_filters_and_metadata(
               scoped to the provided session(s) and potentially a resolved actor.
     """
 
-    base_metadata_template = deepcopy(input_metadata) if input_metadata else {}
+    # DeepMem0 v0.7.1: strip RESERVED lineage fields from caller metadata so a client
+    # cannot inject a version edge (`_mem0_version_*`) via add — only the versioned
+    # update transition may write them (critic #3).
+    base_metadata_template = {
+        k: deepcopy(v) for k, v in input_metadata.items() if k not in RESERVED_LINEAGE_FIELDS
+    } if input_metadata else {}
     effective_query_filters = deepcopy(input_filters) if input_filters else {}
 
     # ---------- validate and add all provided session ids ----------
@@ -540,46 +550,64 @@ def _mark_superseded(vector_store, db, new_id, new_text, old_ids, new_created_at
 _VERSION_NON_INHERITED = frozenset({
     "data", "hash", "text_lemmatized", "created_at", "updated_at",
     FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_SUPERSEDES, FIELD_EVENT_DATE,
+    FIELD_VERSION_PREV, FIELD_VERSION_NEXT, FIELD_LINEAGE_SCHEMA,
     "reinforced_at", "access_count", "last_accessed",
     "source_doc", "page_start", "page_end", "chunk_index", "content_type",
     "task_id",
 })
 
+# Ownership/scope keys that are IMMUTABLE across versions: a caller can neither
+# change nor ADD a scope the head does not have (issue #4490 for actor_id; the
+# rest closes cross-scope escalation via a versioned update — critic #9).
+_IMMUTABLE_SCOPE = ("user_id", "agent_id", "run_id", "actor_id")
+_LINEAGE_SCOPE_KEYS = ("user_id", "agent_id", "run_id")
+
+
+def _lineage_scope(payload) -> Tuple:
+    """The owner-scope tuple used to fence version-lineage traversal to one owner."""
+    p = payload or {}
+    return tuple(p.get(k) for k in _LINEAGE_SCOPE_KEYS)
+
+
 def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
                             head_id, extract_event_date) -> Dict[str, Any]:
-    """Explicit field-by-field metadata policy for a new version (v2) minted when
-    ``update()`` supersedes ``head_payload`` (v1). Pure — no I/O.
+    """Field-by-field metadata policy for a new version (v2) minted when ``update()``
+    supersedes ``head_payload`` (v1). Pure — no I/O.
 
-    Inherit-by-blacklist: v2 carries FORWARD every field of the head (owner/scope,
-    ``actor_id``, ``role``, ``memory_type``, classification, and any arbitrary
-    custom metadata) EXCEPT the ``_VERSION_NON_INHERITED`` set — derived fields
-    (recomputed by ``_create_memory``), version bookkeeping, the prior version's
-    usage/temporal state (v2 starts neutral), and per-source provenance. Then:
-
-    - caller-provided metadata overrides the inherited values (again never version
-      bookkeeping/derived/provenance, and never ``actor_id`` — see below);
-    - ``created_at = operation_ts`` (this version's record-time) and
-      ``supersedes = [head_id]`` are stamped; ``task_id`` (provenance) is taken from
-      the caller when present;
-    - ``actor_id`` is IMMUTABLE across versions (issue #4490): the head's value
-      always wins, mirroring the legacy in-place update; a caller override is dropped;
-    - ``event_date`` is re-inferred from the NEW text (never carries the old one).
-
-    ``hash``/``text_lemmatized``/``data``/``updated_at`` are (re)computed downstream.
+    Inherit-by-blacklist: v2 carries forward every head field EXCEPT
+    ``_VERSION_NON_INHERITED`` (derived/version-bookkeeping/prior usage/provenance).
+    Then:
+    - RESERVED lineage fields (``_mem0_version_*``) and IMMUTABLE scope keys are
+      STRIPPED from the caller first — a client can neither forge a lineage edge nor
+      change ownership of a version (critic #3/#5/#9);
+    - remaining caller metadata overrides inherited values;
+    - the exact head scope tuple ``(user_id, agent_id, run_id, actor_id)`` is copied
+      INCLUDING ABSENCE (immutable);
+    - ``created_at = operation_ts``; ``_mem0_version_prev = [head_id]`` +
+      ``_mem0_lineage_schema`` stamp the linear update lineage (the shared semantic
+      ``supersedes`` is NOT written by an update — it stays semantic-only);
+    - ``task_id`` from the caller (provenance); ``event_date`` re-inferred from the
+      NEW text.
     """
     caller = dict(caller_metadata or {})
+    for k in RESERVED_LINEAGE_FIELDS:
+        caller.pop(k, None)          # anti-injection: only _version_update writes these
+    for k in _IMMUTABLE_SCOPE:
+        caller.pop(k, None)          # ownership is immutable across versions
     meta: Dict[str, Any] = {
         k: v for k, v in head_payload.items() if k not in _VERSION_NON_INHERITED
     }
     for k, v in caller.items():
         if k not in _VERSION_NON_INHERITED:
             meta[k] = v
+    # exact immutable scope from the head (including absence)
+    for k in _IMMUTABLE_SCOPE:
+        meta.pop(k, None)
+        if k in head_payload:
+            meta[k] = head_payload[k]
     meta["created_at"] = operation_ts
-    meta[FIELD_SUPERSEDES] = [head_id]
-    # actor_id immutable: the head's value wins over any caller override (matches
-    # the legacy path, which re-asserts the existing actor_id after merging metadata).
-    if "actor_id" in head_payload:
-        meta["actor_id"] = head_payload["actor_id"]
+    meta[FIELD_VERSION_PREV] = [head_id]
+    meta[FIELD_LINEAGE_SCHEMA] = LINEAGE_SCHEMA_VERSION
     if caller.get("task_id"):
         meta["task_id"] = caller["task_id"]
     if extract_event_date:
@@ -590,57 +618,73 @@ def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
 
 
 def _resolve_chain_head(get_fn, memory_id, max_hops: int = 64) -> Tuple[str, Any]:
-    """Follow ``superseded_by`` to the current head of a version chain.
+    """Follow the DEDICATED update-version link ``_mem0_version_next`` to the current
+    head of an update-version chain (v0.7.1). NOT ``superseded_by`` — that is shared
+    with semantic supersedence and would branch across mechanisms.
 
-    ``update``/``delete`` operate on the head so that reusing an original (now
-    superseded) id does not branch the chain (roadmap item #7, critic #4).
-    ``get_fn(id)`` returns a store record (with ``.payload``/``.id``) or None.
-    Stops at the first record with no ``superseded_by`` (the head), a dangling
-    link (treats the last valid record as head), a self-reference, or a cycle.
-    Returns ``(head_id, head_record_or_None)``.
+    Used by ``update`` and ``delete``. FAIL-CLOSED (raises, so the operation aborts
+    BEFORE any mutation — critic #2) on a cross-scope lineage edge, a cycle, or hop
+    exhaustion (corruption). A dangling ``version_next`` (successor missing, e.g.
+    purged mid-retry) is treated as the head, preserving retry robustness. A missing
+    start record returns ``(memory_id, None)``. Returns ``(head_id, head_record)``.
     """
-    seen: set = set()
-    cur = memory_id
-    last_id, last_mem = memory_id, None
+    first = get_fn(memory_id)
+    if first is None:
+        return memory_id, None
+    anchor = _lineage_scope(getattr(first, "payload", None) or {})
+    seen = {memory_id}
+    cur_id, cur_mem = memory_id, first
     for _ in range(max_hops):
-        if cur in seen:
-            break
-        seen.add(cur)
-        mem = get_fn(cur)
-        if mem is None:
-            break
-        last_id, last_mem = cur, mem
-        nxt = (getattr(mem, "payload", None) or {}).get(FIELD_SUPERSEDED_BY)
-        if not nxt or nxt == cur:
-            break
-        cur = nxt
-    return last_id, last_mem
+        nxt = (getattr(cur_mem, "payload", None) or {}).get(FIELD_VERSION_NEXT)
+        if not isinstance(nxt, str) or not nxt or nxt == cur_id:
+            return cur_id, cur_mem  # head (no successor / malformed / self)
+        if nxt in seen:
+            raise ValueError(f"Corrupt version lineage: cycle at {nxt}")
+        nxt_mem = get_fn(nxt)
+        if nxt_mem is None:
+            return cur_id, cur_mem  # dangling successor -> current is head
+        if _lineage_scope(getattr(nxt_mem, "payload", None) or {}) != anchor:
+            raise ValueError(f"Cross-scope version lineage edge {cur_id}->{nxt}; aborting")
+        seen.add(nxt)
+        cur_id, cur_mem = nxt, nxt_mem
+    raise ValueError(f"Version lineage exceeded {max_hops} hops from {memory_id}; aborting")
 
 
 def _collect_chain(get_fn, memory_id, max_hops: int = 256) -> List[str]:
-    """Return every id in a version chain reachable from ``memory_id``.
+    """Ids of the WHOLE update-version chain reachable from ``memory_id`` (for delete).
 
-    Walks forward via ``superseded_by`` to the head, then backward from the head
-    via ``supersedes`` (breadth-first over the ancestry). Used by ``delete`` to
-    remove the WHOLE fact (all versions) at once, so no ancestor is left dangling
-    or resurrectable (roadmap item #7, critic #4). Cycle- and dangling-safe.
+    Resolves the head via ``_mem0_version_next``, then walks ``_mem0_version_prev``
+    backward. Uses ONLY the dedicated lineage fields, so semantic supersedence
+    siblings (``supersedes=[A,B]``) are NEVER over-collected (critic #1). FAIL-CLOSED:
+    raises on a cross-scope member, cycle, or size overflow — so ``delete`` validates
+    the whole chain before removing anything. Ordered head-first.
     """
     head_id, head_mem = _resolve_chain_head(get_fn, memory_id, max_hops=max_hops)
+    if head_mem is None:
+        return []
+    anchor = _lineage_scope(getattr(head_mem, "payload", None) or {})
     ids: List[str] = []
     seen: set = set()
-    frontier = [head_id]
-    while frontier and len(seen) < max_hops:
-        cur = frontier.pop()
-        if cur in seen:
+    frontier = [(head_id, head_mem)]
+    while frontier:
+        if len(seen) > max_hops:
+            raise ValueError(f"Version lineage too large (>{max_hops}) from {memory_id}; aborting")
+        cid, cmem = frontier.pop()
+        if cid in seen:
             continue
-        seen.add(cur)
-        mem = head_mem if cur == head_id and head_mem is not None else get_fn(cur)
-        if mem is None:
+        seen.add(cid)
+        if cmem is None:
+            cmem = get_fn(cid)
+        if cmem is None:
             continue
-        ids.append(cur)
-        for anc in (getattr(mem, "payload", None) or {}).get(FIELD_SUPERSEDES) or []:
-            if anc not in seen:
-                frontier.append(anc)
+        if _lineage_scope(getattr(cmem, "payload", None) or {}) != anchor:
+            raise ValueError(f"Cross-scope version lineage member {cid}; aborting")
+        ids.append(cid)
+        prev = (getattr(cmem, "payload", None) or {}).get(FIELD_VERSION_PREV) or []
+        if isinstance(prev, list):
+            for anc in prev:
+                if isinstance(anc, str) and anc and anc not in seen:
+                    frontier.append((anc, None))
     return ids
 
 
@@ -2426,20 +2470,21 @@ class Memory(MemoryBase):
         """
         capture_event("mem0.update", self, {"memory_id": memory_id, "sync_type": "sync"})
 
+        if metadata:  # strip reserved lineage fields (anti-injection, incl. legacy path)
+            metadata = {k: v for k, v in metadata.items() if k not in RESERVED_LINEAGE_FIELDS}
         existing_embeddings = {data: self.embedding_model.embed(data, "update")}
 
-        # DeepMem0 v0.7: report the resolved chain head (the version actually
-        # superseded) as old_id — not the caller's possibly-stale input id (which,
-        # after prior updates, points at a historical version).
-        temp = _temporality_config(self.config)
-        old_id = memory_id
-        if temp is not None and getattr(temp, "version_on_update", False):
-            old_id, _ = _resolve_chain_head(
-                lambda vid: self.vector_store.get(vector_id=vid), memory_id
-            )
-        returned_id = self._update_memory(memory_id, data, existing_embeddings, metadata)
+        # DeepMem0 v0.7.1: the versioned path returns (current_id, superseded_head_id)
+        # resolved INSIDE the transition lock, so old_id matches the version actually
+        # superseded even under concurrency (critic #4). Legacy in-place returns a
+        # single id (current == old).
+        returned = self._update_memory(memory_id, data, existing_embeddings, metadata)
+        if isinstance(returned, tuple):
+            current_id, old_id = returned
+        else:
+            current_id = old_id = returned
         display_first_run_notice(self, "sync", "update")
-        return {"message": "Memory updated successfully!", "id": returned_id, "old_id": old_id}
+        return {"message": "Memory updated successfully!", "id": current_id, "old_id": old_id}
 
     def delete(self, memory_id):
         """
@@ -2450,10 +2495,13 @@ class Memory(MemoryBase):
         """
         capture_event("mem0.delete", self, {"memory_id": memory_id, "sync_type": "sync"})
 
-        # DeepMem0 v0.7: delete removes the WHOLE version chain of the fact (every
-        # version reachable from this id), under the version lock — so no ancestor is
-        # left dangling or resurrectable and no obsolete version can resurface. On
-        # non-versioned data the chain is just the single id.
+        # DeepMem0 v0.7.1: delete removes the WHOLE UPDATE-VERSION chain (only the
+        # dedicated lineage, NEVER semantic supersedence siblings — critic #1), under
+        # the lock. Transactional shape (critic #6): _collect_chain PREFLIGHTS the
+        # whole chain (raises fail-closed on cross-scope/corruption before any
+        # mutation); then delete HISTORICAL versions first and the current HEAD LAST,
+        # so a mid-failure leaves the current fact alive (not only demoted history);
+        # partial failure returns the exact remaining ids for a deterministic retry.
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
             with self._version_lock:
@@ -2462,10 +2510,20 @@ class Memory(MemoryBase):
                 )
                 if not chain:
                     raise ValueError(f"Memory with id {memory_id} not found")
-                for cid in chain:
+                order = list(reversed(chain))  # chain is head-first -> head deleted LAST
+                deleted: List[str] = []
+                for cid in order:
                     existing = self.vector_store.get(vector_id=cid)
-                    if existing is not None:
+                    if existing is None:
+                        continue
+                    try:
                         self._delete_memory(cid, existing)
+                        deleted.append(cid)
+                    except Exception as e:
+                        remaining = [x for x in order if x not in deleted]
+                        logger.error(f"Partial version-chain delete for {memory_id}: {e}; remaining={remaining}")
+                        return {"message": "Memory partially deleted; retry with a remaining id",
+                                "deleted": deleted, "remaining": remaining}
         else:
             existing_memory = self.vector_store.get(vector_id=memory_id)
             if existing_memory is None:
@@ -2604,17 +2662,30 @@ class Memory(MemoryBase):
         return result
 
     def _version_update(self, memory_id, data, existing_embeddings, metadata, temp):
-        """DeepMem0 v0.7 versioned update (roadmap item #7). Under the per-process
-        version lock (so concurrent updates form a LINEAR chain, never two heads):
-        resolve the chain head, mint a new version, and mark the supersession.
-
-        Direction honors record time: an update whose operation timestamp predates
-        the head is BORN superseded by the head (the head stays current), mirroring
-        v0.4 born-superseded for adds — a late/out-of-order update never demotes a
-        fresher fact. Strict + compensating: on any failure after the mint we delete
-        the new version AND restore the head's original payload, so the store never
-        keeps two heads or a dangling pointer. Returns the id CURRENT after the op.
+        """DeepMem0 v0.7.1 versioned update. Under the per-instance version lock
+        (serializes multi-thread on the singleton Memory — the production write path;
+        cross-instance/process needs an external single writer, e.g. the serial MCP
+        worker). Resolves the head via the DEDICATED ``_mem0_version_next`` lineage
+        (fail-closed on cross-scope/cycle — critic #2), mints a new version, and links
+        the lineage in BOTH directions (``version_next`` on the old, ``version_prev``
+        on the new). Keeps writing ``superseded_by``/``superseded_at`` for ranking/
+        as_of but NOT the shared semantic ``supersedes`` (critic #5). Direction honors
+        record time: an update older than the head is born superseded by it (the head
+        stays current and simply gains the older record as a version predecessor).
+        Strict + compensating: on any failure the head is restored to its EXACT
+        original and the new version deleted. Returns ``(current_id, superseded_head_id)``
+        resolved INSIDE the lock so the caller reports lineage matching reality
+        (critic #4).
         """
+        _HEAD_MUT = (FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_VERSION_NEXT, FIELD_VERSION_PREV)
+
+        def _hist(mem_id, old_txt, new_txt, cre, upd, src):
+            try:
+                self.db.add_history(mem_id, old_txt, new_txt, "SUPERSEDED", created_at=cre,
+                                    updated_at=upd, actor_id=src.get("actor_id"), role=src.get("role"))
+            except Exception as e:
+                logger.warning(f"Supersession history record failed for {mem_id}: {e}")
+
         with self._version_lock:
             head_id, head_mem = _resolve_chain_head(
                 lambda vid: self.vector_store.get(vector_id=vid), memory_id
@@ -2632,67 +2703,51 @@ class Memory(MemoryBase):
                 getattr(temp, "extract_event_date", True),
             )
             if born_superseded:
-                # Arriving version is older than the head: born superseded BY the head
-                # (head stays current). superseded_at = head's record-time so an as_of
-                # between operation_ts and the head's created_at still restores it.
-                v2_meta[FIELD_SUPERSEDES] = []
+                # v2 is OLDER than the head: born superseded BY it. In the version
+                # lineage v2 -> head (head gains v2 as a predecessor below). No
+                # predecessor of its own. superseded_at = head's record-time so an
+                # as_of between operation_ts and it still restores v2.
+                v2_meta[FIELD_VERSION_PREV] = []
+                v2_meta[FIELD_VERSION_NEXT] = head_id
                 v2_meta[FIELD_SUPERSEDED_BY] = head_id
                 v2_meta[FIELD_SUPERSEDED_AT] = head_payload.get("created_at") or operation_ts
 
-            head_marked = False
+            head_restore = {**head_payload, **{k: head_payload.get(k) for k in _HEAD_MUT}}
+            head_modified = False
             new_id = None
             try:
                 new_id = self._create_memory(data, existing_embeddings, metadata=v2_meta)
                 session_filters = {k: v2_meta[k] for k in ("user_id", "agent_id", "run_id") if v2_meta.get(k)}
                 self._link_entities_for_memory(new_id, data, session_filters)
                 if born_superseded:
-                    try:
-                        self.db.add_history(
-                            new_id, data, head_payload.get("data"), "SUPERSEDED",
-                            created_at=operation_ts, updated_at=operation_ts,
-                            actor_id=head_payload.get("actor_id"), role=head_payload.get("role"),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Born-superseded history record failed for {new_id}: {e}")
-                    chk = self.vector_store.get(vector_id=new_id)
-                    if chk is None or (getattr(chk, "payload", None) or {}).get(FIELD_SUPERSEDED_BY) != head_id:
-                        raise RuntimeError(
-                            f"Version transition verification failed: {new_id} not born superseded by {head_id}"
-                        )
+                    head_prev = list(head_payload.get(FIELD_VERSION_PREV) or [])
+                    head_prev.append(new_id)
+                    self.vector_store.update(vector_id=head_id, payload={**head_payload, FIELD_VERSION_PREV: head_prev})
+                    head_modified = True
+                    _hist(new_id, data, head_payload.get("data"), operation_ts, operation_ts, head_payload)
+                    cp = (getattr(self.vector_store.get(vector_id=new_id), "payload", None) or {})
+                    if cp.get(FIELD_VERSION_NEXT) != head_id:
+                        raise RuntimeError(f"Version transition verify failed: {new_id} not born superseded by {head_id}")
                     current_id = head_id
                 else:
                     self.vector_store.update(
                         vector_id=head_id,
-                        payload={**head_payload, FIELD_SUPERSEDED_BY: new_id, FIELD_SUPERSEDED_AT: operation_ts},
+                        payload={**head_payload, FIELD_SUPERSEDED_BY: new_id,
+                                 FIELD_SUPERSEDED_AT: operation_ts, FIELD_VERSION_NEXT: new_id},
                     )
-                    head_marked = True
-                    try:
-                        self.db.add_history(
-                            head_id, head_payload.get("data"), data, "SUPERSEDED",
-                            created_at=head_payload.get("created_at"), updated_at=operation_ts,
-                            actor_id=head_payload.get("actor_id"), role=head_payload.get("role"),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Supersession history record failed for {head_id}: {e}")
+                    head_modified = True
+                    _hist(head_id, head_payload.get("data"), data, head_payload.get("created_at"), operation_ts, head_payload)
                     check = self.vector_store.get(vector_id=head_id)
-                    if check is None or (getattr(check, "payload", None) or {}).get(FIELD_SUPERSEDED_BY) != new_id:
-                        raise RuntimeError(
-                            f"Version transition verification failed: head {head_id} not superseded_by {new_id}"
-                        )
+                    cp = (getattr(check, "payload", None) or {}) if check is not None else None
+                    if cp is None or cp.get(FIELD_VERSION_NEXT) != new_id or cp.get(FIELD_SUPERSEDED_BY) != new_id:
+                        raise RuntimeError(f"Version transition verify failed: head {head_id} not linked to {new_id}")
                     if self.vector_store.get(vector_id=new_id) is None:
-                        raise RuntimeError(
-                            f"Version transition verification failed: new version {new_id} missing"
-                        )
+                        raise RuntimeError(f"Version transition verify failed: new version {new_id} missing")
                     current_id = new_id
             except Exception:
-                if head_marked:
+                if head_modified:
                     try:
-                        # set_payload MERGES, so explicitly NULL the marking to undo it
-                        # (writing the original payload alone would not remove the keys).
-                        self.vector_store.update(
-                            vector_id=head_id,
-                            payload={**head_payload, FIELD_SUPERSEDED_BY: None, FIELD_SUPERSEDED_AT: None},
-                        )
+                        self.vector_store.update(vector_id=head_id, payload=head_restore)
                     except Exception as re_:
                         logger.error(f"Compensation restore of head {head_id} failed: {re_}")
                 if new_id is not None:
@@ -2701,10 +2756,8 @@ class Memory(MemoryBase):
                     except Exception as ce:
                         logger.error(f"Compensation delete of {new_id} failed: {ce}")
                 raise
-            logger.info(
-                f"Versioned update: head={head_id} new={new_id} current={current_id} born_superseded={born_superseded}"
-            )
-            return current_id
+            logger.info(f"Versioned update: head={head_id} new={new_id} current={current_id} born={born_superseded}")
+            return current_id, head_id
 
     def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)
@@ -4393,19 +4446,19 @@ class AsyncMemory(MemoryBase):
         """
         capture_event("mem0.update", self, {"memory_id": memory_id, "sync_type": "async"})
 
+        if metadata:  # strip reserved lineage fields (anti-injection, incl. legacy path)
+            metadata = {k: v for k, v in metadata.items() if k not in RESERVED_LINEAGE_FIELDS}
         embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
         existing_embeddings = {data: embeddings}
 
-        # DeepMem0 v0.7: report the resolved chain head as old_id (not the stale input).
-        temp = _temporality_config(self.config)
-        old_id = memory_id
-        if temp is not None and getattr(temp, "version_on_update", False):
-            old_id, _ = await asyncio.to_thread(
-                _resolve_chain_head, lambda vid: self.vector_store.get(vector_id=vid), memory_id
-            )
-        returned_id = await self._update_memory(memory_id, data, existing_embeddings, metadata)
+        # DeepMem0 v0.7.1: old_id comes from inside the transition lock (critic #4).
+        returned = await self._update_memory(memory_id, data, existing_embeddings, metadata)
+        if isinstance(returned, tuple):
+            current_id, old_id = returned
+        else:
+            current_id = old_id = returned
         await display_first_run_notice_async(self, "async", "update")
-        return {"message": "Memory updated successfully!", "id": returned_id, "old_id": old_id}
+        return {"message": "Memory updated successfully!", "id": current_id, "old_id": old_id}
 
     async def delete(self, memory_id):
         """
@@ -4416,7 +4469,9 @@ class AsyncMemory(MemoryBase):
         """
         capture_event("mem0.delete", self, {"memory_id": memory_id, "sync_type": "async"})
 
-        # DeepMem0 v0.7: delete removes the WHOLE version chain (under the lock).
+        # DeepMem0 v0.7.1: whole UPDATE-version chain, transactional (preflight via
+        # _collect_chain which raises fail-closed; historical-first, head-last; partial
+        # failure returns remaining ids). Semantic supersedence siblings are untouched.
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
             async with self._version_lock:
@@ -4425,10 +4480,20 @@ class AsyncMemory(MemoryBase):
                 )
                 if not chain:
                     raise ValueError(f"Memory with id {memory_id} not found")
-                for cid in chain:
+                order = list(reversed(chain))
+                deleted: List[str] = []
+                for cid in order:
                     existing = await asyncio.to_thread(self.vector_store.get, vector_id=cid)
-                    if existing is not None:
+                    if existing is None:
+                        continue
+                    try:
                         await self._delete_memory(cid, existing)
+                        deleted.append(cid)
+                    except Exception as e:
+                        remaining = [x for x in order if x not in deleted]
+                        logger.error(f"Partial version-chain delete for {memory_id}: {e}; remaining={remaining}")
+                        return {"message": "Memory partially deleted; retry with a remaining id",
+                                "deleted": deleted, "remaining": remaining}
         else:
             existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
             if existing_memory is None:
@@ -4598,12 +4663,19 @@ class AsyncMemory(MemoryBase):
         return result
 
     async def _version_update(self, memory_id, data, existing_embeddings, metadata, temp):
-        """Async mirror of ``_version_update`` (DeepMem0 v0.7 versioned update,
-        roadmap item #7): under the async version lock, resolve the chain head, mint
-        a new version, mark the supersession honoring record-time (out-of-order
-        updates are born superseded by the head), verify strictly, and compensate
-        (delete the new version + restore the head) on any failure. Returns the id
-        CURRENT after the transition."""
+        """Async mirror of ``_version_update`` (DeepMem0 v0.7.1). Dedicated
+        ``_mem0_version_next/prev`` lineage, fail-closed scope guard, born-superseded
+        reverse link, strict verify + compensation restoring the head's exact original.
+        Returns ``(current_id, superseded_head_id)`` from inside the lock."""
+        _HEAD_MUT = (FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_VERSION_NEXT, FIELD_VERSION_PREV)
+
+        async def _hist(mem_id, old_txt, new_txt, cre, upd, src):
+            try:
+                await asyncio.to_thread(self.db.add_history, mem_id, old_txt, new_txt, "SUPERSEDED",
+                                        created_at=cre, updated_at=upd, actor_id=src.get("actor_id"), role=src.get("role"))
+            except Exception as e:
+                logger.warning(f"Supersession history record failed for {mem_id}: {e}")
+
         async with self._version_lock:
             head_id, head_mem = await asyncio.to_thread(
                 _resolve_chain_head, lambda vid: self.vector_store.get(vector_id=vid), memory_id
@@ -4621,67 +4693,48 @@ class AsyncMemory(MemoryBase):
                 getattr(temp, "extract_event_date", True),
             )
             if born_superseded:
-                v2_meta[FIELD_SUPERSEDES] = []
+                v2_meta[FIELD_VERSION_PREV] = []
+                v2_meta[FIELD_VERSION_NEXT] = head_id
                 v2_meta[FIELD_SUPERSEDED_BY] = head_id
                 v2_meta[FIELD_SUPERSEDED_AT] = head_payload.get("created_at") or operation_ts
 
-            head_marked = False
+            head_restore = {**head_payload, **{k: head_payload.get(k) for k in _HEAD_MUT}}
+            head_modified = False
             new_id = None
             try:
                 new_id = await self._create_memory(data, existing_embeddings, metadata=v2_meta)
                 session_filters = {k: v2_meta[k] for k in ("user_id", "agent_id", "run_id") if v2_meta.get(k)}
                 await self._link_entities_for_memory(new_id, data, session_filters)
                 if born_superseded:
-                    try:
-                        await asyncio.to_thread(
-                            self.db.add_history,
-                            new_id, data, head_payload.get("data"), "SUPERSEDED",
-                            created_at=operation_ts, updated_at=operation_ts,
-                            actor_id=head_payload.get("actor_id"), role=head_payload.get("role"),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Born-superseded history record failed for {new_id}: {e}")
-                    chk = await asyncio.to_thread(self.vector_store.get, vector_id=new_id)
-                    if chk is None or (getattr(chk, "payload", None) or {}).get(FIELD_SUPERSEDED_BY) != head_id:
-                        raise RuntimeError(
-                            f"Version transition verification failed: {new_id} not born superseded by {head_id}"
-                        )
+                    head_prev = list(head_payload.get(FIELD_VERSION_PREV) or [])
+                    head_prev.append(new_id)
+                    await asyncio.to_thread(self.vector_store.update, vector_id=head_id,
+                                            payload={**head_payload, FIELD_VERSION_PREV: head_prev})
+                    head_modified = True
+                    await _hist(new_id, data, head_payload.get("data"), operation_ts, operation_ts, head_payload)
+                    _m = await asyncio.to_thread(self.vector_store.get, vector_id=new_id)
+                    if (getattr(_m, "payload", None) or {}).get(FIELD_VERSION_NEXT) != head_id:
+                        raise RuntimeError(f"Version transition verify failed: {new_id} not born superseded by {head_id}")
                     current_id = head_id
                 else:
                     await asyncio.to_thread(
-                        self.vector_store.update,
-                        vector_id=head_id,
-                        payload={**head_payload, FIELD_SUPERSEDED_BY: new_id, FIELD_SUPERSEDED_AT: operation_ts},
+                        self.vector_store.update, vector_id=head_id,
+                        payload={**head_payload, FIELD_SUPERSEDED_BY: new_id,
+                                 FIELD_SUPERSEDED_AT: operation_ts, FIELD_VERSION_NEXT: new_id},
                     )
-                    head_marked = True
-                    try:
-                        await asyncio.to_thread(
-                            self.db.add_history,
-                            head_id, head_payload.get("data"), data, "SUPERSEDED",
-                            created_at=head_payload.get("created_at"), updated_at=operation_ts,
-                            actor_id=head_payload.get("actor_id"), role=head_payload.get("role"),
-                        )
-                    except Exception as e:
-                        logger.warning(f"Supersession history record failed for {head_id}: {e}")
+                    head_modified = True
+                    await _hist(head_id, head_payload.get("data"), data, head_payload.get("created_at"), operation_ts, head_payload)
                     check = await asyncio.to_thread(self.vector_store.get, vector_id=head_id)
-                    if check is None or (getattr(check, "payload", None) or {}).get(FIELD_SUPERSEDED_BY) != new_id:
-                        raise RuntimeError(
-                            f"Version transition verification failed: head {head_id} not superseded_by {new_id}"
-                        )
+                    cp = (getattr(check, "payload", None) or {}) if check is not None else None
+                    if cp is None or cp.get(FIELD_VERSION_NEXT) != new_id or cp.get(FIELD_SUPERSEDED_BY) != new_id:
+                        raise RuntimeError(f"Version transition verify failed: head {head_id} not linked to {new_id}")
                     if await asyncio.to_thread(self.vector_store.get, vector_id=new_id) is None:
-                        raise RuntimeError(
-                            f"Version transition verification failed: new version {new_id} missing"
-                        )
+                        raise RuntimeError(f"Version transition verify failed: new version {new_id} missing")
                     current_id = new_id
             except Exception:
-                if head_marked:
+                if head_modified:
                     try:
-                        # set_payload MERGES, so explicitly NULL the marking to undo it.
-                        await asyncio.to_thread(
-                            self.vector_store.update,
-                            vector_id=head_id,
-                            payload={**head_payload, FIELD_SUPERSEDED_BY: None, FIELD_SUPERSEDED_AT: None},
-                        )
+                        await asyncio.to_thread(self.vector_store.update, vector_id=head_id, payload=head_restore)
                     except Exception as re_:
                         logger.error(f"Compensation restore of head {head_id} failed: {re_}")
                 if new_id is not None:
@@ -4690,10 +4743,8 @@ class AsyncMemory(MemoryBase):
                     except Exception as ce:
                         logger.error(f"Compensation delete of {new_id} failed: {ce}")
                 raise
-            logger.info(
-                f"Versioned update (async): head={head_id} new={new_id} current={current_id} born_superseded={born_superseded}"
-            )
-            return current_id
+            logger.info(f"Versioned update (async): head={head_id} new={new_id} current={current_id} born={born_superseded}")
+            return current_id, head_id
 
     async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)

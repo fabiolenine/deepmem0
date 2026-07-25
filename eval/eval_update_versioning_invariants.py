@@ -63,7 +63,7 @@ try:
     check(p1 is not None and p1.get("created_at") == t0, "v1 mantém created_at=T0 (R14/eval premissa)")
     check(p1.get("superseded_by") == v2, "v1.superseded_by == v2")
     check(p1.get("superseded_at") is not None, "v1.superseded_at setado")
-    check(p2.get("supersedes") == [v1], "v2.supersedes == [v1] (direção reversa)")
+    check(p2.get("_mem0_version_prev") == [v1], "v2._mem0_version_prev == [v1] (linhagem reversa)")
     check(p2.get("superseded_by") in (None, ""), "v2 não é superseded (é vigente)")
     check("mysql" in p1["data"].lower(), "v1 mantém conteúdo antigo (mysql)")
     check("postgresql" in p2["data"].lower(), "v2 tem conteúdo novo (postgresql)")
@@ -92,7 +92,7 @@ try:
     p1b, p2b, p3 = payload(m, v1), payload(m, v2), payload(m, v3)
     check(p1b.get("superseded_by") == v2, "v1 ainda aponta p/ v2 (first-marking-wins, sem re-marcar)")
     check(p2b.get("superseded_by") == v3, "v2 agora superseded_by v3 (resolveu p/ a cabeça!)")
-    check(p3.get("supersedes") == [v2], "v3.supersedes == [v2]")
+    check(p3.get("_mem0_version_prev") == [v2], "v3._mem0_version_prev == [v2]")
     check(not p3.get("superseded_by"), "v3 é a nova cabeça vigente")
     sup2 = {vid: (payload(m, vid) or {}).get("superseded_by") for vid in (v1, v2, v3)}
     currents2 = [vid for vid, s in sup2.items() if not s]

@@ -45,6 +45,19 @@ FIELD_EVENT_DATE = "event_date"
 
 TEMPORALITY_FIELDS = (FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_SUPERSEDES, FIELD_EVENT_DATE)
 
+# DeepMem0 v0.7.1: dedicated, NAMESPACED update-version lineage. The semantic
+# supersedence fields above are SHARED by v0.3 (one fact supersedes MANY:
+# supersedes=[A,B]) and v0.4 born-supersedence, so navigating them for delete
+# over-collects semantic siblings. These fields carry ONLY the linear update
+# lineage; delete/resolve follow them exclusively. Written ONLY by the versioned
+# update transition and RESERVED — stripped from any caller-supplied metadata at
+# every public write boundary so a client can't inject a destructive edge.
+FIELD_VERSION_NEXT = "_mem0_version_next"   # on the OLDER version -> successor id (str)
+FIELD_VERSION_PREV = "_mem0_version_prev"   # on the NEWER version -> [predecessor id(s)]
+FIELD_LINEAGE_SCHEMA = "_mem0_lineage_schema"
+LINEAGE_SCHEMA_VERSION = 1
+RESERVED_LINEAGE_FIELDS = frozenset({FIELD_VERSION_NEXT, FIELD_VERSION_PREV, FIELD_LINEAGE_SCHEMA})
+
 _DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})([T ].*)?$")
 
 
