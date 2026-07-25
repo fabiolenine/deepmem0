@@ -2857,7 +2857,14 @@ class Memory(MemoryBase):
         if own_intent:
             op_id = str(uuid.uuid4())
             if self.db is not None:
-                self.db.begin_delete(op_id, memory_id, scope=json.dumps(session_filters, sort_keys=True))
+                before_image = json.dumps({
+                    "data": prev_value, "created_at": created_at,
+                    "actor_id": existing_memory.payload.get("actor_id"),
+                    "role": existing_memory.payload.get("role"),
+                }, sort_keys=True)
+                self.db.begin_delete(op_id, memory_id,
+                                     scope=json.dumps(session_filters, sort_keys=True),
+                                     before_image=before_image)
         self.vector_store.delete(vector_id=memory_id)
         # Tombstone is IDEMPOTENT: never duplicate the DELETE row on retry/reconcile.
         if self.db is not None and not self.db.has_delete_tombstone(memory_id):
@@ -2903,13 +2910,32 @@ class Memory(MemoryBase):
         for intent in pending:
             mid, op = intent["memory_id"], intent["op_id"]
             try:
+                before = {}
+                if intent.get("before_image"):
+                    try:
+                        before = json.loads(intent["before_image"])
+                    except Exception:
+                        before = {}
                 existing = self.vector_store.get(vector_id=mid)
                 if existing is not None:
-                    self.vector_store.delete(vector_id=mid)
+                    # ABA guard: only delete if the CURRENT vector is the SAME memory the
+                    # intent targeted (created_at identity). A REUSED id (import/restore/manual)
+                    # is SPARED — we never delete a different memory that took the id.
+                    cur_created = (existing.payload or {}).get("created_at")
+                    orig_created = before.get("created_at")
+                    if orig_created and cur_created and cur_created != orig_created:
+                        logger.warning(f"Reconcile: id {mid} appears REUSED (created_at differs) — sparing current vector")
+                    else:
+                        self.vector_store.delete(vector_id=mid)
                 if not self.db.has_delete_tombstone(mid):
+                    # faithful tombstone from the before-image (survives a crash that hit
+                    # before the tombstone was written)
                     self.db.add_history(
-                        mid, None, None, "DELETE",
-                        updated_at=datetime.now(timezone.utc).isoformat(), is_deleted=1,
+                        mid, before.get("data"), None, "DELETE",
+                        created_at=before.get("created_at"),
+                        updated_at=datetime.now(timezone.utc).isoformat(),
+                        actor_id=before.get("actor_id"), role=before.get("role"),
+                        is_deleted=1,
                     )
                 self.db.commit_delete(op)
                 reconciled += 1
@@ -4899,8 +4925,14 @@ class AsyncMemory(MemoryBase):
         if own_intent:
             op_id = str(uuid.uuid4())
             if self.db is not None:
+                before_image = json.dumps({
+                    "data": prev_value, "created_at": created_at,
+                    "actor_id": existing_memory.payload.get("actor_id"),
+                    "role": existing_memory.payload.get("role"),
+                }, sort_keys=True)
                 await asyncio.to_thread(
-                    self.db.begin_delete, op_id, memory_id, json.dumps(session_filters, sort_keys=True)
+                    self.db.begin_delete, op_id, memory_id,
+                    json.dumps(session_filters, sort_keys=True), before_image,
                 )
         await asyncio.to_thread(self.vector_store.delete, vector_id=memory_id)
         # Tombstone is IDEMPOTENT: never duplicate the DELETE row on retry/reconcile.
@@ -4942,13 +4974,32 @@ class AsyncMemory(MemoryBase):
         for intent in pending:
             mid, op = intent["memory_id"], intent["op_id"]
             try:
+                before = {}
+                if intent.get("before_image"):
+                    try:
+                        before = json.loads(intent["before_image"])
+                    except Exception:
+                        before = {}
                 existing = self.vector_store.get(vector_id=mid)
                 if existing is not None:
-                    self.vector_store.delete(vector_id=mid)
+                    # ABA guard: only delete if the CURRENT vector is the SAME memory the
+                    # intent targeted (created_at identity). A REUSED id (import/restore/manual)
+                    # is SPARED — we never delete a different memory that took the id.
+                    cur_created = (existing.payload or {}).get("created_at")
+                    orig_created = before.get("created_at")
+                    if orig_created and cur_created and cur_created != orig_created:
+                        logger.warning(f"Reconcile: id {mid} appears REUSED (created_at differs) — sparing current vector")
+                    else:
+                        self.vector_store.delete(vector_id=mid)
                 if not self.db.has_delete_tombstone(mid):
+                    # faithful tombstone from the before-image (survives a crash that hit
+                    # before the tombstone was written)
                     self.db.add_history(
-                        mid, None, None, "DELETE",
-                        updated_at=datetime.now(timezone.utc).isoformat(), is_deleted=1,
+                        mid, before.get("data"), None, "DELETE",
+                        created_at=before.get("created_at"),
+                        updated_at=datetime.now(timezone.utc).isoformat(),
+                        actor_id=before.get("actor_id"), role=before.get("role"),
+                        is_deleted=1,
                     )
                 self.db.commit_delete(op)
                 reconciled += 1

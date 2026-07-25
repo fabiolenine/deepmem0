@@ -151,23 +151,36 @@ class SQLiteManager:
     def _create_delete_intents_table(self) -> None:
         """DeepMem0 v0.7.2 — durable delete-intent journal (roadmap item #7).
 
-        A delete becomes crash-consistent: a ``pending`` intent is written BEFORE
-        the vector delete + tombstone and flipped to ``committed`` after. The
-        AUTHORITY on completion is this row's state, NOT the history tombstone —
-        so a crash mid-delete is distinguishable from a completed delete and can be
-        reconciled (finish + commit) instead of vanishing without a trace or looking
-        done while the vector is still live. Additive: never touches ``history``.
+        A delete becomes crash-consistent: an intent ROW is written BEFORE the vector
+        delete + tombstone and DELETED after (``commit_delete``). The AUTHORITY on
+        completion is ROW PRESENCE — a row means the delete is in-flight/crashed; no row
+        means it completed (the history tombstone is the durable audit). So a crash
+        mid-delete is distinguishable from a completed one and can be reconciled
+        (finish + commit). ``before_image`` (JSON: data/created_at/actor_id/role) lets
+        a reconciled tombstone stay FAITHFUL even when the crash happened before the
+        tombstone was written. Bounded by construction (committed rows are removed).
+        Additive: never touches ``history``.
         """
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
+                cur = self.connection.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='delete_intents'")
+                if cur.fetchone() is not None:
+                    cur.execute("PRAGMA table_info(delete_intents)")
+                    cols = {row[1] for row in cur.fetchall()}
+                    if "before_image" not in cols:
+                        # Pre-final v0.7.2 schema (had `state`, no `before_image`). This is a
+                        # TRANSIENT crash-recovery journal never shipped, so no real pending
+                        # intents exist — rebuild rather than in-place migrate.
+                        cur.execute("DROP TABLE delete_intents")
                 self.connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS delete_intents (
                         op_id        TEXT PRIMARY KEY,
                         memory_id    TEXT NOT NULL,
                         scope        TEXT,
-                        state        TEXT NOT NULL,
+                        before_image TEXT,
                         created_at   DATETIME,
                         updated_at   DATETIME
                     )
@@ -179,8 +192,9 @@ class SQLiteManager:
                 logger.error(f"Failed to create delete_intents table: {e}")
                 raise
 
-    def begin_delete(self, op_id: str, memory_id: str, scope: Optional[str] = None) -> None:
-        """Record a delete intent as ``pending`` (before the vector delete)."""
+    def begin_delete(self, op_id: str, memory_id: str, scope: Optional[str] = None,
+                     before_image: Optional[str] = None) -> None:
+        """Record an in-flight delete intent (before the vector delete)."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             try:
@@ -188,10 +202,10 @@ class SQLiteManager:
                 self.connection.execute(
                     """
                     INSERT OR REPLACE INTO delete_intents
-                        (op_id, memory_id, scope, state, created_at, updated_at)
-                    VALUES (?, ?, ?, 'pending', ?, ?)
+                        (op_id, memory_id, scope, before_image, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                    (op_id, memory_id, scope, now, now),
+                    (op_id, memory_id, scope, before_image, now, now),
                 )
                 self.connection.execute("COMMIT")
             except Exception as e:
@@ -200,15 +214,12 @@ class SQLiteManager:
                 raise
 
     def commit_delete(self, op_id: str) -> None:
-        """Flip a delete intent to ``committed`` (after vector delete + tombstone)."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Mark a delete complete by REMOVING its intent row (bounded; the history
+        tombstone is the durable audit, so committed rows are not retained)."""
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
-                self.connection.execute(
-                    "UPDATE delete_intents SET state='committed', updated_at=? WHERE op_id=?",
-                    (now, op_id),
-                )
+                self.connection.execute("DELETE FROM delete_intents WHERE op_id=?", (op_id,))
                 self.connection.execute("COMMIT")
             except Exception as e:
                 self.connection.execute("ROLLBACK")
@@ -216,13 +227,14 @@ class SQLiteManager:
                 raise
 
     def list_pending_deletes(self) -> List[Dict[str, Any]]:
-        """Delete intents still ``pending`` (for reconciliation at startup)."""
+        """In-flight delete intents (every row is pending by construction — a completed
+        delete leaves NO row). For reconciliation at startup."""
         with self._lock:
             cur = self.connection.execute(
-                "SELECT op_id, memory_id, scope, created_at FROM delete_intents WHERE state='pending'"
+                "SELECT op_id, memory_id, scope, before_image FROM delete_intents"
             )
             rows = cur.fetchall()
-        return [{"op_id": r[0], "memory_id": r[1], "scope": r[2], "created_at": r[3]} for r in rows]
+        return [{"op_id": r[0], "memory_id": r[1], "scope": r[2], "before_image": r[3]} for r in rows]
 
     def has_delete_tombstone(self, memory_id: str) -> bool:
         """Whether a DELETE tombstone already exists for this id (idempotency guard)."""
