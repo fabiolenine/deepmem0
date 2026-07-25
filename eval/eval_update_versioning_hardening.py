@@ -344,6 +344,101 @@ def scenario_pagination(m):
     wipe(m)
 
 
+def _pending_ids(m):
+    return {p["memory_id"] for p in m.db.list_pending_deletes()}
+
+
+def scenario_intent_journal(m):
+    print("== intent journal: crash em cada ponto -> reconcile converge, tombstone único ==")
+    wipe(m)
+    # A) crash APÓS pending, ANTES do vetor: dado NÃO se perde; reconcile completa.
+    a = add(m, "intent journal fato A")
+    orig = _wrap_fail(m.vector_store, "delete", lambda *x, **k: True)  # vetor sempre falha
+    m.delete(a)  # caminho versionado -> retorna parcial (não levanta)
+    m.vector_store.delete = orig
+    check(a in _pending_ids(m), "A: intent PENDING após falha do vetor")
+    check(m.vector_store.get(vector_id=a) is not None, "A: vetor VIVO (delete falhou) — sem perda de dado")
+    m.reconcile_pending_deletes()
+    check(a not in _pending_ids(m), "A: reconcile limpou o pending")
+    check(m.vector_store.get(vector_id=a) is None, "A: reconcile removeu o vetor")
+    check(m.db.has_delete_tombstone(a), "A: tombstone garantido pelo reconcile")
+
+    # B) crash APÓS vetor+tombstone, ANTES do commit: reconcile idempotente (sem duplicar).
+    b = add(m, "intent journal fato B")
+    orig_c = m.db.commit_delete
+    m.db.commit_delete = lambda *x, **k: (_ for _ in ()).throw(RuntimeError("inject commit"))
+    try:
+        m.delete(b)
+    except Exception:
+        pass
+    m.db.commit_delete = orig_c
+    check(b in _pending_ids(m), "B: intent PENDING (commit falhou)")
+    check(m.vector_store.get(vector_id=b) is None, "B: vetor já removido (delete ocorreu)")
+    t_before = sum(1 for h in m.db.get_history(b) if h["is_deleted"])
+    m.reconcile_pending_deletes()
+    t_after = sum(1 for h in m.db.get_history(b) if h["is_deleted"])
+    check(b not in _pending_ids(m), "B: reconcile commitou o intent")
+    check(t_before == t_after == 1, f"B: tombstone NÃO duplicado (before={t_before} after={t_after})")
+
+    # C) delete concluído é DISTINGUÍVEL de um pendente (autoridade = estado do intent).
+    c = add(m, "intent journal fato C")
+    m.delete(c)
+    check(c not in _pending_ids(m), "C: delete concluído -> nenhum intent pendente")
+    check(m.db.has_delete_tombstone(c), "C: tombstone presente")
+
+
+def scenario_partial_chain_delete(m):
+    print("== falha parcial de delete de cadeia: {deleted, remaining}, head vivo, retry converge ==")
+    wipe(m)
+    v1 = add(m, "cadeia parcial v1")
+    m.update(v1, "cadeia parcial v2")
+    m.update(v1, "cadeia parcial v3")
+    pts = all_points(m)
+    head = heads(pts)[0].id
+    hist = [p.id for p in pts if (p.payload or {}).get("superseded_by")]  # v1, v2
+    # falha SÓ no delete do HEAD (deletado por ÚLTIMO) -> históricos saem, head fica
+    orig = _wrap_fail(m.vector_store, "delete", lambda *a, **k: k.get("vector_id") == head)
+    res = m.delete(v1)  # delete via v1 -> coleta a cadeia inteira
+    m.vector_store.delete = orig
+    check(isinstance(res, dict) and res.get("remaining") == [head], f"remaining == [head] (got {res})")
+    check(set(res.get("deleted", [])) == set(hist), f"deleted == históricos (got {res.get('deleted')})")
+    check(m.vector_store.get(vector_id=head) is not None, "head VIVO após falha parcial")
+    for h in hist:
+        check(m.vector_store.get(vector_id=h) is None, f"histórico {h[:8]} removido")
+    res2 = m.delete(head)  # retry sem falha
+    check(m.vector_store.get(vector_id=head) is None, "retry removeu o head")
+
+
+def scenario_delete_residue(m):
+    print("== resíduo pós-delete: tombstones por versão + sem linked_memory_ids pendurado ==")
+    wipe(m)
+    a1 = add(m, "residuo fato um")
+    a2 = add(m, "residuo fato dois")
+    # SEMEIA uma entidade determinística (SEM extração LLM) ligada a a1 E a2.
+    ent_text = "Entidade Residuo"
+    emb = m.embedding_model.embed(ent_text, "add")
+    m.entity_store.insert(
+        vectors=[emb], ids=["a0000000-0000-4000-8000-000000000001"],  # UUID fixo válido
+        payloads=[{"data": ent_text, "entity_type": "concept",
+                   "linked_memory_ids": [a1, a2], "user_id": USER}],
+    )
+
+    def _linked():
+        out = set()
+        for e in m.entity_store.list(filters={"user_id": USER}, top_k=10000)[0]:
+            for mid in (e.payload or {}).get("linked_memory_ids", []):
+                out.add(mid)
+        return out
+
+    m.delete(a1)  # a1 sai; entidade SOBREVIVE com a2
+    check(m.db.has_delete_tombstone(a1), "tombstone DELETE p/ a1")
+    check(a1 not in _linked(), "a1 removido de linked_memory_ids")
+    check(a2 in _linked(), "a2 ainda ligado (entidade não deletada cedo)")
+    m.delete(a2)  # a2 sai; entidade fica vazia -> deletada
+    check(m.db.has_delete_tombstone(a2), "tombstone DELETE p/ a2")
+    check(a2 not in _linked(), "a2 removido -> nenhum linked_memory_ids pendurado")
+
+
 if __name__ == "__main__":
     m = build()
     try:
@@ -356,6 +451,9 @@ if __name__ == "__main__":
         scenario_reserved_injection(m)
         scenario_scope_guard(m)
         scenario_pagination(m)
+        scenario_intent_journal(m)
+        scenario_partial_chain_delete(m)
+        scenario_delete_residue(m)
     finally:
         cleanup()
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FALHAS: {FAILS}")

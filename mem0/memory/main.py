@@ -959,6 +959,12 @@ class Memory(MemoryBase):
                 self.config.vector_store.provider,
             )
 
+        # DeepMem0 v0.7.2: finish any delete interrupted by a crash (no-op if none).
+        try:
+            self.reconcile_pending_deletes()
+        except Exception as e:
+            logger.warning(f"Delete-intent reconciliation skipped: {e}")
+
         capture_event("mem0.init", self, {"sync_type": "sync"})
 
     @property
@@ -2832,7 +2838,7 @@ class Memory(MemoryBase):
 
         return memory_id
 
-    def _delete_memory(self, memory_id, existing_memory=None):
+    def _delete_memory(self, memory_id, existing_memory=None, *, op_id=None):
         logger.info(f"Deleting memory with {memory_id=}")
         if existing_memory is None:
             existing_memory = self.vector_store.get(vector_id=memory_id)
@@ -2843,24 +2849,75 @@ class Memory(MemoryBase):
         updated_at = datetime.now(timezone.utc).isoformat()
         payload = existing_memory.payload or {}
         session_filters = {k: payload[k] for k in ("user_id", "agent_id", "run_id") if payload.get(k)}
+        # DeepMem0 v0.7.2: durable delete intent (crash-consistency). own_intent -> this
+        # call opens a fresh PENDING intent; a caller-supplied op_id (reconciliation)
+        # resumes an existing one. The intent state (not the tombstone) is the
+        # authority on completion, so a crash at any point below is reconcilable.
+        own_intent = op_id is None
+        if own_intent:
+            op_id = str(uuid.uuid4())
+            if self.db is not None:
+                self.db.begin_delete(op_id, memory_id, scope=json.dumps(session_filters, sort_keys=True))
         self.vector_store.delete(vector_id=memory_id)
-        self.db.add_history(
-            memory_id,
-            prev_value,
-            None,
-            "DELETE",
-            created_at=created_at,
-            updated_at=updated_at,
-            actor_id=existing_memory.payload.get("actor_id"),
-            role=existing_memory.payload.get("role"),
-            is_deleted=1,
-        )
+        # Tombstone is IDEMPOTENT: never duplicate the DELETE row on retry/reconcile.
+        if self.db is not None and not self.db.has_delete_tombstone(memory_id):
+            self.db.add_history(
+                memory_id,
+                prev_value,
+                None,
+                "DELETE",
+                created_at=created_at,
+                updated_at=updated_at,
+                actor_id=existing_memory.payload.get("actor_id"),
+                role=existing_memory.payload.get("role"),
+                is_deleted=1,
+            )
+        if self.db is not None:
+            self.db.commit_delete(op_id)
 
         # Entity-store cleanup: strip this memory's id from any entity records
         # that linked to it. Non-fatal — the helper swallows errors.
         self._remove_memory_from_entity_store(memory_id, session_filters)
 
         return memory_id
+
+    def reconcile_pending_deletes(self) -> int:
+        """DeepMem0 v0.7.2 — finish any delete interrupted by a crash (roadmap #7).
+
+        For each ``pending`` delete intent: delete the vector if it is still present,
+        ensure the DELETE tombstone exists (idempotent), and commit the intent. The
+        intent STATE (not the tombstone) is the authority on completion, so this
+        converges from a crash at ANY point — no lost tombstone, no false 'completed'
+        signal for a live vector. Idempotent; a single cheap query when nothing is
+        pending. Entity cleanup is skipped here (best-effort; stale links are benign
+        residue). Called once at init.
+        """
+        if getattr(self, "db", None) is None:
+            return 0
+        try:
+            pending = self.db.list_pending_deletes()
+        except Exception as e:
+            logger.warning(f"Could not read pending delete intents: {e}")
+            return 0
+        reconciled = 0
+        for intent in pending:
+            mid, op = intent["memory_id"], intent["op_id"]
+            try:
+                existing = self.vector_store.get(vector_id=mid)
+                if existing is not None:
+                    self.vector_store.delete(vector_id=mid)
+                if not self.db.has_delete_tombstone(mid):
+                    self.db.add_history(
+                        mid, None, None, "DELETE",
+                        updated_at=datetime.now(timezone.utc).isoformat(), is_deleted=1,
+                    )
+                self.db.commit_delete(op)
+                reconciled += 1
+            except Exception as e:
+                logger.warning(f"Reconcile of pending delete {op} ({mid}) failed: {e}")
+        if reconciled:
+            logger.info(f"Reconciled {reconciled} pending delete(s) on startup.")
+        return reconciled
 
     def reset(self):
         """
@@ -2962,6 +3019,12 @@ class AsyncMemory(MemoryBase):
                 "store with keyword_search support (e.g. qdrant, elasticsearch, pgvector).",
                 self.config.vector_store.provider,
             )
+
+        # DeepMem0 v0.7.2: finish any delete interrupted by a crash (no-op if none).
+        try:
+            self.reconcile_pending_deletes()
+        except Exception as e:
+            logger.warning(f"Delete-intent reconciliation skipped: {e}")
 
         capture_event("mem0.init", self, {"sync_type": "async"})
 
@@ -4819,7 +4882,7 @@ class AsyncMemory(MemoryBase):
 
         return memory_id
 
-    async def _delete_memory(self, memory_id, existing_memory=None, skip_entity_cleanup=False):
+    async def _delete_memory(self, memory_id, existing_memory=None, skip_entity_cleanup=False, *, op_id=None):
         logger.info(f"Deleting memory with {memory_id=}")
         if existing_memory is None:
             existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
@@ -4831,24 +4894,69 @@ class AsyncMemory(MemoryBase):
         payload = existing_memory.payload or {}
         session_filters = {k: payload[k] for k in ("user_id", "agent_id", "run_id") if payload.get(k)}
 
+        # DeepMem0 v0.7.2: durable delete intent (crash-consistency) — mirrors sync.
+        own_intent = op_id is None
+        if own_intent:
+            op_id = str(uuid.uuid4())
+            if self.db is not None:
+                await asyncio.to_thread(
+                    self.db.begin_delete, op_id, memory_id, json.dumps(session_filters, sort_keys=True)
+                )
         await asyncio.to_thread(self.vector_store.delete, vector_id=memory_id)
-        await asyncio.to_thread(
-            self.db.add_history,
-            memory_id,
-            prev_value,
-            None,
-            "DELETE",
-            created_at=created_at,
-            updated_at=updated_at,
-            actor_id=existing_memory.payload.get("actor_id"),
-            role=existing_memory.payload.get("role"),
-            is_deleted=1,
-        )
+        # Tombstone is IDEMPOTENT: never duplicate the DELETE row on retry/reconcile.
+        if self.db is not None and not await asyncio.to_thread(self.db.has_delete_tombstone, memory_id):
+            await asyncio.to_thread(
+                self.db.add_history,
+                memory_id,
+                prev_value,
+                None,
+                "DELETE",
+                created_at=created_at,
+                updated_at=updated_at,
+                actor_id=existing_memory.payload.get("actor_id"),
+                role=existing_memory.payload.get("role"),
+                is_deleted=1,
+            )
+        if self.db is not None:
+            await asyncio.to_thread(self.db.commit_delete, op_id)
 
         if not skip_entity_cleanup:
             await self._remove_memory_from_entity_store(memory_id, session_filters)
 
         return memory_id
+
+    def reconcile_pending_deletes(self) -> int:
+        """DeepMem0 v0.7.2 — finish crash-interrupted deletes (sync, one-shot at init).
+
+        Same contract as ``Memory.reconcile_pending_deletes``; runs synchronously
+        (no event loop yet at construction) using the sync vector-store/db calls.
+        """
+        if getattr(self, "db", None) is None:
+            return 0
+        try:
+            pending = self.db.list_pending_deletes()
+        except Exception as e:
+            logger.warning(f"Could not read pending delete intents: {e}")
+            return 0
+        reconciled = 0
+        for intent in pending:
+            mid, op = intent["memory_id"], intent["op_id"]
+            try:
+                existing = self.vector_store.get(vector_id=mid)
+                if existing is not None:
+                    self.vector_store.delete(vector_id=mid)
+                if not self.db.has_delete_tombstone(mid):
+                    self.db.add_history(
+                        mid, None, None, "DELETE",
+                        updated_at=datetime.now(timezone.utc).isoformat(), is_deleted=1,
+                    )
+                self.db.commit_delete(op)
+                reconciled += 1
+            except Exception as e:
+                logger.warning(f"Reconcile of pending delete {op} ({mid}) failed: {e}")
+        if reconciled:
+            logger.info(f"Reconciled {reconciled} pending delete(s) on startup.")
+        return reconciled
 
     async def reset(self):
         """

@@ -16,6 +16,7 @@ class SQLiteManager:
         self._migrate_history_table()
         self._create_history_table()
         self._create_messages_table()
+        self._create_delete_intents_table()
 
     def _migrate_history_table(self) -> None:
         """
@@ -146,6 +147,91 @@ class SQLiteManager:
                 self.connection.execute("ROLLBACK")
                 logger.error(f"Failed to create messages table: {e}")
                 raise
+
+    def _create_delete_intents_table(self) -> None:
+        """DeepMem0 v0.7.2 — durable delete-intent journal (roadmap item #7).
+
+        A delete becomes crash-consistent: a ``pending`` intent is written BEFORE
+        the vector delete + tombstone and flipped to ``committed`` after. The
+        AUTHORITY on completion is this row's state, NOT the history tombstone —
+        so a crash mid-delete is distinguishable from a completed delete and can be
+        reconciled (finish + commit) instead of vanishing without a trace or looking
+        done while the vector is still live. Additive: never touches ``history``.
+        """
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                self.connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS delete_intents (
+                        op_id        TEXT PRIMARY KEY,
+                        memory_id    TEXT NOT NULL,
+                        scope        TEXT,
+                        state        TEXT NOT NULL,
+                        created_at   DATETIME,
+                        updated_at   DATETIME
+                    )
+                """
+                )
+                self.connection.execute("COMMIT")
+            except Exception as e:
+                self.connection.execute("ROLLBACK")
+                logger.error(f"Failed to create delete_intents table: {e}")
+                raise
+
+    def begin_delete(self, op_id: str, memory_id: str, scope: Optional[str] = None) -> None:
+        """Record a delete intent as ``pending`` (before the vector delete)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                self.connection.execute(
+                    """
+                    INSERT OR REPLACE INTO delete_intents
+                        (op_id, memory_id, scope, state, created_at, updated_at)
+                    VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                    (op_id, memory_id, scope, now, now),
+                )
+                self.connection.execute("COMMIT")
+            except Exception as e:
+                self.connection.execute("ROLLBACK")
+                logger.error(f"Failed to record delete intent {op_id}: {e}")
+                raise
+
+    def commit_delete(self, op_id: str) -> None:
+        """Flip a delete intent to ``committed`` (after vector delete + tombstone)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            try:
+                self.connection.execute("BEGIN")
+                self.connection.execute(
+                    "UPDATE delete_intents SET state='committed', updated_at=? WHERE op_id=?",
+                    (now, op_id),
+                )
+                self.connection.execute("COMMIT")
+            except Exception as e:
+                self.connection.execute("ROLLBACK")
+                logger.error(f"Failed to commit delete intent {op_id}: {e}")
+                raise
+
+    def list_pending_deletes(self) -> List[Dict[str, Any]]:
+        """Delete intents still ``pending`` (for reconciliation at startup)."""
+        with self._lock:
+            cur = self.connection.execute(
+                "SELECT op_id, memory_id, scope, created_at FROM delete_intents WHERE state='pending'"
+            )
+            rows = cur.fetchall()
+        return [{"op_id": r[0], "memory_id": r[1], "scope": r[2], "created_at": r[3]} for r in rows]
+
+    def has_delete_tombstone(self, memory_id: str) -> bool:
+        """Whether a DELETE tombstone already exists for this id (idempotency guard)."""
+        with self._lock:
+            cur = self.connection.execute(
+                "SELECT 1 FROM history WHERE memory_id=? AND is_deleted=1 LIMIT 1",
+                (memory_id,),
+            )
+            return cur.fetchone() is not None
 
     def add_history(
         self,
@@ -324,12 +410,13 @@ class SQLiteManager:
         ]
 
     def reset(self) -> None:
-        """Drop and recreate the history and messages tables."""
+        """Drop and recreate the history, messages and delete_intents tables."""
         with self._lock:
             try:
                 self.connection.execute("BEGIN")
                 self.connection.execute("DROP TABLE IF EXISTS history")
                 self.connection.execute("DROP TABLE IF EXISTS messages")
+                self.connection.execute("DROP TABLE IF EXISTS delete_intents")
                 self.connection.execute("COMMIT")
             except Exception as e:
                 self.connection.execute("ROLLBACK")
@@ -337,6 +424,7 @@ class SQLiteManager:
                 raise
         self._create_history_table()
         self._create_messages_table()
+        self._create_delete_intents_table()
 
     def close(self) -> None:
         if self.connection:

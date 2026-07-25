@@ -102,6 +102,64 @@ try:
     h = m.history(v1)
     events = [e.get("event") for e in h]
     check("SUPERSEDED" in events, f"history(v1) tem SUPERSEDED (got {events})")
+
+    # === §F (v0.7.2): MATRIZ de as_of com timestamps FIXOS (determinística) =========
+    # Boundary é inclusivo (lte em created_at); a penalidade de supersedência é isenta
+    # sse superseded_at > as_of. Semeia uma cadeia com created_at/superseded_at EXATOS
+    # (não wall-clock) e asseta INCLUSÃO DE CANDIDATO (conjunto, não top-1) + demoção.
+    print("== matriz de as_of (timestamps fixos, inclusão de candidato + demoção) ==")
+    from mem0.utils.temporality import superseded_penalty_applies, parse_as_of
+    for p in m.vector_store.list(filters={"user_id": USER}, top_k=10000)[0]:
+        m.vector_store.delete(vector_id=p.id)
+    T1, T2 = "2024-03-15T10:00:00+00:00", "2024-06-20T10:00:00+00:00"
+    mv1 = m.add("O serviço de pagamentos roda na região us-east-1.", user_id=USER, infer=False)["results"][0]["id"]
+    mv2 = m.add("O serviço de pagamentos roda na região sa-east-1.", user_id=USER, infer=False)["results"][0]["id"]
+    pp1 = payload(m, mv1); pp1.update({"created_at": T1, "updated_at": T1,
+        "superseded_by": mv2, "superseded_at": T2, "_mem0_version_next": mv2})
+    m.vector_store.update(vector_id=mv1, payload=pp1)
+    pp2 = payload(m, mv2); pp2.update({"created_at": T2, "updated_at": T2, "_mem0_version_prev": [mv1]})
+    m.vector_store.update(vector_id=mv2, payload=pp2)
+
+    def asof_ids(anchor):
+        res = m.search("onde o serviço de pagamentos roda", user_id=USER, limit=10, as_of=anchor)["results"]
+        return {r.get("id") for r in res}
+
+    # (anchor, esperado_incluídos) — INCLUSÃO via filtro de created_at (lte)
+    matrix = [
+        ("2024-01-01T00:00:00+00:00", set(),        "antes de v1: nenhum"),
+        (T1,                          {mv1},        "exatamente v1: só v1 (lte inclusivo, v2 futuro)"),
+        ("2024-05-01T00:00:00+00:00", {mv1},        "entre v1/v2: só v1"),
+        (T2,                          {mv1, mv2},   "exatamente v2: v1 E v2 (ambos created<=anchor)"),
+        ("2024-08-01T00:00:00+00:00", {mv1, mv2},   "depois de v2: v1 E v2"),
+        ("2024-03-15",                {mv1},        "date-only do dia de v1: fim-de-dia UTC inclui v1 (10:00)"),
+        ("2024-03-14",                set(),        "date-only do dia ANTERIOR: exclui v1 (prova fim-de-dia UTC)"),
+    ]
+    for anchor, expected, desc in matrix:
+        got = asof_ids(anchor)
+        check(got == expected, f"{desc} (got {sorted(str(x)[:8] for x in got)})")
+
+    # naive vs tz-aware do MESMO instante -> idêntico
+    check(asof_ids("2024-05-01T00:00:00") == asof_ids("2024-05-01T00:00:00+00:00"),
+          "as_of naive == tz-aware do mesmo instante")
+
+    # DEMOÇÃO (isenção de penalidade) — asserida DIRETO, separada do score de busca
+    p_v1 = payload(m, mv1)
+    check(superseded_penalty_applies(p_v1, as_of=parse_as_of(T1)[1]) is False,
+          "demoção: as_of em v1 (superseded_at futuro) -> ISENTA")
+    check(superseded_penalty_applies(p_v1, as_of=parse_as_of("2024-05-01T00:00:00+00:00")[1]) is False,
+          "demoção: as_of entre v1/v2 -> ISENTA")
+    check(superseded_penalty_applies(p_v1, as_of=parse_as_of(T2)[1]) is True,
+          "demoção: as_of == superseded_at (T2) -> DEMOVIDO (lte)")
+    check(superseded_penalty_applies(p_v1, as_of=parse_as_of("2024-08-01T00:00:00+00:00")[1]) is True,
+          "demoção: as_of depois de v2 -> DEMOVIDO")
+
+    # as_of inválido -> ValueError (fail-fast, mesmo com temporalidade)
+    raised = False
+    try:
+        m.search("x", user_id=USER, as_of="não-é-data")
+    except ValueError:
+        raised = True
+    check(raised, "as_of inválido levanta ValueError")
 finally:
     cleanup()
 
