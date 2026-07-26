@@ -200,9 +200,21 @@ def _apply_metadata_post_filters(
     if memory_type:
         out = [m for m in out if _meta(m).get("memory_type") == memory_type]
     if sort_by_importance:
+        # A chave TEM que espelhar a guarda de isinstance do min_importance acima:
+        # importance vinda do caller (metadata= no add) NÃO passa pelo coerce do
+        # classificador, então o corpus real tem strings ("high"). Sem a guarda,
+        # sorted() compara str com float e derruba a busca inteira com
+        # "'<' not supported between instances of 'str' and 'float'" — foi o que
+        # aconteceu no Open WebUI em 26/07/2026 (17 memórias 'high' no corpus).
+        # Não-numérico ordena como 0.0 em vez de crashar: o filtro já trata o
+        # mesmo caso excluindo; ordenar nunca pode ser mais frágil que filtrar.
         out = sorted(
             out,
-            key=lambda m: _meta(m).get("importance") or 0.0,
+            key=lambda m: (
+                _meta(m)["importance"]
+                if isinstance(_meta(m).get("importance"), (int, float))
+                else 0.0
+            ),
             reverse=True,
         )
     return out
