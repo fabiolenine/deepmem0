@@ -1,6 +1,7 @@
 """DeepMem0 v0.2 human-memory dynamics tests — pure units, no live infrastructure."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from mem0.configs.base import MemoryConfig, MemoryDynamicsConfig
 from mem0.memory.main import (
@@ -321,51 +322,88 @@ class TestReinforceMemory:
         assert {o for _, _, o in seen} == {"applied"}
         assert fields is not None
 
+    def test_t2_end_to_end_notifies_after_the_write(self):
+        """COMPORTAMENTAL: exercita `_update_memory` de verdade.
+
+        O teste anterior chamava `plan_reinforcement` e `_notify_reinforcement`
+        à mão — ficaria VERDE mesmo se o update parasse de notificar T2.
+        """
+        import mem0.memory.main as main_mod
+
+        order = []
+
+        class Store:
+            def __init__(self):
+                self.payload = {"data": "antigo", "created_at": hours_ago(72),
+                                "user_id": "u"}
+
+            def get(self, vector_id):
+                order.append("read")
+                return SimpleNamespace(id=vector_id, payload=dict(self.payload))
+
+            def update(self, vector_id, vector=None, payload=None):
+                order.append("write")
+                self.payload = payload
+
+        class Embedder:
+            def embed(self, data, action):
+                order.append("embed")
+                return [0.1, 0.2]
+
+        seen = []
+        store = Store()
+        # version_on_update DESLIGADO: é o modo em que o T2 existe (ver o teste
+        # seguinte, que prova o contrário no modo default).
+        cfg = MemoryConfig()
+        cfg.temporality.version_on_update = False
+        fake = SimpleNamespace(
+            config=cfg, vector_store=store, embedding_model=Embedder(),
+            db=SimpleNamespace(add_history=lambda *a, **kw: order.append("history")),
+            _remove_memory_from_entity_store=lambda *a, **kw: None,
+            _add_memory_to_entity_store=lambda *a, **kw: None,
+            _link_entities_for_memory=lambda *a, **kw: None,
+        )
+        main_mod.reinforcement_observer = lambda *a: seen.append((a[1], a[2], list(order)))
+        try:
+            main_mod.Memory._update_memory(fake, "mem-1", "novo texto", {})
+        finally:
+            main_mod.reinforcement_observer = None
+
+        assert [t for t, _o, _s in seen] == ["t2"], "o T2 tem que notificar de verdade"
+        _trigger, outcome, order_at_notify = seen[0]
+        assert outcome == "applied"
+        # embed ANTES da leitura (encurta a janela em que um T3 é apagado) e
+        # notify DEPOIS da escrita (não afirmar reforço que não persistiu)
+        assert order.index("embed") < order.index("read")
+        assert "write" in order_at_notify
+        assert store.payload["reinforced_by"][-1] == "t2"
+        assert store.payload["reinforce_counts"] == {"t2": 1}
+
     def test_t2_does_not_exist_under_version_on_update(self):
-        """Dependência SILENCIOSA que ninguém tinha documentado: com
-        version_on_update ligado (default do fork) o update roteia para o
-        caminho versionado, a versão nova nasce neutra e o gatilho T2
-        simplesmente não acontece. Produção só tem T2 hoje porque um drop-in de
-        contenção do v0.7 desliga o versionamento — se ele sair, um gatilho
-        desaparece sem aviso."""
-        import inspect
+        """COMPORTAMENTAL: com version_on_update ligado (DEFAULT do fork) o
+        update roteia para o caminho versionado, a versão nova nasce neutra e o
+        gatilho T2 simplesmente não acontece.
 
+        Produção só tem T2 hoje porque um drop-in de contenção do v0.7 desliga o
+        versionamento — se ele sair, um gatilho desaparece sem aviso. Este teste
+        foi escrito como inspeção de fonte primeiro e só virou comportamental
+        depois: o teste de fonte teria passado sem provar nada em runtime.
+        """
         import mem0.memory.main as main_mod
 
-        src = inspect.getsource(main_mod.Memory._update_memory)
-        version_return = src.index("return self._version_update(")
-        t2_block = src.index("TRIGGER_UPDATE")
-        assert version_return < t2_block, (
-            "o caminho versionado precisa retornar ANTES do bloco T2 — se isso "
-            "mudar, o contrato dos gatilhos mudou junto")
+        routed, seen = [], []
+        fake = SimpleNamespace(
+            config=MemoryConfig(),  # default = version_on_update ligado
+            _version_update=lambda *a, **k: routed.append(a[0]) or ("novo", "velho"),
+        )
+        main_mod.reinforcement_observer = lambda *a: seen.append(a[1])
+        try:
+            main_mod.Memory._update_memory(fake, "mem-1", "novo texto", {})
+        finally:
+            main_mod.reinforcement_observer = None
 
-    def test_embedding_happens_before_the_authoritative_read(self):
-        """O trecho lento (embed) rodava DEPOIS da leitura, envelhecendo o
-        payload: um T3 que chegasse no intervalo era apagado pelo upsert de
-        payload completo. Isto reduz a janela — não a elimina."""
-        import inspect
-
-        import mem0.memory.main as main_mod
-
-        for fn in (main_mod.Memory._update_memory, main_mod.AsyncMemory._update_memory):
-            src = inspect.getsource(fn)
-            embed_at = src.index("embedding_model.embed")
-            read_at = src.index("vector_store.get")
-            assert embed_at < read_at, f"{fn.__qualname__}: embed tem que vir antes da leitura"
-
-    def test_t2_reports_applied_only_after_the_write_lands(self):
-        """A telemetria do T2 emitia 'applied' ANTES da escrita do update: uma
-        falha de embed ou de vector_store deixava a métrica afirmando um reforço
-        que nunca persistiu."""
-        import inspect
-
-        import mem0.memory.main as main_mod
-
-        src = inspect.getsource(main_mod.Memory._update_memory)
-        notify_at = src.index("_notify_reinforcement(memory_id, TRIGGER_UPDATE")
-        write_at = src.index("self.vector_store.update(")
-        assert write_at < notify_at, (
-            "o notify de T2 tem que vir DEPOIS da escrita no vector store")
+        assert routed == ["mem-1"], "deveria rotear para o caminho versionado"
+        assert seen == [], "não pode haver T2 quando o update cria uma versão nova"
 
     def test_observer_failure_never_breaks_bookkeeping(self):
         import mem0.memory.main as main_mod

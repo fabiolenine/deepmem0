@@ -196,15 +196,28 @@ if __name__ == "__main__":
     # timelines da rodada anterior no lugar, o dedup por hash disparava T1 nos
     # adds do seed e o teste [A] ("corpus fresco, ON==OFF") reprovava por
     # sujeira, não por regressão — um falso alarme que custa investigação.
-    try:
-        from qdrant_client import QdrantClient
+    from qdrant_client import QdrantClient
 
-        QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY).delete_collection(ARGS.collection)
-    except Exception:
-        pass
+    _client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    try:
+        _client.delete_collection(ARGS.collection)
+    except Exception as exc:
+        print(f"aviso: delete da collection falhou ({exc}) — seguindo para a verificação")
 
     memory_on = build_memory(ARGS.rerank, dynamics_enabled=True)
     ids = seed(memory_on)
+
+    # FAIL-CLOSED: engolir o erro do delete deixaria uma rodada se anunciar
+    # "fresh" sem estar. O teste [A] pressupõe corpus limpo e SEM timeline —
+    # se a pressuposição não vale, ele acusa sujeira como se fosse regressão.
+    _points = memory_on.vector_store.list(top_k=1000)
+    _points = _points[0] if isinstance(_points, tuple) else _points
+    _expected = len(PAIRS) * 2 + 2 + len(DISTRACTORS)
+    _dirty = [p for p in _points if (getattr(p, "payload", None) or {}).get("reinforced_at")]
+    if len(_points) != _expected or _dirty:
+        sys.exit(f"ABORT: collection não está limpa — {len(_points)} pontos "
+                 f"(esperado {_expected}), {len(_dirty)} com timeline pré-existente. "
+                 f"Use --collection novo ou apague {ARGS.collection}.")
     print(f"seeded {len(ids)} memories ({len(PAIRS)} twin pairs + {len(DISTRACTORS)} distractors)")
 
     # --- A. No regression: fresh corpus, dynamics ON == OFF on every top-1 ---

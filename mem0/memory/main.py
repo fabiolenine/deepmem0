@@ -872,7 +872,10 @@ def _t3_targets(dyn, memories, *, search_id, exposed_at) -> List[ReinforcementTa
             rank=i,
             search_id=search_id,
             exposed_at=exposed_at,
-            snapshot=doc.get("metadata") or {},
+            # cópia: o dict de metadata pertence ao resultado que volta ao
+            # caller, e "viaja por valor" só é verdade se ninguém puder mutá-lo
+            # depois que o alvo já foi montado.
+            snapshot=dict(doc.get("metadata") or {}),
         )
         for i, doc in enumerate(selected, start=1)
         if doc.get("id")

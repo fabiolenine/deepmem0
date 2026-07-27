@@ -238,6 +238,23 @@ def should_reinforce(
     return True
 
 
+def _has_seed(payload: Dict[str, Any], history: List[Any]) -> bool:
+    """Whether the first timeline entry is the adopted ``created_at`` anchor.
+
+    Compares INSTANTS, not strings: ``2026-07-01T00:00:00Z`` and
+    ``...+00:00`` are the same moment written two ways, and a string compare
+    would miss the anchor and count it as an event.
+
+    Undetectable once the trim has dropped the anchor — an accepted limit: from
+    then on the tally is carried forward instead of re-derived.
+    """
+    if not history:
+        return False
+    created = _parse_ts(payload.get("created_at"))
+    first = _parse_ts(history[0])
+    return created is not None and first is not None and created == first
+
+
 def _carry_counts(payload: Dict[str, Any], history: List[Any], count: int) -> Dict[str, int]:
     """Per-trigger tally carried forward, migrating a pre-tally timeline once.
 
@@ -246,7 +263,12 @@ def _carry_counts(payload: Dict[str, Any], history: List[Any], count: int) -> Di
         first reinforcement is an anchor, not an event;
       * everything already on a timeline that predates provenance goes to
         ``unknown`` (never guessed);
-      * invariant ``sum(counts.values()) == access_count - (1 if seeded else 0)``;
+      * invariant ``sum(counts.values()) == access_count - (1 if seeded else 0)``
+        holds from the migration onward, and is NOT re-imposed on a tally that
+        already exists: once the trim drops the ``created_at`` anchor, a short
+        sum is indistinguishable from a corrupt one, and "repairing" it would
+        fabricate an ``unknown`` event that never happened. A visible
+        inconsistency beats invented data that looks correct;
       * best-effort, like the rest of the timeline: the store has no atomic
         increment, so a lost race loses a count — which the telemetry measures
         instead of hiding;
@@ -254,16 +276,43 @@ def _carry_counts(payload: Dict[str, Any], history: List[Any], count: int) -> Di
     """
     raw = payload.get(FIELD_REINFORCE_COUNTS)
     if isinstance(raw, dict):
-        return {
-            str(k): int(v) for k, v in raw.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
-        }
+        carried = {}
+        for k, v in raw.items():
+            # inf/NaN passam por `v >= 0` e explodem no int(): uma tally
+            # malformada NUNCA pode derrubar a escrita de conteúdo que a
+            # carrega (o T2 chama isto fora de qualquer try).
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if not math.isfinite(float(v)) or v < 0:
+                continue
+            carried[str(k)] = int(v)
+        # Uma tally que já existe é carregada COMO ESTÁ. Reconciliar contra o
+        # access_count parece atraente, mas é impossível distinguir "a âncora
+        # created_at já foi descartada pelo trim" de "a tally está corrompida" —
+        # e nos dois casos a reconciliação INVENTARIA um evento `unknown` que
+        # nunca aconteceu. Soma inconsistente é um sintoma visível; evento
+        # fabricado é dado errado que parece certo.
+        return carried
     if not history:
         return {}
     # Migração implícita: o payload nunca é reescrito retroativamente; a primeira
     # gravação depois desta versão é que materializa o histórico anterior.
-    seeded = payload.get("created_at") == history[0]
-    prior = max(count - (1 if seeded else 0), 0)
+    origins = payload.get(FIELD_REINFORCED_BY)
+    if isinstance(origins, list) and origins:
+        # Proveniência CONHECIDA não vira `unknown`: memórias gravadas entre o
+        # deploy de reinforced_by e o desta tally já sabem seus gatilhos, e
+        # descartá-los seria perder informação que existe.
+        carried = {}
+        for origin in origins:
+            if origin == TRIGGER_CREATED:
+                continue  # âncora, não evento
+            carried[origin or BUCKET_UNKNOWN] = carried.get(origin or BUCKET_UNKNOWN, 0) + 1
+        untracked = max(count - (1 if _has_seed(payload, history) else 0)
+                        - sum(carried.values()), 0)
+        if untracked:  # cauda já descartada pelo trim
+            carried[BUCKET_UNKNOWN] = carried.get(BUCKET_UNKNOWN, 0) + untracked
+        return carried
+    prior = max(count - (1 if _has_seed(payload, history) else 0), 0)
     return {BUCKET_UNKNOWN: prior} if prior else {}
 
 
