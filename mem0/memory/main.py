@@ -585,7 +585,12 @@ _VERSION_NON_INHERITED = frozenset({
     "data", "hash", "text_lemmatized", "created_at", "updated_at",
     FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_SUPERSEDES, FIELD_EVENT_DATE,
     FIELD_VERSION_PREV, FIELD_VERSION_NEXT, FIELD_LINEAGE_SCHEMA,
-    "reinforced_at", "access_count", "last_accessed",
+    # EVERY dynamics field, from the single tuple that defines them: listing them
+    # by hand let two new ones (reinforced_by, last_search_reinforced_at) slip
+    # through, so a new version would inherit orphan provenance and an exposure
+    # clock that muted its own first retrieval for a day. A new version starts
+    # neutral — and that must not depend on someone remembering this list.
+    *DYNAMICS_FIELDS,
     "source_doc", "page_start", "page_end", "chunk_index", "content_type",
     "task_id",
 })
@@ -774,6 +779,15 @@ def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_
     earlier: that read-modify-write silently reverted any field a concurrent
     writer had changed in between. Stores that REPLACE the payload still get the
     full merge, or they would lose everything else.
+
+    This narrows the blast radius; it does NOT make the timeline concurrency-safe.
+    The read-modify-write on the dynamics fields themselves remains: two
+    reinforcements racing can both read the same history and one overwrites the
+    other, and an UPDATE that upserts a full payload built from an older snapshot
+    can erase a reinforcement that landed in between. Reinforcement is
+    best-effort bookkeeping — a lost event costs one unrecorded exposure, and the
+    telemetry counts what was applied so the loss is measurable rather than
+    invisible.
 
     Never raises — reinforcement is bookkeeping and must not break add/update/search.
     """
@@ -2977,7 +2991,10 @@ class Memory(MemoryBase):
             )
             if _fields:
                 new_metadata.update(_fields)
-            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
+            # NÃO notifica aqui: a decisão foi tomada, mas o reforço só existe
+            # depois que a escrita do update pega. Emitir "applied" antes do
+            # write faria a telemetria afirmar um reforço que uma falha de embed
+            # ou de vector_store deixaria sem persistir.
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
@@ -2989,6 +3006,8 @@ class Memory(MemoryBase):
             vector=embeddings,
             payload=new_metadata,
         )
+        if dyn is not None:
+            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
         logger.info(f"Updating memory with ID {memory_id=} with {data=}")
 
         self.db.add_history(
@@ -5049,7 +5068,10 @@ class AsyncMemory(MemoryBase):
             )
             if _fields:
                 new_metadata.update(_fields)
-            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
+            # NÃO notifica aqui: a decisão foi tomada, mas o reforço só existe
+            # depois que a escrita do update pega. Emitir "applied" antes do
+            # write faria a telemetria afirmar um reforço que uma falha de embed
+            # ou de vector_store deixaria sem persistir.
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
@@ -5062,6 +5084,8 @@ class AsyncMemory(MemoryBase):
             vector=embeddings,
             payload=new_metadata,
         )
+        if dyn is not None:
+            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
         logger.info(f"Updating memory with ID {memory_id=} with {data=}")
 
         await asyncio.to_thread(

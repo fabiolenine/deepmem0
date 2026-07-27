@@ -198,14 +198,20 @@ def main() -> int:
           "recuperada UMA vez\n")
 
     results = {}
+    winners = {}
     for mode in MODE_ORDER:
         memory = build_memory(ARGS.rerank, mode)
-        stolen = []
+        stolen, per_case = [], {}
         for case in CASES:
             winner = top_id(memory, case["query"])
-            if winner == ids[case["exposed"]]:
+            per_case[case["query"]] = winner
+            # FALHA = a resposta correta perdeu o top-1, seja para quem for. O
+            # oráculo anterior só contava quando a vizinha DESIGNADA vencia, e
+            # ficava cego a um terceiro candidato roubando o topo.
+            if winner != ids[case["answer"]]:
                 stolen.append(case["query"])
         results[mode] = stolen
+        winners[mode] = per_case
         label = {
             "off": "dynamics OFF (controle)",
             "tie": "tie-break só (weight=0, band=0.002)",
@@ -214,10 +220,12 @@ def main() -> int:
             "both": "fusão + tie-break",
         }[mode]
         status = "ok " if not stolen else "FAIL"
-        print(f"  [{status}] {label:38} exposta roubou o top-1 em "
+        print(f"  [{status}] {label:38} resposta correta perdeu o top-1 em "
               f"{len(stolen)}/{len(CASES)}")
         for q in stolen:
-            print(f"          → {q}")
+            who = "a vizinha exposta" if winners[mode][q] == ids[
+                next(c["exposed"] for c in CASES if c["query"] == q)] else "OUTRO candidato"
+            print(f"          → {q}  (quem levou: {who})")
 
     try:
         client.delete_collection(ARGS.collection)
@@ -228,11 +236,19 @@ def main() -> int:
     # é do ACT-R. Só conta como dano de exposição o que PIORA em relação a ele.
     baseline = len(results["off"])
     print(f"\nbaseline (sem dynamics): {baseline}/{len(CASES)} — abaixo disto é o custo do ACT-R")
+    # TRANSIÇÕES PAREADAS: um delta agregado zero pode esconder um modo que
+    # conserta um caso e estraga outro. O que decide é o dano NOVO, não o saldo.
     verdicts = {}
     for mode in MODE_ORDER[1:]:
-        delta = len(results[mode]) - baseline
-        verdicts[mode] = delta
-        print(f"  {mode:7} delta vs controle: {delta:+d}")
+        harmed = [c["query"] for c in CASES
+                  if winners["off"][c["query"]] == ids[c["answer"]]
+                  and winners[mode][c["query"]] != ids[c["answer"]]]
+        helped = [c["query"] for c in CASES
+                  if winners["off"][c["query"]] != ids[c["answer"]]
+                  and winners[mode][c["query"]] == ids[c["answer"]]]
+        verdicts[mode] = len(harmed)
+        print(f"  {mode:9} dano NOVO {len(harmed)}  |  consertou {len(helped)}  |  "
+              f"saldo {len(results[mode]) - baseline:+d}")
     # O GATE é sobre o modo que vai rodar (tie-break only). `fusion`/`both` são
     # MEDIÇÃO, não modos candidatos: o dano que eles mostram é justamente a razão
     # de a fusão ficar em zero. Reportá-los como falha do gate confundiria "a
@@ -240,11 +256,15 @@ def main() -> int:
     print("\n  nota: n=6 e o delta é de UM caso — sinal direcional, não número"
           " calibrado. O que ele mostra é ONDE o viés entra, não o seu tamanho.")
     if verdicts["fusion"] > 0:
-        print(f"  → a fusão (weight>0) custa {verdicts['fusion']:+d}: é a evidência que"
-              " mantém o peso da fusão em ZERO (decisão D4).")
+        print(f"  → a fusão (weight>0) causa {verdicts['fusion']} dano(s) novo(s): é a"
+              " evidência que mantém o peso da fusão em ZERO (decisão D4).")
     ok = verdicts["tie"] <= 0
     print(f"\nRESULT: {'PASS' if ok else 'FAIL'} "
-          f"(modo em produção = tie-break; dano de exposição {verdicts['tie']:+d})")
+          f"(candidato à Fase 3 = tie-break; dano novo {verdicts['tie']})")
+    print("  ⚠️ ESTE EVAL NÃO MEDE FREQUÊNCIA. 1 falha em 6 tem IC95% de ~0,4% a 64%:"
+          " ele prova a EXISTÊNCIA de um par em que a banda deixa passar um flip"
+          " danoso, não a taxa com que isso ocorre. Os casos foram escritos por"
+          " quem conhecia o mecanismo — serve para falsificar, não para calibrar.")
     return 0 if ok else 1
 
 

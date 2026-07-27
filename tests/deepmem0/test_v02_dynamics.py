@@ -319,6 +319,20 @@ class TestReinforceMemory:
         assert {o for _, _, o in seen} == {"applied"}
         assert fields is not None
 
+    def test_t2_reports_applied_only_after_the_write_lands(self):
+        """A telemetria do T2 emitia 'applied' ANTES da escrita do update: uma
+        falha de embed ou de vector_store deixava a métrica afirmando um reforço
+        que nunca persistiu."""
+        import inspect
+
+        import mem0.memory.main as main_mod
+
+        src = inspect.getsource(main_mod.Memory._update_memory)
+        notify_at = src.index("_notify_reinforcement(memory_id, TRIGGER_UPDATE")
+        write_at = src.index("self.vector_store.update(")
+        assert write_at < notify_at, (
+            "o notify de T2 tem que vir DEPOIS da escrita no vector store")
+
     def test_observer_failure_never_breaks_bookkeeping(self):
         import mem0.memory.main as main_mod
 
@@ -441,6 +455,49 @@ class TestSearchReinforcementGate:
 
         docs = [{"id": "m0"}, {"score": 1}, {"id": "m1"}]
         assert _t3_targets(self._dyn(reinforce_top_n=0), docs) == ["m0", "m1"]
+
+
+class TestWindowInteraction:
+    """A janela global (1h, todos os gatilhos) e a de exposição (24h, só T3) se
+    COMPÕEM — não são orçamentos separados. A documentação dizia "não dividem
+    orçamento", o que é falso numa direção: um T3 recente cala T1/T2 por 1h."""
+
+    def test_recent_t3_mutes_an_explicit_write_for_the_global_window(self):
+        payload = {
+            "reinforced_at": [hours_ago(0.5)],
+            FIELD_LAST_SEARCH_REINFORCED_AT: hours_ago(0.5),
+        }
+        assert should_reinforce(payload, now=NOW, window_seconds=3600, trigger="t1",
+                                search_window_seconds=86400) is False
+
+    def test_after_the_global_window_an_explicit_write_passes(self):
+        payload = {
+            "reinforced_at": [hours_ago(5)],
+            FIELD_LAST_SEARCH_REINFORCED_AT: hours_ago(5),
+        }
+        assert should_reinforce(payload, now=NOW, window_seconds=3600, trigger="t2",
+                                search_window_seconds=86400) is True
+
+    def test_search_stays_muted_long_after_the_global_window(self):
+        payload = {
+            "reinforced_at": [hours_ago(5)],
+            FIELD_LAST_SEARCH_REINFORCED_AT: hours_ago(5),
+        }
+        assert should_reinforce(payload, now=NOW, window_seconds=3600,
+                                trigger=TRIGGER_SEARCH, search_window_seconds=86400) is False
+
+
+class TestVersionInheritance:
+    """Uma versão nova nasce NEUTRA. Isto quebrou de verdade: a blacklist listava
+    três campos de dynamics à mão e os dois novos passaram — a v2 herdaria
+    proveniência órfã e um relógio de exposição que calaria a própria primeira
+    recuperação dela por 24h."""
+
+    def test_no_dynamics_field_is_inherited(self):
+        from mem0.memory.main import _VERSION_NON_INHERITED
+
+        missing = [f for f in DYNAMICS_FIELDS if f not in _VERSION_NON_INHERITED]
+        assert missing == [], f"campos de dynamics herdados por uma versão nova: {missing}"
 
 
 class TestConfigSurface:

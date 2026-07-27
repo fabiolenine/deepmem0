@@ -94,11 +94,12 @@ class MemoryDynamicsConfig(BaseModel):
     )
     reinforce_on_search_window: int = Field(
         description="Seconds during which further SEARCH reinforcements (T3) of the same"
-        " memory have no effect, tracked independently from reinforcement_window so an"
-        " explicit write (T1/T2) and a mere retrieval exposure do not share a budget."
+        " memory have no effect, measured from the last T3 event only. It is an ADDITIONAL"
+        " cooldown ON TOP of reinforcement_window, not a separate budget: the global window"
+        " still applies to every trigger first, so an event of any kind mutes all triggers"
+        " for reinforcement_window, and T3 stays muted for this longer period afterwards."
         " Retrieval is exposure, not confirmed use: a memory the ranker keeps surfacing"
-        " would otherwise compound its own visibility. 0 = fall back to"
-        " reinforcement_window.",
+        " would otherwise compound its own visibility. 0 = only the global window applies.",
         default=86400,
     )
 
