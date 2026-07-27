@@ -49,8 +49,39 @@ logger = logging.getLogger(__name__)
 FIELD_REINFORCED_AT = "reinforced_at"
 FIELD_ACCESS_COUNT = "access_count"
 FIELD_LAST_ACCESSED = "last_accessed"
+#: Which trigger produced each retained timestamp, positionally aligned with
+#: ``reinforced_at``. Without it a timeline is unattributable: a search exposure
+#: (T3) cannot be told apart from an explicit write (T1/T2), so neither a
+#: trigger-specific window nor a selective rollback of exposure events is
+#: possible — only all-or-nothing deletion of the whole history.
+FIELD_REINFORCED_BY = "reinforced_by"
+#: Last T3 (search exposure) timestamp, tracked apart from the shared timeline so
+#: the exposure window is independent of explicit-write reinforcements.
+FIELD_LAST_SEARCH_REINFORCED_AT = "last_search_reinforced_at"
 
-DYNAMICS_FIELDS = (FIELD_REINFORCED_AT, FIELD_ACCESS_COUNT, FIELD_LAST_ACCESSED)
+DYNAMICS_FIELDS = (
+    FIELD_REINFORCED_AT,
+    FIELD_ACCESS_COUNT,
+    FIELD_LAST_ACCESSED,
+    FIELD_REINFORCED_BY,
+    FIELD_LAST_SEARCH_REINFORCED_AT,
+)
+
+#: Reinforcement triggers. T1/T2 are explicit writes (a fact was re-stated or
+#: evolved); T3 is retrieval EXPOSURE — the memory was returned, which is weaker
+#: evidence than a write and is rate-limited on its own window.
+TRIGGER_DEDUP = "t1"
+TRIGGER_UPDATE = "t2"
+TRIGGER_SEARCH = "t3"
+TRIGGER_CREATED = "created"  # the created_at seed adopted by the first reinforcement
+
+#: Structured outcome of one reinforcement attempt. The previous boolean collapsed
+#: "the window suppressed it" with "it blew up", which made the two indistinguishable
+#: in telemetry — exactly the blindness this work exists to remove.
+OUTCOME_APPLIED = "applied"
+OUTCOME_SUPPRESSED = "suppressed"
+OUTCOME_MISSING = "missing"
+OUTCOME_FAILED = "failed"
 
 # dt is measured in days, clamped to >= 1: within the first day every memory
 # is equally "today", so freshness alone cannot dominate real reinforcement.
@@ -160,6 +191,8 @@ def should_reinforce(
     *,
     now: Optional[datetime] = None,
     window_seconds: int = 3600,
+    trigger: str = TRIGGER_DEDUP,
+    search_window_seconds: int = 0,
 ) -> bool:
     """At most one reinforcement per memory per window, across all triggers.
 
@@ -168,15 +201,25 @@ def should_reinforce(
     not double-count) and approximates the ACT-R spacing effect: massed
     repetition adds nothing, spaced repetition does. ``window_seconds <= 0``
     disables the window.
+
+    T3 (search) additionally honors its OWN window (``search_window_seconds``,
+    measured from the last T3 event only). Retrieval is exposure, not confirmed
+    use: whatever the ranker keeps surfacing would otherwise compound its own
+    visibility, and an explicit write must not spend the exposure budget (nor the
+    reverse). This is a deliberate exposure rate-limit, NOT the canonical ACT-R
+    spacing effect.
     """
-    if window_seconds <= 0:
-        return True
-    history = payload.get(FIELD_REINFORCED_AT) or []
-    last = _parse_ts(history[-1]) if history else None
-    if last is None:
-        return True
     now = now or utcnow()
-    return (now - last).total_seconds() >= window_seconds
+    if window_seconds > 0:
+        history = payload.get(FIELD_REINFORCED_AT) or []
+        last = _parse_ts(history[-1]) if history else None
+        if last is not None and (now - last).total_seconds() < window_seconds:
+            return False
+    if trigger == TRIGGER_SEARCH and search_window_seconds > 0:
+        last_search = _parse_ts(payload.get(FIELD_LAST_SEARCH_REINFORCED_AT))
+        if last_search is not None and (now - last_search).total_seconds() < search_window_seconds:
+            return False
+    return True
 
 
 def reinforcement_fields(
@@ -184,6 +227,7 @@ def reinforcement_fields(
     *,
     now: Optional[datetime] = None,
     max_timestamps: int = 10,
+    trigger: str = TRIGGER_DEDUP,
 ) -> Dict[str, Any]:
     """Updated dynamics fields for one reinforcement event.
 
@@ -192,9 +236,13 @@ def reinforcement_fields(
     encounter so its first reinforcement yields a two-event history. The
     returned dict contains ONLY the dynamics fields, ready to merge into the
     payload.
+
+    ``reinforced_by`` stays positionally aligned with ``reinforced_at`` (same
+    append, same trim) so every retained timestamp keeps its provenance.
     """
     now = now or utcnow()
     history = list(payload.get(FIELD_REINFORCED_AT) or [])
+    origins = list(payload.get(FIELD_REINFORCED_BY) or [])
     count = payload.get(FIELD_ACCESS_COUNT)
     count = count if isinstance(count, int) and count > 0 else len(history)
 
@@ -202,16 +250,28 @@ def reinforcement_fields(
         created = payload.get("created_at")
         if created and _parse_ts(created) is not None:
             history = [created]
+            origins = [TRIGGER_CREATED]
             count = max(count, 1)
+
+    # A legacy timeline (pre-provenance) is padded so the alignment invariant
+    # holds from here on; unknown origins stay explicitly unknown, never guessed.
+    if len(origins) < len(history):
+        origins = [None] * (len(history) - len(origins)) + origins
 
     now_iso = now.isoformat()
     history.append(now_iso)
+    origins.append(trigger)
     count += 1
     if max_timestamps > 0 and len(history) > max_timestamps:
         history = history[-max_timestamps:]
+        origins = origins[-max_timestamps:]
 
-    return {
+    fields = {
         FIELD_REINFORCED_AT: history,
+        FIELD_REINFORCED_BY: origins,
         FIELD_ACCESS_COUNT: count,
         FIELD_LAST_ACCESSED: now_iso,
     }
+    if trigger == TRIGGER_SEARCH:
+        fields[FIELD_LAST_SEARCH_REINFORCED_AT] = now_iso
+    return fields

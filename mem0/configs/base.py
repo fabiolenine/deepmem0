@@ -85,6 +85,22 @@ class MemoryDynamicsConfig(BaseModel):
         " (async, fire-and-forget, never blocks the hot path).",
         default=False,
     )
+    reinforce_top_n: int = Field(
+        description="How many of the returned results a search reinforces (T3), counting"
+        " from the top. Being returned at rank 9 is list filler, not recall — reinforcing"
+        " the whole page inflates the timeline with memories the caller never used. 0 = the"
+        " entire returned page.",
+        default=3,
+    )
+    reinforce_on_search_window: int = Field(
+        description="Seconds during which further SEARCH reinforcements (T3) of the same"
+        " memory have no effect, tracked independently from reinforcement_window so an"
+        " explicit write (T1/T2) and a mere retrieval exposure do not share a budget."
+        " Retrieval is exposure, not confirmed use: a memory the ranker keeps surfacing"
+        " would otherwise compound its own visibility. 0 = fall back to"
+        " reinforcement_window.",
+        default=86400,
+    )
 
 
 class MemoryTemporalityConfig(BaseModel):

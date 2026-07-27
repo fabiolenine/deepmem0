@@ -47,6 +47,13 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
 LANGUAGE = os.environ.get("MEM0_LANGUAGE", "pt")
+# Event tie-break band (roadmap item 16) + fusion weight, both optional config
+# overrides. None => use the fork default (event_tie_band=0.002, weight=0.15).
+# CLI --event-tie-band wins over the env; resolved in main() after argparse.
+EVENT_TIE_BAND = (float(os.environ["MEM0_EVENT_TIE_BAND"])
+                  if os.environ.get("MEM0_EVENT_TIE_BAND") else None)
+EVENT_WEIGHT = (float(os.environ["MEM0_EVENT_WEIGHT"])
+                if os.environ.get("MEM0_EVENT_WEIGHT") else None)
 USER_ID = "event_date_demo"
 CONTROL_USER_ID = "event_date_demo_ctl"  # undated corpus, separate scope (C)
 
@@ -110,6 +117,16 @@ BORN_DAYS_AGO = 20  # uniform created_at so ACT-R activation is identical for al
 def build_memory(rerank: bool, event_ranking: bool = True, temporality_enabled: bool = True):
     from mem0 import Memory
 
+    # v0.6 / roadmap item 16: the post-rerank event tie-break band is a config
+    # knob (event_tie_band), NOT a search param — build_memory used to hardcode
+    # the temporality dict and silently pin the fork default (0.002), so
+    # `--rerank` could never test a candidate band. Pass it through explicitly
+    # (CLI --event-tie-band or MEM0_EVENT_TIE_BAND) and echo the effective value.
+    temporality = {"enabled": temporality_enabled, "event_ranking": event_ranking}
+    if EVENT_TIE_BAND is not None:
+        temporality["event_tie_band"] = EVENT_TIE_BAND
+    if EVENT_WEIGHT is not None:
+        temporality["event_ranking_weight"] = EVENT_WEIGHT
     config = {
         "language": LANGUAGE,
         "llm": {
@@ -130,7 +147,7 @@ def build_memory(rerank: bool, event_ranking: bool = True, temporality_enabled: 
             "provider": "ollama",
             "config": {"model": EMBED_MODEL, "embedding_dims": EMBED_DIMS, "ollama_base_url": OLLAMA_URL},
         },
-        "temporality": {"enabled": temporality_enabled, "event_ranking": event_ranking},
+        "temporality": temporality,
     }
     if rerank:
         config["reranker"] = {
@@ -216,14 +233,26 @@ def cleanup(collection):
 
 
 def main() -> int:
-    global ARGS
+    global ARGS, EVENT_TIE_BAND, EVENT_WEIGHT
     parser = argparse.ArgumentParser()
     parser.add_argument("--collection", default="deepmem0_event_date")
     parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--event-tie-band", type=float, default=None,
+                        help="post-rerank event tie-break band (default: fork 0.002). "
+                             "Overrides MEM0_EVENT_TIE_BAND. Roadmap item 16 calibration.")
+    parser.add_argument("--event-weight", type=float, default=None,
+                        help="fusion event_ranking_weight (default: fork 0.15). Overrides MEM0_EVENT_WEIGHT.")
     ARGS = parser.parse_args()
+    if ARGS.event_tie_band is not None:
+        EVENT_TIE_BAND = ARGS.event_tie_band
+    if ARGS.event_weight is not None:
+        EVENT_WEIGHT = ARGS.event_weight
 
-    print(f"collection={ARGS.collection} rerank={ARGS.rerank} embed={EMBED_MODEL} qdrant={QDRANT_URL}")
+    eff_band = EVENT_TIE_BAND if EVENT_TIE_BAND is not None else "0.002(fork default)"
+    eff_weight = EVENT_WEIGHT if EVENT_WEIGHT is not None else "0.15(fork default)"
+    print(f"collection={ARGS.collection} rerank={ARGS.rerank} embed={EMBED_MODEL} qdrant={QDRANT_URL} "
+          f"event_tie_band={eff_band} event_weight={eff_weight}")
     failures = []
     try:
         memory_on = build_memory(ARGS.rerank, event_ranking=True)
@@ -250,8 +279,9 @@ def main() -> int:
             elif ARGS.trace:
                 trace(memory_on, pair["query"], ids, f"A-miss right_rank={rr} wrong_rank={wr}")
         gate = "informational" if ARGS.rerank else "HARD"
+        band_note = f" band={EVENT_TIE_BAND if EVENT_TIE_BAND is not None else 0.002}" if ARGS.rerank else ""
         print(f"[A] correctly-dated twin outranks wrong-dated ({'rerank' if ARGS.rerank else 'fusion'}, "
-              f"{gate}): {a_wins}/{len(PAIRS)}")
+              f"{gate}{band_note}): {a_wins}/{len(PAIRS)}")
         if not ARGS.rerank and a_wins < len(PAIRS):
             failures.append("A")
 

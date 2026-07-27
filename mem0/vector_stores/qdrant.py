@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 class Qdrant(VectorStoreBase):
+    #: A payload-only ``update()`` goes through ``set_payload``, which MERGES the
+    #: given keys into the stored payload instead of replacing it. Callers that
+    #: only want to touch a few fields (reinforcement bookkeeping) can therefore
+    #: send just those fields, avoiding the read-modify-write that would revert a
+    #: concurrent writer's changes. Stores without this flag must be handed the
+    #: full payload.
+    PAYLOAD_UPDATE_MERGES = True
+
     def __init__(
         self,
         collection_name: str,

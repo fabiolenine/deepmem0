@@ -368,6 +368,39 @@ class TestEventPostRerank:
         assert by_id["y"]["event_proximity"] == 1.0
         assert "event_proximity" not in by_id["x"]  # only set when > 0
 
+    def test_actr_reorder_shifts_event_group_leader(self):
+        # /critic-plan #4 (roadmap item 16, measured 2026-07-26): the passes are
+        # DECOUPLED (independent bands) but NOT independent ALGORITHMS — the event
+        # pass runs on the list the ACT-R pass already reordered, and reads the
+        # FIRST item's base as the group leader. When ACT-R promotes a slightly
+        # lower-base item to the front, the event group's leader base DROPS, so a
+        # dated candidate enters the event tie group at a NARROWER band than it
+        # would from the original base leader.
+        #   bases: A=sig(0.006)=.50150  B=sig(0)=.5000  C=sig(-0.020)=.4950
+        #   A-B=.0015 (< ACT-R 0.002 -> B promoted)  B-C=.0050  A-C=.0065
+        # With ACT-R OFF the event leader is A: C rises only at band > A-C (.0065).
+        # With ACT-R ON, B (reinforced) leads: C rises at band > B-C (.0050). At
+        # band 0.006 the two diverge — proof the interaction is real (so an
+        # "undated query no-op" does NOT prove non-interaction on DATED queries).
+        band = 0.006
+        recent = ["2099-01-01T00:00:00+00:00"] * 3
+
+        def pool():
+            a = self._doc("A", 0.006, None)
+            b = self._doc("B", 0.000, None)
+            b["metadata"]["reinforced_at"] = recent
+            b["metadata"]["access_count"] = 3
+            c = self._doc("C", -0.020, "2023-10-17")
+            return [a, b, c]
+
+        temp = MemoryTemporalityConfig(event_tie_band=band)
+        dyn = MemoryDynamicsConfig()
+        off = [d["id"] for d in _apply_post_rerank_adjustments(pool(), temp=temp, event_anchor=self.ANCHOR)]
+        on = [d["id"] for d in _apply_post_rerank_adjustments(pool(), dyn=dyn, temp=temp, event_anchor=self.ANCHOR)]
+        assert off[0] == "A"   # ACT-R off: C not yet risen (band < A-C)
+        assert on[0] == "C"    # ACT-R on: B leads, C rises (band > B-C) -> interaction
+        assert off != on
+
 
 class TestEventSupersessionFactorial:
     """Activating the event term (which grows the divisor) must not flip pairs

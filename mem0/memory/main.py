@@ -69,6 +69,14 @@ from mem0.utils.factory import (
     VectorStoreFactory,
 )
 from mem0.utils.dynamics import (
+    DYNAMICS_FIELDS,
+    OUTCOME_APPLIED,
+    OUTCOME_FAILED,
+    OUTCOME_MISSING,
+    OUTCOME_SUPPRESSED,
+    TRIGGER_DEDUP,
+    TRIGGER_SEARCH,
+    TRIGGER_UPDATE,
     boost_from_payload,
     reinforcement_fields,
     should_reinforce,
@@ -714,42 +722,169 @@ def _collect_chain(get_fn, memory_id, max_hops: int = 256) -> List[str]:
     return ids
 
 
-def _reinforce_memory(vector_store, dyn, memory_id, payload) -> bool:
-    """One reinforcement event on a memory, honoring the reinforcement window.
+#: Hook for observability: called as ``(memory_id, trigger, outcome, elapsed_ms)``
+#: after EVERY reinforcement decision, whichever trigger made it. Kept as a plain
+#: module attribute so the companion (telemetry lives outside the core) can attach
+#: without patching three different call sites — the previous shape made T2
+#: invisible, since it wrote the timeline inline and never called the shared
+#: helper. Must never raise; exceptions here are swallowed.
+reinforcement_observer = None
 
-    Writes the FULL merged payload (not just the dynamics fields) so vector
-    stores that replace instead of merging payloads stay whole. Never raises —
-    reinforcement is bookkeeping and must not break add/update/search.
+
+def _notify_reinforcement(memory_id, trigger, outcome, elapsed_ms=0.0) -> None:
+    observer = reinforcement_observer
+    if observer is None:
+        return
+    try:
+        observer(memory_id, trigger, outcome, elapsed_ms)
+    except Exception:  # observability must never break bookkeeping
+        pass
+
+
+def plan_reinforcement(payload, dyn, trigger, *, now=None):
+    """THE single decision point for every trigger: should this memory be
+    reinforced now, and with which fields?
+
+    Returns ``(fields_or_None, outcome)``. T1/T3 hand the fields to the vector
+    store themselves; T2 merges them into the update it is already writing, so
+    the content update and its reinforcement stay one atomic write. Centralizing
+    only the DECISION (not the write) keeps that atomicity while making all three
+    triggers observable through one place.
     """
+    payload = payload or {}
+    if not should_reinforce(
+        payload,
+        now=now,
+        window_seconds=dyn.reinforcement_window,
+        trigger=trigger,
+        search_window_seconds=getattr(dyn, "reinforce_on_search_window", 0) or 0,
+    ):
+        return None, OUTCOME_SUPPRESSED
+    fields = reinforcement_fields(
+        payload, now=now, max_timestamps=dyn.max_timestamps, trigger=trigger
+    )
+    return fields, OUTCOME_APPLIED
+
+
+def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_DEDUP) -> str:
+    """One reinforcement event on a memory. Returns the structured outcome.
+
+    Writes ONLY the dynamics fields when the store merges payloads (Qdrant's
+    set_payload does), instead of re-writing the full payload read moments
+    earlier: that read-modify-write silently reverted any field a concurrent
+    writer had changed in between. Stores that REPLACE the payload still get the
+    full merge, or they would lose everything else.
+
+    Never raises — reinforcement is bookkeeping and must not break add/update/search.
+    """
+    started = time.time()
+    outcome = OUTCOME_FAILED
     try:
         payload = payload or {}
-        if not should_reinforce(payload, window_seconds=dyn.reinforcement_window):
-            return False
-        fields = reinforcement_fields(payload, max_timestamps=dyn.max_timestamps)
-        vector_store.update(vector_id=memory_id, payload={**payload, **fields})
-        return True
+        fields, outcome = plan_reinforcement(payload, dyn, trigger)
+        if fields is None:
+            return outcome
+        if getattr(vector_store, "PAYLOAD_UPDATE_MERGES", False):
+            vector_store.update(vector_id=memory_id, payload=fields)
+        else:
+            vector_store.update(vector_id=memory_id, payload={**payload, **fields})
+        return outcome
     except Exception as e:
         logger.warning(f"Reinforcement failed for memory {memory_id}: {e}")
+        outcome = OUTCOME_FAILED
+        return outcome
+    finally:
+        _notify_reinforcement(memory_id, trigger, outcome, (time.time() - started) * 1000.0)
+
+
+def _t3_enabled(dyn, reinforce) -> bool:
+    """Whether this particular search reinforces what it returns.
+
+    ``reinforce`` is the per-CALL override: ``False`` opts a search out even with
+    T3 globally on. Measurement harnesses MUST pass it — a golden set that runs
+    its own queries against the live corpus would otherwise reinforce its own
+    expected targets on every run, inflating the very metric it exists to
+    protect. ``None`` defers to the configured default.
+    """
+    if dyn is None or not dyn.reinforce_on_search:
         return False
+    return True if reinforce is None else bool(reinforce)
+
+
+def _t3_targets(dyn, memories) -> List[str]:
+    """Ids a search reinforces: the top ``reinforce_top_n`` returned (0 = all).
+
+    Being returned at rank 9 is list filler, not recall; reinforcing a whole page
+    would put the timeline at the mercy of ``limit`` rather than of use.
+    """
+    top_n = getattr(dyn, "reinforce_top_n", 0) or 0
+    selected = memories[:top_n] if top_n > 0 else memories
+    return [doc["id"] for doc in selected if doc.get("id")]
+
+
+#: Serial, bounded write-back. One thread per search created an unbounded number
+#: of threads under load and gave no way to see a backlog; a single worker with a
+#: capped queue makes the pressure visible (dropped events are counted, not lost
+#: silently) and keeps reinforcement strictly off the hot path.
+_REINFORCE_MAX_PENDING = 256
+_reinforce_executor = None
+_reinforce_pending = 0
+_reinforce_dropped = 0
+_reinforce_lock = threading.Lock()
+
+
+def _get_reinforce_executor():
+    global _reinforce_executor
+    if _reinforce_executor is None:
+        _reinforce_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="deepmem0-reinforce"
+        )
+    return _reinforce_executor
+
+
+def reinforcement_backlog() -> Dict[str, int]:
+    """Queue depth and dropped count — the backpressure signal for telemetry."""
+    return {"pending": _reinforce_pending, "dropped": _reinforce_dropped}
 
 
 def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
     """T3: reinforce searched-and-returned memories off the hot path.
 
-    Fire-and-forget daemon thread; each memory is re-fetched so the window
-    check and the merge run against fresh payload, not the search snapshot.
+    Each memory is re-fetched so the window check and the merge run against fresh
+    payload, not the search snapshot.
     """
+    global _reinforce_pending, _reinforce_dropped
 
     def _run():
-        for memory_id in memory_ids:
-            try:
-                mem = vector_store.get(vector_id=memory_id)
-                if mem is not None:
-                    _reinforce_memory(vector_store, dyn, memory_id, getattr(mem, "payload", None))
-            except Exception as e:
-                logger.debug(f"Access reinforcement skipped for {memory_id}: {e}")
+        global _reinforce_pending
+        try:
+            for memory_id in memory_ids:
+                try:
+                    mem = vector_store.get(vector_id=memory_id)
+                    if mem is None:
+                        _notify_reinforcement(memory_id, TRIGGER_SEARCH, OUTCOME_MISSING)
+                        continue
+                    _reinforce_memory(
+                        vector_store, dyn, memory_id,
+                        getattr(mem, "payload", None), trigger=TRIGGER_SEARCH,
+                    )
+                except Exception as e:
+                    logger.debug(f"Access reinforcement skipped for {memory_id}: {e}")
+                    _notify_reinforcement(memory_id, TRIGGER_SEARCH, OUTCOME_FAILED)
+        finally:
+            with _reinforce_lock:
+                _reinforce_pending -= 1
 
-    threading.Thread(target=_run, daemon=True, name="deepmem0-reinforce").start()
+    with _reinforce_lock:
+        if _reinforce_pending >= _REINFORCE_MAX_PENDING:
+            _reinforce_dropped += len(memory_ids)
+            logger.warning(
+                "Reinforcement backlog full (%d pending); dropped %d search hits",
+                _reinforce_pending, len(memory_ids),
+            )
+            return
+        _reinforce_pending += 1
+    _get_reinforce_executor().submit(_run)
 
 
 def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None) -> List[Dict[str, Any]]:
@@ -776,7 +911,13 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
     0.0 and ordering falls through to activation exactly as before. Memories
     without dynamics/temporality/event fields keep their reranked order.
     """
-    dyn_active = dyn is not None and dyn.weight > 0
+    # v0.2 tie-break runs whenever dynamics is on and has a band — INDEPENDENT of
+    # dynamics.weight, which gates ONLY the fusion term (mirroring how v0.6 gates
+    # its event tie-break). Conflating the two made "tie-break only" unreachable:
+    # zeroing the fusion weight to keep exposure bias out of pool composition also
+    # silently killed the bounded post-rerank tie-break, the one form of activation
+    # the 2026-07-21 ablation actually vindicated.
+    dyn_active = dyn is not None and (getattr(dyn, "tie_band", 0.0) or 0.0) > 0
     temp_active = temp is not None and temp.superseded_penalty > 0
     # v0.6 tie-break runs whenever event_ranking is on and the query has an anchor
     # — INDEPENDENT of event_ranking_weight (weight only gates the fusion term, so
@@ -1459,7 +1600,10 @@ class Memory(MemoryBase):
                 # any, is ignored by design.)
                 existing = existing_by_hash.get(mem_hash)
                 if dyn is not None and existing is not None:
-                    _reinforce_memory(self.vector_store, dyn, existing.id, existing.payload)
+                    _reinforce_memory(
+                        self.vector_store, dyn, existing.id, existing.payload,
+                        trigger=TRIGGER_DEDUP,
+                    )
                 continue
             seen_hashes.add(mem_hash)
 
@@ -1875,6 +2019,7 @@ class Memory(MemoryBase):
         as_of: Optional[str] = None,
         event_from: Optional[str] = None,
         event_to: Optional[str] = None,
+        reinforce: Optional[bool] = None,
         **kwargs,
     ):
         """
@@ -2110,9 +2255,9 @@ class Memory(MemoryBase):
         # Only the memories actually returned to the caller are reinforced,
         # asynchronously, so the hot path never pays for the write-back.
         dyn = _dynamics_config(self.config)
-        if dyn is not None and dyn.reinforce_on_search and original_memories:
+        if _t3_enabled(dyn, reinforce) and original_memories:
             _reinforce_hits_in_background(
-                self.vector_store, dyn, [doc["id"] for doc in original_memories if doc.get("id")]
+                self.vector_store, dyn, _t3_targets(dyn, original_memories)
             )
 
         if temporal_usage_notice:
@@ -2826,12 +2971,13 @@ class Memory(MemoryBase):
         # Inside the reinforcement window the content update still applies; only
         # the reinforcement bookkeeping is suppressed (fields carry over as-is).
         dyn = _dynamics_config(self.config)
-        if dyn is not None and should_reinforce(
-            existing_memory.payload, window_seconds=dyn.reinforcement_window
-        ):
-            new_metadata.update(
-                reinforcement_fields(existing_memory.payload, max_timestamps=dyn.max_timestamps)
+        if dyn is not None:
+            _fields, _outcome = plan_reinforcement(
+                existing_memory.payload, dyn, TRIGGER_UPDATE
             )
+            if _fields:
+                new_metadata.update(_fields)
+            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
@@ -3531,7 +3677,9 @@ class AsyncMemory(MemoryBase):
                 existing = existing_by_hash.get(mem_hash)
                 if dyn is not None and existing is not None:
                     await asyncio.to_thread(
-                        _reinforce_memory, self.vector_store, dyn, existing.id, existing.payload
+                        _reinforce_memory,
+                        self.vector_store, dyn, existing.id, existing.payload,
+                        trigger=TRIGGER_DEDUP,
                     )
                 continue
             seen_hashes.add(mem_hash)
@@ -3944,6 +4092,7 @@ class AsyncMemory(MemoryBase):
         as_of: Optional[str] = None,
         event_from: Optional[str] = None,
         event_to: Optional[str] = None,
+        reinforce: Optional[bool] = None,
         **kwargs,
     ):
         """
@@ -4181,9 +4330,9 @@ class AsyncMemory(MemoryBase):
 
         # DeepMem0 v0.2 (T3, opt-in): reinforce returned memories off the hot path.
         dyn = _dynamics_config(self.config)
-        if dyn is not None and dyn.reinforce_on_search and original_memories:
+        if _t3_enabled(dyn, reinforce) and original_memories:
             _reinforce_hits_in_background(
-                self.vector_store, dyn, [doc["id"] for doc in original_memories if doc.get("id")]
+                self.vector_store, dyn, _t3_targets(dyn, original_memories)
             )
 
         if temporal_usage_notice:
@@ -4894,12 +5043,13 @@ class AsyncMemory(MemoryBase):
 
         # DeepMem0 v0.2 (T2): an updated fact is alive — reinforce its timeline.
         dyn = _dynamics_config(self.config)
-        if dyn is not None and should_reinforce(
-            existing_memory.payload, window_seconds=dyn.reinforcement_window
-        ):
-            new_metadata.update(
-                reinforcement_fields(existing_memory.payload, max_timestamps=dyn.max_timestamps)
+        if dyn is not None:
+            _fields, _outcome = plan_reinforcement(
+                existing_memory.payload, dyn, TRIGGER_UPDATE
             )
+            if _fields:
+                new_metadata.update(_fields)
+            _notify_reinforcement(memory_id, TRIGGER_UPDATE, _outcome)
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
