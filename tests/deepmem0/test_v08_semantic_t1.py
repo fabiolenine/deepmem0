@@ -99,6 +99,15 @@ class TestDigitGuard:
         assert _digits_compatible("timeout de 10 segundos", "timeout de 10 segundos e retry de 10")
         assert not _digits_compatible("timeout de 10 e 20 segundos", "timeout de 20 e 30 segundos")
 
+    def test_one_sided_digits_is_compatible_by_policy(self):
+        # POLÍTICA (pinada pelo /critic-results): o multiset vazio é o extremo
+        # do subset — um texto SEM dígitos é compatível com qualquer um. A
+        # re-declaração comprimida ("há um limite diário definido") pode reforçar
+        # o fato numérico ("limite diário de 1,5 mil"); a ≥0.95 de cosseno isso é
+        # quase sempre o mesmo fato. Mudar isto é decisão, não bug.
+        assert _digits_compatible("há um limite diário de requisições definido no serviço",
+                                  "no serviço o limite diário de requisições é de 1,5 mil")
+
 
 class TestSimilarTarget:
     def test_fires_at_threshold(self):
