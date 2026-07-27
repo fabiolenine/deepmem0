@@ -192,6 +192,17 @@ if __name__ == "__main__":
 
     print(f"collection={ARGS.collection} rerank={ARGS.rerank} embed={EMBED_MODEL}")
 
+    # A collection PRECISA começar vazia: rodar duas vezes seguidas deixava as
+    # timelines da rodada anterior no lugar, o dedup por hash disparava T1 nos
+    # adds do seed e o teste [A] ("corpus fresco, ON==OFF") reprovava por
+    # sujeira, não por regressão — um falso alarme que custa investigação.
+    try:
+        from qdrant_client import QdrantClient
+
+        QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY).delete_collection(ARGS.collection)
+    except Exception:
+        pass
+
     memory_on = build_memory(ARGS.rerank, dynamics_enabled=True)
     ids = seed(memory_on)
     print(f"seeded {len(ids)} memories ({len(PAIRS)} twin pairs + {len(DISTRACTORS)} distractors)")

@@ -9,6 +9,7 @@ from mem0.memory.main import (
     _reinforce_memory,
 )
 from mem0.utils.dynamics import (
+    FIELD_REINFORCE_COUNTS,
     DYNAMICS_FIELDS,
     FIELD_LAST_SEARCH_REINFORCED_AT,
     FIELD_REINFORCED_BY,
@@ -307,7 +308,8 @@ class TestReinforceMemory:
         seen = []
         store = FakeVectorStore()
         dyn = MemoryDynamicsConfig()
-        main_mod.reinforcement_observer = lambda mid, trig, out, ms: seen.append((mid, trig, out))
+        main_mod.reinforcement_observer = lambda mid, trig, out, ms, ctx=None: seen.append(
+            (mid, trig, out))
         try:
             _reinforce_memory(store, dyn, "mem-1", {"data": "x"}, trigger="t1")
             _reinforce_memory(store, dyn, "mem-2", {"data": "y"}, trigger="t3")
@@ -318,6 +320,38 @@ class TestReinforceMemory:
         assert [t for _, t, _ in seen] == ["t1", "t3", "t2"]
         assert {o for _, _, o in seen} == {"applied"}
         assert fields is not None
+
+    def test_t2_does_not_exist_under_version_on_update(self):
+        """Dependência SILENCIOSA que ninguém tinha documentado: com
+        version_on_update ligado (default do fork) o update roteia para o
+        caminho versionado, a versão nova nasce neutra e o gatilho T2
+        simplesmente não acontece. Produção só tem T2 hoje porque um drop-in de
+        contenção do v0.7 desliga o versionamento — se ele sair, um gatilho
+        desaparece sem aviso."""
+        import inspect
+
+        import mem0.memory.main as main_mod
+
+        src = inspect.getsource(main_mod.Memory._update_memory)
+        version_return = src.index("return self._version_update(")
+        t2_block = src.index("TRIGGER_UPDATE")
+        assert version_return < t2_block, (
+            "o caminho versionado precisa retornar ANTES do bloco T2 — se isso "
+            "mudar, o contrato dos gatilhos mudou junto")
+
+    def test_embedding_happens_before_the_authoritative_read(self):
+        """O trecho lento (embed) rodava DEPOIS da leitura, envelhecendo o
+        payload: um T3 que chegasse no intervalo era apagado pelo upsert de
+        payload completo. Isto reduz a janela — não a elimina."""
+        import inspect
+
+        import mem0.memory.main as main_mod
+
+        for fn in (main_mod.Memory._update_memory, main_mod.AsyncMemory._update_memory):
+            src = inspect.getsource(fn)
+            embed_at = src.index("embedding_model.embed")
+            read_at = src.index("vector_store.get")
+            assert embed_at < read_at, f"{fn.__qualname__}: embed tem que vir antes da leitura"
 
     def test_t2_reports_applied_only_after_the_write_lands(self):
         """A telemetria do T2 emitia 'applied' ANTES da escrita do update: uma
@@ -443,18 +477,191 @@ class TestSearchReinforcementGate:
 
         assert _t3_enabled(None, True) is False
 
-    def test_top_n_limits_what_a_search_reinforces(self):
+    def _targets(self, dyn, docs):
         from mem0.memory.main import _t3_targets
 
+        return _t3_targets(dyn, docs, search_id="sid", exposed_at=NOW)
+
+    def test_top_n_limits_what_a_search_reinforces(self):
         docs = [{"id": f"m{i}"} for i in range(10)]
-        assert _t3_targets(self._dyn(reinforce_top_n=3), docs) == ["m0", "m1", "m2"]
-        assert len(_t3_targets(self._dyn(reinforce_top_n=0), docs)) == 10
+        got = self._targets(self._dyn(reinforce_top_n=3), docs)
+        assert [t.memory_id for t in got] == ["m0", "m1", "m2"]
+        assert len(self._targets(self._dyn(reinforce_top_n=0), docs)) == 10
 
     def test_targets_skip_docs_without_id(self):
+        docs = [{"id": "m0"}, {"score": 1}, {"id": "m1"}]
+        assert [t.memory_id for t in self._targets(self._dyn(), docs)] == ["m0", "m1"]
+
+    def test_target_carries_rank_search_id_and_exposure_time(self):
+        """Correlação e instante de exposição viajam POR VALOR: o reforço roda
+        noutra thread e, no async, tasks concorrentes dividem a thread do loop —
+        contexto implícito vazaria ou sumiria."""
+        docs = [{"id": "a", "metadata": {"domain": "ai"}}, {"id": "b"}]
+        got = self._targets(self._dyn(), docs)
+        assert [t.rank for t in got] == [1, 2]  # 1-based, posição na página final
+        assert {t.search_id for t in got} == {"sid"}
+        assert all(t.exposed_at == NOW for t in got)
+        assert got[0].snapshot == {"domain": "ai"}
+        assert got[1].snapshot == {}
+
+
+class TestReinforceCounts:
+    """A tally por gatilho existe porque `reinforced_by` trunca em K=10: sem ela,
+    passando de dez eventos o breakdown some em silêncio."""
+
+    def test_counts_only_real_events_not_the_created_seed(self):
+        fields = reinforcement_fields({"created_at": hours_ago(72)}, trigger="t3")
+        assert fields[FIELD_REINFORCE_COUNTS] == {"t3": 1}
+        assert fields["access_count"] == 2  # a semente conta no access_count...
+        # ...mas NÃO na tally: o invariante é sum(counts) == access_count - semente
+        assert sum(fields[FIELD_REINFORCE_COUNTS].values()) == fields["access_count"] - 1
+
+    def test_legacy_timeline_migrates_to_unknown_never_guessed(self):
+        payload = {
+            "created_at": hours_ago(100),
+            "reinforced_at": [hours_ago(100), hours_ago(50), hours_ago(20)],
+            "access_count": 3,
+        }
+        fields = reinforcement_fields(payload, trigger="t1")
+        assert fields[FIELD_REINFORCE_COUNTS] == {"unknown": 2, "t1": 1}
+        assert sum(fields[FIELD_REINFORCE_COUNTS].values()) == fields["access_count"] - 1
+
+    def test_tally_survives_the_trim(self):
+        payload = {
+            "created_at": hours_ago(200),
+            "reinforced_at": [hours_ago(100 - i) for i in range(10)],
+            FIELD_REINFORCED_BY: ["t3"] * 10,
+            FIELD_REINFORCE_COUNTS: {"t3": 40},
+            "access_count": 41,
+        }
+        fields = reinforcement_fields(payload, max_timestamps=10, trigger="t3")
+        assert len(fields["reinforced_at"]) == 10          # timestamps truncados
+        assert fields[FIELD_REINFORCE_COUNTS] == {"t3": 41}  # contagem inteira
+
+    def test_malformed_tally_is_dropped_not_propagated(self):
+        payload = {"created_at": hours_ago(72), FIELD_REINFORCE_COUNTS: {"t3": "muitos"}}
+        fields = reinforcement_fields(payload, trigger="t2")
+        assert fields[FIELD_REINFORCE_COUNTS] == {"t2": 1}
+
+    def test_tally_is_not_inherited_by_a_new_version(self):
+        from mem0.memory.main import _VERSION_NON_INHERITED
+
+        assert FIELD_REINFORCE_COUNTS in _VERSION_NON_INHERITED
+
+
+class TestExposureTime:
+    """O timestamp do T3 é o instante em que o caller VIU a memória, não o
+    instante em que o worker rodou. Sob backlog os dois divergem, e a diferença
+    cai direto na linha do tempo ACT-R e nas duas janelas."""
+
+    def _store(self):
+        class S(FakeVectorStore):
+            PAYLOAD_UPDATE_MERGES = True
+
+        return S()
+
+    def test_written_timestamp_is_the_exposure_instant(self):
+        store = self._store()
+        exposed = NOW - timedelta(hours=6)  # job atrasado 6h
+        _reinforce_memory(store, MemoryDynamicsConfig(), "m", {"created_at": hours_ago(72)},
+                          trigger=TRIGGER_SEARCH, now=exposed)
+        _vid, written = store.updates[0]
+        assert written["reinforced_at"][-1] == exposed.isoformat()
+
+    def test_a_write_after_the_exposure_suppresses_the_late_job(self):
+        """T2 aconteceu DEPOIS da exposição e ANTES do job T3: o evento antigo
+        não pode ser anexado fora de ordem nem reabrir a janela."""
+        store = self._store()
+        exposed = NOW - timedelta(hours=6)
+        payload = {"reinforced_at": [(NOW - timedelta(minutes=5)).isoformat()]}
+        outcome = _reinforce_memory(store, MemoryDynamicsConfig(), "m", payload,
+                                    trigger=TRIGGER_SEARCH, now=exposed)
+        assert outcome == "suppressed"
+        assert store.updates == []
+
+
+class TestBackgroundDispatch:
+    """Pré-filtro NEGATIVO, contadores na mesma unidade e drop visível."""
+
+    def _dyn(self):
+        return MemoryDynamicsConfig(reinforce_on_search=True, reinforce_top_n=0)
+
+    def _targets(self, docs, exposed_at=None):
         from mem0.memory.main import _t3_targets
 
-        docs = [{"id": "m0"}, {"score": 1}, {"id": "m1"}]
-        assert _t3_targets(self._dyn(reinforce_top_n=0), docs) == ["m0", "m1"]
+        return _t3_targets(self._dyn(), docs, search_id="sid",
+                           exposed_at=exposed_at or datetime.now(timezone.utc))
+
+    def test_snapshot_inside_the_window_never_costs_a_fetch(self):
+        import mem0.memory.main as main_mod
+
+        class ExplodingStore:
+            def get(self, vector_id):
+                raise AssertionError("não deveria buscar payload de alvo suprimido")
+
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        docs = [{"id": "x", "metadata": {"reinforced_at": [recent],
+                                         "last_search_reinforced_at": recent}}]
+        seen = []
+        main_mod.reinforcement_observer = lambda *a: seen.append((a[2], a[4]))
+        try:
+            main_mod._reinforce_hits_in_background(ExplodingStore(), self._dyn(),
+                                                   self._targets(docs))
+        finally:
+            main_mod.reinforcement_observer = None
+        assert seen and seen[0][0] == "suppressed"
+        assert seen[0][1]["prefiltered"] is True
+
+    def test_backlog_full_emits_a_dropped_event_per_memory(self):
+        import mem0.memory.main as main_mod
+
+        seen = []
+        main_mod.reinforcement_observer = lambda *a: seen.append((a[1], a[2]))
+        original = main_mod._reinforce_pending
+        main_mod._reinforce_pending = main_mod._REINFORCE_MAX_PENDING
+        try:
+            docs = [{"id": "a", "metadata": {}}, {"id": "b", "metadata": {}}]
+            main_mod._reinforce_hits_in_background(FakeVectorStore(), self._dyn(),
+                                                   self._targets(docs))
+        finally:
+            main_mod._reinforce_pending = original
+            main_mod.reinforcement_observer = None
+        # drop é EVENTO, não só contador: antes a exposição descartada não
+        # aparecia em lugar nenhum do stream.
+        assert [o for _t, o in seen] == ["dropped", "dropped"]
+
+    def test_counters_use_the_same_unit(self):
+        """`pending` contava JOBS e `dropped` contava MEMÓRIAS no mesmo gauge."""
+        import mem0.memory.main as main_mod
+
+        original = main_mod._reinforce_dropped
+        main_mod._reinforce_pending = main_mod._REINFORCE_MAX_PENDING
+        try:
+            docs = [{"id": f"m{i}", "metadata": {}} for i in range(3)]
+            main_mod._reinforce_hits_in_background(FakeVectorStore(), self._dyn(),
+                                                   self._targets(docs))
+            assert main_mod.reinforcement_backlog()["dropped"] == original + 3
+        finally:
+            main_mod._reinforce_pending = 0
+            main_mod._reinforce_dropped = original
+
+    def test_submit_failure_does_not_leak_pending(self):
+        import mem0.memory.main as main_mod
+
+        class BrokenExecutor:
+            def submit(self, *a, **k):
+                raise RuntimeError("interpreter shutting down")
+
+        original_get = main_mod._get_reinforce_executor
+        main_mod._get_reinforce_executor = lambda: BrokenExecutor()
+        before = main_mod.reinforcement_backlog()["pending"]
+        try:
+            docs = [{"id": "a", "metadata": {}}]
+            main_mod._reinforce_hits_in_background(FakeVectorStore(), self._dyn(),
+                                                   self._targets(docs))
+        finally:
+            main_mod._get_reinforce_executor = original_get
+        assert main_mod.reinforcement_backlog()["pending"] == before
 
 
 class TestWindowInteraction:

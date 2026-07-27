@@ -12,7 +12,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -71,6 +71,7 @@ from mem0.utils.factory import (
 from mem0.utils.dynamics import (
     DYNAMICS_FIELDS,
     OUTCOME_APPLIED,
+    OUTCOME_DROPPED,
     OUTCOME_FAILED,
     OUTCOME_MISSING,
     OUTCOME_SUPPRESSED,
@@ -727,23 +728,49 @@ def _collect_chain(get_fn, memory_id, max_hops: int = 256) -> List[str]:
     return ids
 
 
-#: Hook for observability: called as ``(memory_id, trigger, outcome, elapsed_ms)``
-#: after EVERY reinforcement decision, whichever trigger made it. Kept as a plain
-#: module attribute so the companion (telemetry lives outside the core) can attach
+#: Hook for observability: called as
+#: ``(memory_id, trigger, outcome, elapsed_ms, context)`` after EVERY
+#: reinforcement decision, whichever trigger made it. Kept as a plain module
+#: attribute so the companion (telemetry lives outside the core) can attach
 #: without patching three different call sites — the previous shape made T2
 #: invisible, since it wrote the timeline inline and never called the shared
-#: helper. Must never raise; exceptions here are swallowed.
+#: helper. ``context`` carries the search correlation for T3 (search_id, rank)
+#: and is None for write triggers. Must never raise; exceptions are swallowed.
 reinforcement_observer = None
 
 
-def _notify_reinforcement(memory_id, trigger, outcome, elapsed_ms=0.0) -> None:
+def _notify_reinforcement(memory_id, trigger, outcome, elapsed_ms=0.0, context=None) -> None:
     observer = reinforcement_observer
     if observer is None:
         return
     try:
-        observer(memory_id, trigger, outcome, elapsed_ms)
+        observer(memory_id, trigger, outcome, elapsed_ms, context)
     except Exception:  # observability must never break bookkeeping
         pass
+
+
+class ReinforcementTarget(NamedTuple):
+    """One memory a search exposed, with everything the write-back needs.
+
+    Correlation travels EXPLICITLY, by value, from the search thread into the
+    executor. A thread-local would not survive the hop (the executor runs on its
+    own thread) and would be worse than useless on the async path, where many
+    tasks share the event-loop thread and would overwrite each other's context.
+
+    ``exposed_at`` is the moment the caller SAW the memory, not the moment the
+    worker got around to writing it: under backlog those differ, and the
+    difference lands straight in the ACT-R timeline and in both windows.
+
+    ``snapshot`` is the metadata the search already carried — used only as a
+    NEGATIVE pre-filter (skip a fetch that the window will surely suppress);
+    the fresh payload remains the authority.
+    """
+
+    memory_id: str
+    rank: int  # 1-based, position in the FINAL page the caller received
+    search_id: str
+    exposed_at: Any
+    snapshot: dict
 
 
 def plan_reinforcement(payload, dyn, trigger, *, now=None):
@@ -771,7 +798,8 @@ def plan_reinforcement(payload, dyn, trigger, *, now=None):
     return fields, OUTCOME_APPLIED
 
 
-def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_DEDUP) -> str:
+def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_DEDUP,
+                      now=None, context=None) -> str:
     """One reinforcement event on a memory. Returns the structured outcome.
 
     Writes ONLY the dynamics fields when the store merges payloads (Qdrant's
@@ -795,7 +823,11 @@ def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_
     outcome = OUTCOME_FAILED
     try:
         payload = payload or {}
-        fields, outcome = plan_reinforcement(payload, dyn, trigger)
+        # `now` = when the memory was ENCOUNTERED. For T3 that is the exposure
+        # instant, so a late job neither back-dates nor re-opens a window: if a
+        # write landed after the exposure, the window check sees a negative
+        # delta and suppresses, which is the correct ordering.
+        fields, outcome = plan_reinforcement(payload, dyn, trigger, now=now)
         if fields is None:
             return outcome
         if getattr(vector_store, "PAYLOAD_UPDATE_MERGES", False):
@@ -808,7 +840,8 @@ def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_
         outcome = OUTCOME_FAILED
         return outcome
     finally:
-        _notify_reinforcement(memory_id, trigger, outcome, (time.time() - started) * 1000.0)
+        _notify_reinforcement(memory_id, trigger, outcome,
+                              (time.time() - started) * 1000.0, context)
 
 
 def _t3_enabled(dyn, reinforce) -> bool:
@@ -825,21 +858,33 @@ def _t3_enabled(dyn, reinforce) -> bool:
     return True if reinforce is None else bool(reinforce)
 
 
-def _t3_targets(dyn, memories) -> List[str]:
-    """Ids a search reinforces: the top ``reinforce_top_n`` returned (0 = all).
+def _t3_targets(dyn, memories, *, search_id, exposed_at) -> List[ReinforcementTarget]:
+    """What a search reinforces: the top ``reinforce_top_n`` returned (0 = all).
 
     Being returned at rank 9 is list filler, not recall; reinforcing a whole page
     would put the timeline at the mercy of ``limit`` rather than of use.
     """
     top_n = getattr(dyn, "reinforce_top_n", 0) or 0
     selected = memories[:top_n] if top_n > 0 else memories
-    return [doc["id"] for doc in selected if doc.get("id")]
+    return [
+        ReinforcementTarget(
+            memory_id=doc["id"],
+            rank=i,
+            search_id=search_id,
+            exposed_at=exposed_at,
+            snapshot=doc.get("metadata") or {},
+        )
+        for i, doc in enumerate(selected, start=1)
+        if doc.get("id")
+    ]
 
 
 #: Serial, bounded write-back. One thread per search created an unbounded number
 #: of threads under load and gave no way to see a backlog; a single worker with a
 #: capped queue makes the pressure visible (dropped events are counted, not lost
 #: silently) and keeps reinforcement strictly off the hot path.
+#: Backlog cap in TARGETS (memories), the same unit the counters use: mixing
+#: "jobs pending" with "memories dropped" made the gauge unreadable.
 _REINFORCE_MAX_PENDING = 256
 _reinforce_executor = None
 _reinforce_pending = 0
@@ -848,57 +893,110 @@ _reinforce_lock = threading.Lock()
 
 
 def _get_reinforce_executor():
+    """Lazy singleton. Creation happens UNDER the lock: check-then-act outside it
+    let two threads build two executors, leaking one silently."""
     global _reinforce_executor
-    if _reinforce_executor is None:
-        _reinforce_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="deepmem0-reinforce"
-        )
-    return _reinforce_executor
+    with _reinforce_lock:
+        if _reinforce_executor is None:
+            _reinforce_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="deepmem0-reinforce"
+            )
+        return _reinforce_executor
 
 
 def reinforcement_backlog() -> Dict[str, int]:
-    """Queue depth and dropped count — the backpressure signal for telemetry."""
-    return {"pending": _reinforce_pending, "dropped": _reinforce_dropped}
+    """Backpressure signal for telemetry, both counters in MEMORIES.
+
+    ``dropped`` is cumulative since process start — it resets on restart, so read
+    it as a rate, never as a lifetime total.
+    """
+    with _reinforce_lock:
+        return {"pending": _reinforce_pending, "dropped": _reinforce_dropped}
 
 
-def _reinforce_hits_in_background(vector_store, dyn, memory_ids) -> None:
+def _reinforce_hits_in_background(vector_store, dyn, targets) -> None:
     """T3: reinforce searched-and-returned memories off the hot path.
 
     Each memory is re-fetched so the window check and the merge run against fresh
-    payload, not the search snapshot.
+    payload, not the search snapshot — the snapshot only skips work that would
+    surely be suppressed.
     """
     global _reinforce_pending, _reinforce_dropped
+
+    if not targets:
+        return
+    window = getattr(dyn, "reinforcement_window", 0) or 0
+    search_window = getattr(dyn, "reinforce_on_search_window", 0) or 0
 
     def _run():
         global _reinforce_pending
         try:
-            for memory_id in memory_ids:
+            for target in targets:
                 try:
-                    mem = vector_store.get(vector_id=memory_id)
+                    mem = vector_store.get(vector_id=target.memory_id)
+                    context = {"search_id": target.search_id, "rank": target.rank}
                     if mem is None:
-                        _notify_reinforcement(memory_id, TRIGGER_SEARCH, OUTCOME_MISSING)
+                        _notify_reinforcement(target.memory_id, TRIGGER_SEARCH,
+                                              OUTCOME_MISSING, 0.0, context)
                         continue
                     _reinforce_memory(
-                        vector_store, dyn, memory_id,
+                        vector_store, dyn, target.memory_id,
                         getattr(mem, "payload", None), trigger=TRIGGER_SEARCH,
+                        now=target.exposed_at, context=context,
                     )
                 except Exception as e:
-                    logger.debug(f"Access reinforcement skipped for {memory_id}: {e}")
-                    _notify_reinforcement(memory_id, TRIGGER_SEARCH, OUTCOME_FAILED)
+                    logger.debug(f"Access reinforcement skipped for {target.memory_id}: {e}")
+                    _notify_reinforcement(target.memory_id, TRIGGER_SEARCH, OUTCOME_FAILED,
+                                          0.0, {"search_id": target.search_id,
+                                                "rank": target.rank})
         finally:
             with _reinforce_lock:
-                _reinforce_pending -= 1
+                _reinforce_pending -= len(targets)
+
+    # NEGATIVE pre-filter only: the snapshot the search already carried can prove
+    # a target is inside its window, and then there is no reason to pay a fetch.
+    # It can never prove the opposite — "looks eligible" still goes to the fresh
+    # payload, which decides.
+    eligible = [
+        t for t in targets
+        if should_reinforce(t.snapshot, now=t.exposed_at, window_seconds=window,
+                            trigger=TRIGGER_SEARCH, search_window_seconds=search_window)
+    ]
+    for skipped in (t for t in targets if t not in eligible):
+        _notify_reinforcement(skipped.memory_id, TRIGGER_SEARCH, OUTCOME_SUPPRESSED, 0.0,
+                              {"search_id": skipped.search_id, "rank": skipped.rank,
+                               "prefiltered": True})
+    if not eligible:
+        return
+    targets = eligible
 
     with _reinforce_lock:
-        if _reinforce_pending >= _REINFORCE_MAX_PENDING:
-            _reinforce_dropped += len(memory_ids)
+        if _reinforce_pending + len(targets) > _REINFORCE_MAX_PENDING:
+            _reinforce_dropped += len(targets)
+            dropped = list(targets)
             logger.warning(
                 "Reinforcement backlog full (%d pending); dropped %d search hits",
-                _reinforce_pending, len(memory_ids),
+                _reinforce_pending, len(targets),
             )
-            return
-        _reinforce_pending += 1
-    _get_reinforce_executor().submit(_run)
+        else:
+            _reinforce_pending += len(targets)
+            dropped = None
+    if dropped is not None:
+        # A drop is an EVENT, not just a counter: without this the stream showed
+        # nothing at all for exposures that were thrown away.
+        for t in dropped:
+            _notify_reinforcement(t.memory_id, TRIGGER_SEARCH, OUTCOME_DROPPED, 0.0,
+                                  {"search_id": t.search_id, "rank": t.rank})
+        return
+    try:
+        _get_reinforce_executor().submit(_run)
+    except Exception as exc:  # submit itself can fail (interpreter shutdown)
+        with _reinforce_lock:
+            _reinforce_pending -= len(targets)  # or the gauge leaks forever
+        logger.warning("Reinforcement submit failed: %s", exc)
+        for t in targets:
+            _notify_reinforcement(t.memory_id, TRIGGER_SEARCH, OUTCOME_FAILED, 0.0,
+                                  {"search_id": t.search_id, "rank": t.rank})
 
 
 def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None) -> List[Dict[str, Any]]:
@@ -2034,6 +2132,7 @@ class Memory(MemoryBase):
         event_from: Optional[str] = None,
         event_to: Optional[str] = None,
         reinforce: Optional[bool] = None,
+        search_id: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -2270,8 +2369,14 @@ class Memory(MemoryBase):
         # asynchronously, so the hot path never pays for the write-back.
         dyn = _dynamics_config(self.config)
         if _t3_enabled(dyn, reinforce) and original_memories:
+            # exposed_at é AGORA — o instante em que o caller viu estas memórias.
+            # O worker pode rodar muito depois; usar o relógio dele deslocaria a
+            # linha do tempo e as duas janelas.
             _reinforce_hits_in_background(
-                self.vector_store, dyn, _t3_targets(dyn, original_memories)
+                self.vector_store, dyn,
+                _t3_targets(dyn, original_memories,
+                            search_id=search_id or uuid.uuid4().hex[:16],
+                            exposed_at=_dynamics_utcnow()),
             )
 
         if temporal_usage_notice:
@@ -2953,8 +3058,22 @@ class Memory(MemoryBase):
     def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
+            # ⚠️ T2 NÃO EXISTE neste modo: a versão nova nasce neutra por desenho
+            # (v0.7). Ligar/desligar version_on_update muda quais gatilhos de
+            # reforço existem — é dependência silenciosa, pinada em teste.
             return self._version_update(memory_id, data, existing_embeddings, metadata, temp)
         logger.info(f"Updating memory with {data=}")
+
+        # Embedding ANTES da leitura autoritativa: é o trecho lento (centenas de
+        # ms), e enquanto ele rodava o payload lido antes ia ficando velho — um
+        # T3 que chegasse nesse intervalo era apagado pelo upsert de payload
+        # completo. Ler depois estreita a janela de segundos para milissegundos.
+        # (Não a elimina: sobra `leitura → T3 escreve → upsert`. Garantia real
+        # exigiria lock por memory_id entre T2 e T3, ou CAS no store.)
+        if data in existing_embeddings:
+            embeddings = existing_embeddings[data]
+        else:
+            embeddings = self.embedding_model.embed(data, "update")
 
         try:
             existing_memory = self.vector_store.get(vector_id=memory_id)
@@ -2993,13 +3112,8 @@ class Memory(MemoryBase):
                 new_metadata.update(_fields)
             # NÃO notifica aqui: a decisão foi tomada, mas o reforço só existe
             # depois que a escrita do update pega. Emitir "applied" antes do
-            # write faria a telemetria afirmar um reforço que uma falha de embed
-            # ou de vector_store deixaria sem persistir.
-
-        if data in existing_embeddings:
-            embeddings = existing_embeddings[data]
-        else:
-            embeddings = self.embedding_model.embed(data, "update")
+            # write faria a telemetria afirmar um reforço que uma falha de
+            # vector_store deixaria sem persistir.
 
         self.vector_store.update(
             vector_id=memory_id,
@@ -4112,6 +4226,7 @@ class AsyncMemory(MemoryBase):
         event_from: Optional[str] = None,
         event_to: Optional[str] = None,
         reinforce: Optional[bool] = None,
+        search_id: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -4350,8 +4465,14 @@ class AsyncMemory(MemoryBase):
         # DeepMem0 v0.2 (T3, opt-in): reinforce returned memories off the hot path.
         dyn = _dynamics_config(self.config)
         if _t3_enabled(dyn, reinforce) and original_memories:
+            # exposed_at é AGORA — o instante em que o caller viu estas memórias.
+            # O worker pode rodar muito depois; usar o relógio dele deslocaria a
+            # linha do tempo e as duas janelas.
             _reinforce_hits_in_background(
-                self.vector_store, dyn, _t3_targets(dyn, original_memories)
+                self.vector_store, dyn,
+                _t3_targets(dyn, original_memories,
+                            search_id=search_id or uuid.uuid4().hex[:16],
+                            exposed_at=_dynamics_utcnow()),
             )
 
         if temporal_usage_notice:
@@ -5032,8 +5153,17 @@ class AsyncMemory(MemoryBase):
     async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
+            # ⚠️ T2 NÃO EXISTE neste modo (ver o caminho sync).
             return await self._version_update(memory_id, data, existing_embeddings, metadata, temp)
         logger.info(f"Updating memory with {data=}")
+
+        # Embedding ANTES da leitura autoritativa — mesma razão do caminho sync:
+        # o trecho lento envelhecia o payload e o upsert de payload completo
+        # apagava um T3 que chegasse no intervalo.
+        if data in existing_embeddings:
+            embeddings = existing_embeddings[data]
+        else:
+            embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
 
         try:
             existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
@@ -5072,11 +5202,6 @@ class AsyncMemory(MemoryBase):
             # depois que a escrita do update pega. Emitir "applied" antes do
             # write faria a telemetria afirmar um reforço que uma falha de embed
             # ou de vector_store deixaria sem persistir.
-
-        if data in existing_embeddings:
-            embeddings = existing_embeddings[data]
-        else:
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
 
         await asyncio.to_thread(
             self.vector_store.update,

@@ -58,6 +58,11 @@ FIELD_REINFORCED_BY = "reinforced_by"
 #: Last T3 (search exposure) timestamp, tracked apart from the shared timeline so
 #: the exposure window is independent of explicit-write reinforcements.
 FIELD_LAST_SEARCH_REINFORCED_AT = "last_search_reinforced_at"
+#: Per-trigger tally that SURVIVES the K-timestamp trim. ``reinforced_by`` is
+#: truncated together with ``reinforced_at``, so past ten events the breakdown
+#: silently stopped existing; this keeps the accounting whole even though the
+#: discarded TIMESTAMPS are gone for good.
+FIELD_REINFORCE_COUNTS = "reinforce_counts"
 
 DYNAMICS_FIELDS = (
     FIELD_REINFORCED_AT,
@@ -65,7 +70,14 @@ DYNAMICS_FIELDS = (
     FIELD_LAST_ACCESSED,
     FIELD_REINFORCED_BY,
     FIELD_LAST_SEARCH_REINFORCED_AT,
+    FIELD_REINFORCE_COUNTS,
 )
+
+#: Bucket for events whose trigger cannot be known: a timeline written before
+#: provenance existed, or a tail already dropped by the trim. Guessing a trigger
+#: would be worse than admitting ignorance — the tally is used to decide what a
+#: selective rollback CAN touch.
+BUCKET_UNKNOWN = "unknown"
 
 #: Reinforcement triggers. T1/T2 are explicit writes (a fact was re-stated or
 #: evolved); T3 is retrieval EXPOSURE — the memory was returned, which is weaker
@@ -82,6 +94,10 @@ OUTCOME_APPLIED = "applied"
 OUTCOME_SUPPRESSED = "suppressed"
 OUTCOME_MISSING = "missing"
 OUTCOME_FAILED = "failed"
+#: Backlog full — the exposure was thrown away before any attempt. Distinct from
+#: `suppressed` (a rule decided against it) and from `failed` (it was tried and
+#: broke): a stream that cannot tell the three apart hides backpressure as policy.
+OUTCOME_DROPPED = "dropped"
 
 # dt is measured in days, clamped to >= 1: within the first day every memory
 # is equally "today", so freshness alone cannot dominate real reinforcement.
@@ -222,6 +238,35 @@ def should_reinforce(
     return True
 
 
+def _carry_counts(payload: Dict[str, Any], history: List[Any], count: int) -> Dict[str, int]:
+    """Per-trigger tally carried forward, migrating a pre-tally timeline once.
+
+    CONTRACT
+      * counts only REAL reinforcements — the ``created_at`` seed adopted by the
+        first reinforcement is an anchor, not an event;
+      * everything already on a timeline that predates provenance goes to
+        ``unknown`` (never guessed);
+      * invariant ``sum(counts.values()) == access_count - (1 if seeded else 0)``;
+      * best-effort, like the rest of the timeline: the store has no atomic
+        increment, so a lost race loses a count — which the telemetry measures
+        instead of hiding;
+      * a malformed value is dropped rather than propagated.
+    """
+    raw = payload.get(FIELD_REINFORCE_COUNTS)
+    if isinstance(raw, dict):
+        return {
+            str(k): int(v) for k, v in raw.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
+        }
+    if not history:
+        return {}
+    # Migração implícita: o payload nunca é reescrito retroativamente; a primeira
+    # gravação depois desta versão é que materializa o histórico anterior.
+    seeded = payload.get("created_at") == history[0]
+    prior = max(count - (1 if seeded else 0), 0)
+    return {BUCKET_UNKNOWN: prior} if prior else {}
+
+
 def reinforcement_fields(
     payload: Dict[str, Any],
     *,
@@ -245,6 +290,7 @@ def reinforcement_fields(
     origins = list(payload.get(FIELD_REINFORCED_BY) or [])
     count = payload.get(FIELD_ACCESS_COUNT)
     count = count if isinstance(count, int) and count > 0 else len(history)
+    counts = _carry_counts(payload, history, count)
 
     if not history:
         created = payload.get("created_at")
@@ -266,11 +312,14 @@ def reinforcement_fields(
         history = history[-max_timestamps:]
         origins = origins[-max_timestamps:]
 
+    counts[trigger] = counts.get(trigger, 0) + 1
+
     fields = {
         FIELD_REINFORCED_AT: history,
         FIELD_REINFORCED_BY: origins,
         FIELD_ACCESS_COUNT: count,
         FIELD_LAST_ACCESSED: now_iso,
+        FIELD_REINFORCE_COUNTS: counts,
     }
     if trigger == TRIGGER_SEARCH:
         fields[FIELD_LAST_SEARCH_REINFORCED_AT] = now_iso
