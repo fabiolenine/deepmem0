@@ -124,6 +124,42 @@ class TestMetadataPostFilters:
         assert [m["id"] for m in out][:3] == ["a", "d", "b"]
 
 
+class TestMetadataPostFiltersHostilePayloads:
+    """Payload is written by external callers, so the read path must survive
+    values no contract anticipated.
+
+    A production incident (2026-07-26) came from exactly this: a caller stored
+    ``importance='high'`` and ``sorted()`` raised
+    ``'<' not supported between instances of 'str' and 'float'``, taking down
+    every search — 17 bad points out of 1030 disabled retrieval entirely.
+    """
+
+    HOSTILE = [
+        {"id": "str", "metadata": {"importance": "high"}},
+        {"id": "bool", "metadata": {"importance": True}},      # isinstance(True, int) is True
+        {"id": "nan", "metadata": {"importance": float("nan")}},
+        {"id": "inf", "metadata": {"importance": float("inf")}},
+        {"id": "list", "metadata": {"importance": [1]}},
+        {"id": "none", "metadata": {"importance": None}},
+        {"id": "ok", "metadata": {"importance": 0.9}},
+        {"id": "big", "metadata": {"importance": 10 ** 400}},   # float() raises OverflowError
+    ]
+
+    def test_sort_never_raises_and_keeps_every_memory(self):
+        out = _apply_metadata_post_filters(self.HOSTILE, sort_by_importance=True)
+        assert len(out) == len(self.HOSTILE)      # sorting must not drop anything
+        assert out[0]["id"] == "ok"               # only real number ranks above 0.0
+
+    def test_min_importance_keeps_only_rankable_numbers(self):
+        out = _apply_metadata_post_filters(self.HOSTILE, min_importance=0.5)
+        assert [m["id"] for m in out] == ["ok"]   # bool/inf/big must not sneak past
+
+    def test_filter_and_sort_together(self):
+        out = _apply_metadata_post_filters(self.HOSTILE, min_importance=0.0,
+                                           sort_by_importance=True)
+        assert [m["id"] for m in out] == ["ok"]
+
+
 class TestRebrand:
     def test_deepmem0_marker(self):
         import mem0

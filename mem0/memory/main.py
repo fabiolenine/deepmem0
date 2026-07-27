@@ -188,11 +188,27 @@ def _apply_metadata_post_filters(
     def _meta(m):
         return (m.get("metadata") or {}) if isinstance(m, dict) else {}
 
+    def _rankable(value):
+        """Number that can be compared AND ordered without surprising the caller.
+
+        `isinstance(x, (int, float))` alone is not enough: `bool` is a subclass of
+        `int` (so `True` would rank as 1.0) and NaN breaks ordering invariants
+        (every comparison is False, so the sort result depends on input order).
+        Payloads are written by external callers, so this stays defensive even
+        when a write-side contract is in place.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
+
     out = memories
     if min_importance is not None:
         out = [
             m for m in out
-            if isinstance(_meta(m).get("importance"), (int, float))
+            if _rankable(_meta(m).get("importance"))
             and _meta(m)["importance"] >= min_importance
         ]
     if domain:
@@ -211,9 +227,7 @@ def _apply_metadata_post_filters(
         out = sorted(
             out,
             key=lambda m: (
-                _meta(m)["importance"]
-                if isinstance(_meta(m).get("importance"), (int, float))
-                else 0.0
+                float(_meta(m)["importance"]) if _rankable(_meta(m).get("importance")) else 0.0
             ),
             reverse=True,
         )
