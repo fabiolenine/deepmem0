@@ -82,7 +82,14 @@ BUCKET_UNKNOWN = "unknown"
 #: Reinforcement triggers. T1/T2 are explicit writes (a fact was re-stated or
 #: evolved); T3 is retrieval EXPOSURE — the memory was returned, which is weaker
 #: evidence than a write and is rate-limited on its own window.
+#: T1S is the SEMANTIC re-encounter: an extracted fact whose nearest corpus
+#: neighbor is a near-paraphrase (cosine >= threshold). It exists because T1
+#: proper requires the LLM to reproduce a fact byte-identical (MD5 match) — in
+#: practice it never fires (measured 2026-07-27: zero t1 events in a live corpus
+#: of 1065 memories). A distinct bucket, not "t1", so provenance can tell exact
+#: from semantic re-encounter and a selective rollback can target one of them.
 TRIGGER_DEDUP = "t1"
+TRIGGER_SIMILAR = "t1s"
 TRIGGER_UPDATE = "t2"
 TRIGGER_SEARCH = "t3"
 TRIGGER_CREATED = "created"  # the created_at seed adopted by the first reinforcement

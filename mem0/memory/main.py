@@ -6,10 +6,12 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
 import warnings
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -77,6 +79,7 @@ from mem0.utils.dynamics import (
     OUTCOME_SUPPRESSED,
     TRIGGER_DEDUP,
     TRIGGER_SEARCH,
+    TRIGGER_SIMILAR,
     TRIGGER_UPDATE,
     boost_from_payload,
     reinforcement_fields,
@@ -842,6 +845,107 @@ def _reinforce_memory(vector_store, dyn, memory_id, payload, *, trigger=TRIGGER_
     finally:
         _notify_reinforcement(memory_id, trigger, outcome,
                               (time.time() - started) * 1000.0, context)
+
+
+#: Digit-sequence tokens ("8188", "0.7.1", "1,5"). The labeled probe (2026-07-27,
+#: 41 real boundary pairs) showed the false-positive class for T1S is "same
+#: template, one identifier swapped": IDs 8188 vs 8189 sit at cosine
+#: 0.9754 — NO threshold kills it without also killing genuine restatements.
+#: All 6 labeled false positives differed in digits; zero true positives in the
+#: >=0.95 band did. Same principle as the extraction oracle's "alien number".
+_DIGIT_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def _digit_tokens(text):
+    """Multiset of numeric tokens, decimal separator normalized."""
+    return Counter(t.replace(",", ".") for t in _DIGIT_TOKEN_RE.findall(text or ""))
+
+
+def _digits_compatible(text_a, text_b) -> bool:
+    """True when one text's numeric tokens are a sub-multiset of the other's.
+
+    Subset (not equality) so a restatement that ADDS a clause with a new number
+    still counts, while a swapped identifier (8188 vs 8189) never does: neither
+    side contains the other.
+    """
+    a, b = _digit_tokens(text_a), _digit_tokens(text_b)
+    return not (a - b) or not (b - a)
+
+
+def _similar_reinforcement_target(vector_store, text, embedding, search_filters, dyn):
+    """Nearest eligible near-paraphrase of an extracted fact, or None (T1S).
+
+    Why a dedicated per-fact search: the add path's existing_results carry a
+    score against the WHOLE conversation embedding — useless as a per-fact
+    signal — and no vectors, so cosine cannot be computed locally. One dense
+    query per fact (~10-30ms) against an add dominated by 26-37s of extraction.
+
+    FAIL-OPEN by contract: this is enrichment on the hot add path. Any failure
+    returns None and the add keeps inserting — a Qdrant hiccup must never cost
+    a memory. Callers must not invoke this for facts carrying a `supersedes`
+    mark (a correction reinforcing what it corrects is the worst case).
+    """
+    # Config reads coerced defensively: a mocked/duck-typed config must render
+    # the trigger INERT, never crash the add path (this guard sits before the
+    # fail-open try on purpose — it is itself part of the fail-open contract).
+    try:
+        threshold = float(getattr(dyn, "reinforce_similarity_threshold", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not getattr(dyn, "reinforce_on_similar", False) or threshold <= 0:
+        return None
+    try:
+        hits = vector_store.search(query=text, vectors=embedding, top_k=3,
+                                   filters=search_filters)
+        for hit in hits or []:
+            score = getattr(hit, "score", None)
+            if score is None or score < threshold:
+                return None  # ordered by similarity: below threshold, stop
+            pl = getattr(hit, "payload", None) or {}
+            if pl.get(FIELD_SUPERSEDED_BY):
+                continue  # demoted fact: a boost would fight the penalty
+            if not _digits_compatible(text, pl.get("data")):
+                continue  # swapped identifier — the measured FP class
+            return str(hit.id), float(score)
+        return None
+    except Exception as e:
+        logger.warning(f"T1S similarity lookup failed (fail-open, add continues): {e}")
+        _notify_reinforcement(None, TRIGGER_SIMILAR, OUTCOME_FAILED, 0.0,
+                              {"stage": "similarity_lookup"})
+        return None
+
+
+def _apply_similar_reinforcements(vector_store, dyn, pending):
+    """Apply deferred T1S reinforcements. ``pending``: (target_id, score, new_id).
+
+    Runs AFTER persist and _mark_superseded, and re-reads each target FRESH —
+    no payload snapshot. The fresh read both narrows the lost-update window
+    from seconds (the persist span) to milliseconds — same move as the T2
+    reorder — and re-checks eligibility for free: a target superseded moments
+    ago by another fact of this very batch shows its superseded_by here.
+    Best-effort contract as measured for T2×T3; each attempt notifies with a
+    structured outcome either way.
+    """
+    for target_id, score, new_id in pending:
+        try:
+            fresh = vector_store.get(vector_id=target_id)
+        except Exception as e:
+            logger.warning(f"T1S fresh read failed for {target_id}: {e}")
+            _notify_reinforcement(target_id, TRIGGER_SIMILAR, OUTCOME_FAILED, 0.0,
+                                  {"stage": "fresh_read", "from_add": new_id})
+            continue
+        payload = getattr(fresh, "payload", None) if fresh is not None else None
+        if payload is None:
+            _notify_reinforcement(target_id, TRIGGER_SIMILAR, OUTCOME_MISSING, 0.0,
+                                  {"from_add": new_id})
+            continue
+        if payload.get(FIELD_SUPERSEDED_BY):
+            _notify_reinforcement(target_id, TRIGGER_SIMILAR, OUTCOME_SUPPRESSED, 0.0,
+                                  {"reason": "superseded", "from_add": new_id})
+            continue
+        _reinforce_memory(vector_store, dyn, target_id, payload,
+                          trigger=TRIGGER_SIMILAR,
+                          context={"similarity": round(score, 6), "from_add": new_id})
 
 
 def _t3_enabled(dyn, reinforce) -> bool:
@@ -1700,6 +1804,8 @@ class Memory(MemoryBase):
         dyn = _dynamics_config(self.config)
         records = []  # (memory_id, text, embedding, payload)
         pending_supersessions = []  # (new_memory_id, new_text, [old_ids], new_created_at) — applied after persist
+        pending_similarity = []  # DeepMem0 v0.8 (T1S): (target_id, score, new_memory_id) — applied after persist
+        pending_similarity_targets = set()  # one reinforcement per target per add
         seen_hashes = set()  # dedup within the current batch
         for mem in extracted_memories:
             text = mem.get("text")
@@ -1764,6 +1870,20 @@ class Memory(MemoryBase):
                     if event_date:
                         mem_metadata["event_date"] = event_date
 
+            # DeepMem0 v0.8 (T1S): a NEW fact whose nearest corpus neighbor is a
+            # near-paraphrase reinforces that neighbor — and is still inserted;
+            # nothing is suppressed. A fact carrying ANY supersedes mark never
+            # reinforces (a correction is a near-paraphrase with one changed
+            # value; boosting what it corrects is the worst case). Decision now,
+            # application deferred until after persist.
+            if dyn is not None and not mem.get("supersedes"):
+                _sim = _similar_reinforcement_target(
+                    self.vector_store, text, embed_map[text], search_filters, dyn
+                )
+                if _sim is not None and _sim[0] not in pending_similarity_targets:
+                    pending_similarity_targets.add(_sim[0])
+                    pending_similarity.append((_sim[0], _sim[1], memory_id))
+
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
@@ -1776,6 +1896,7 @@ class Memory(MemoryBase):
         all_ids = [r[0] for r in records]
         all_payloads = [r[3] for r in records]
 
+        failed_persist = set()
         try:
             self.vector_store.insert(
                 vectors=all_vectors,
@@ -1789,6 +1910,7 @@ class Memory(MemoryBase):
                     self.vector_store.insert(vectors=[vec], ids=[mid], payloads=[pay])
                 except Exception as e:
                     logger.error(f"Failed to insert memory {mid}: {e}")
+                    failed_persist.add(mid)
 
         # DeepMem0 v0.3: mark superseded memories only AFTER the new facts are
         # persisted (never point a memory at a replacement that failed to land).
@@ -1803,6 +1925,17 @@ class Memory(MemoryBase):
                     )
             except Exception as e:
                 logger.warning(f"Supersession marking pass failed: {e}")
+
+        # DeepMem0 v0.8 (T1S): apply deferred semantic reinforcements only after
+        # the new facts landed AND supersession marks were written — the fresh
+        # read inside re-checks eligibility, so a target superseded by another
+        # fact of this very batch is skipped. A fact that failed to persist
+        # reinforces nobody.
+        if pending_similarity:
+            _apply_similar_reinforcements(
+                self.vector_store, dyn,
+                [p for p in pending_similarity if p[2] not in failed_persist],
+            )
 
         # Batch history
         history_records = [
@@ -3799,6 +3932,8 @@ class AsyncMemory(MemoryBase):
         dyn = _dynamics_config(self.config)
         records = []
         pending_supersessions = []  # (new_memory_id, new_text, [old_ids], new_created_at) — applied after persist
+        pending_similarity = []  # DeepMem0 v0.8 (T1S): (target_id, score, new_memory_id) — applied after persist
+        pending_similarity_targets = set()  # one reinforcement per target per add
         seen_hashes = set()
         for mem in extracted_memories:
             text = mem.get("text")
@@ -3859,6 +3994,16 @@ class AsyncMemory(MemoryBase):
                     if event_date:
                         mem_metadata["event_date"] = event_date
 
+            # DeepMem0 v0.8 (T1S): semantic re-encounter — see the sync twin.
+            if dyn is not None and not mem.get("supersedes"):
+                _sim = await asyncio.to_thread(
+                    _similar_reinforcement_target,
+                    self.vector_store, text, embed_map[text], search_filters, dyn,
+                )
+                if _sim is not None and _sim[0] not in pending_similarity_targets:
+                    pending_similarity_targets.add(_sim[0])
+                    pending_similarity.append((_sim[0], _sim[1], memory_id))
+
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
@@ -3871,6 +4016,7 @@ class AsyncMemory(MemoryBase):
         all_ids = [r[0] for r in records]
         all_payloads = [r[3] for r in records]
 
+        failed_persist = set()
         try:
             await asyncio.to_thread(
                 self.vector_store.insert,
@@ -3884,6 +4030,7 @@ class AsyncMemory(MemoryBase):
                     await asyncio.to_thread(self.vector_store.insert, vectors=[vec], ids=[mid], payloads=[pay])
                 except Exception as e:
                     logger.error(f"Failed to insert memory {mid} (async): {e}")
+                    failed_persist.add(mid)
 
         # DeepMem0 v0.3: mark superseded memories only AFTER the new facts landed.
         superseded_events = []
@@ -3897,6 +4044,14 @@ class AsyncMemory(MemoryBase):
                     superseded_events.extend(marked)
             except Exception as e:
                 logger.warning(f"Supersession marking pass failed (async): {e}")
+
+        # DeepMem0 v0.8 (T1S): deferred application — see the sync twin.
+        if pending_similarity:
+            await asyncio.to_thread(
+                _apply_similar_reinforcements,
+                self.vector_store, dyn,
+                [p for p in pending_similarity if p[2] not in failed_persist],
+            )
 
         # Batch history
         history_records = [

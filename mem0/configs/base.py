@@ -102,6 +102,28 @@ class MemoryDynamicsConfig(BaseModel):
         " would otherwise compound its own visibility. 0 = only the global window applies.",
         default=86400,
     )
+    reinforce_on_similar: bool = Field(
+        description="Reinforce the nearest corpus neighbor of an extracted fact when it is"
+        " a near-paraphrase (cosine >= reinforce_similarity_threshold), WITHOUT suppressing"
+        " the insertion of the new fact (T1S). Exists because hash-based T1 requires the LLM"
+        " to reproduce a fact byte-identical and therefore never fires in practice. Rides on"
+        " `enabled` like T1/T2 — T3's separate flag exists because it turns reads into"
+        " writes; this trigger lives on the add path, which already writes. Facts carrying"
+        " a `supersedes` mark never reinforce (a correction is often a near-paraphrase with"
+        " one changed value — reinforcing what it corrects is the worst case).",
+        default=True,
+    )
+    reinforce_similarity_threshold: float = Field(
+        description="Cosine similarity above which a corpus neighbor counts as a semantic"
+        " re-encounter (T1S). Measured on the live bge-m3 corpus (2026-07-27, n=250):"
+        " nearest-neighbor median 0.74 = topically RELATED (must not reinforce);"
+        " >=0.95 = the near-paraphrase tail (3.2% prevalence; labeled precision 17/19,"
+        " 17/17 with the digit guard). Cosine thresholds are NOT portable across embedding"
+        " models — recalibrate if the embedder changes. 0 disables the trigger.",
+        default=0.95,
+        ge=0,
+        le=1,
+    )
 
 
 class MemoryTemporalityConfig(BaseModel):
