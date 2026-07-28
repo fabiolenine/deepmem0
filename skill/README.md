@@ -1,10 +1,19 @@
 # DeepMem0 memory skill
 
 `deepmem0-memory.skill` is a Claude **Skill** that governs *when* and *how* Claude
-uses the DeepMem0 MCP tools (`search_memories`, `add_memory`, `update_memory`) to
-keep durable memory across conversations — retrieving context at the start of a
-technical chat and saving only facts worth keeping, under a strict save/discard
-filter so retrieval returns signal instead of noise.
+uses the DeepMem0 MCP tools (`search_memories`, `add_memory`, `update_memory`,
+plus `memory_history` and the async status/document tools) to keep durable memory
+across conversations — retrieving context at the start of a technical chat and
+saving only facts worth keeping, under a strict save/discard filter so retrieval
+returns signal instead of noise.
+
+The rubric also teaches Claude the server's **temporal retrieval** (DeepMem0 ≥
+0.10): when the user asks about the past, it picks the right axis — `as_of`
+(record-time filter), `historical=True` (true *recollection*: ranks without
+present-day usage bias, never reinforces, and flags results that already have a
+newer linked fact), or `event_from`/`event_to` (when the fact *happened*, as
+opposed to when it was recorded) — and it knows that `add_memory` acks
+asynchronously and that `update_memory` versions instead of overwriting.
 
 The `.skill` file is a bundle (a zip of `deepmem0-memory/SKILL.md`); unzip it to
 read or edit the rubric:
@@ -74,10 +83,18 @@ technical conversation actually calls for it.
 
 `deepmem0-memory.skill` é uma **Skill** do Claude que governa *quando* e *como* o
 Claude usa as ferramentas MCP do DeepMem0 (`search_memories`, `add_memory`,
-`update_memory`) para manter memória durável entre conversas — recuperando
-contexto no início de uma conversa técnica e salvando só o que merece ser retido,
-com um filtro rigoroso do que salvar e do que descartar, para que a recuperação
-traga sinal em vez de ruído.
+`update_memory`, além de `memory_history` e das ferramentas assíncronas) para
+manter memória durável entre conversas — recuperando contexto no início de uma
+conversa técnica e salvando só o que merece ser retido, com um filtro rigoroso do
+que salvar e do que descartar, para que a recuperação traga sinal em vez de ruído.
+
+A rubrica também ensina a **recuperação temporal** (DeepMem0 ≥ 0.10): quando a
+pergunta é sobre o passado, escolher o eixo certo — `as_of` (filtro de
+record-time), `historical=True` (RECORDAÇÃO de verdade: ordena sem o viés de
+popularidade atual, não reforça nada e avisa quando já existe fato mais novo
+ligado) ou `event_from`/`event_to` (quando o fato *aconteceu*, distinto de quando
+foi registrado) — e sabe que `add_memory` confirma de forma assíncrona e que
+`update_memory` versiona em vez de sobrescrever.
 
 O arquivo `.skill` é um pacote (um zip de `deepmem0-memory/SKILL.md`); descompacte
 para ler ou editar a rubrica (`unzip -p deepmem0-memory.skill deepmem0-memory/SKILL.md`).
