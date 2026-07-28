@@ -209,6 +209,17 @@ class MemoryTemporalityConfig(BaseModel):
         " never inherit.",
         default=True,
     )
+    historical_recall: bool = Field(
+        description="DeepMem0 v0.10: enables the EXPLICIT historical-recall search path"
+        " (search(historical=True, as_of=...)): \"what did I know back then\". A recollection"
+        " never reinforces (T3 off even with reinforce=True) and never uses usage-derived"
+        " activation in ranking (inert at fusion and post-rerank); results carrying an"
+        " explicitly linked successor (superseded_by — semantic correction or update version)"
+        " are flagged has_newer_version, echoed as historical_recall.results_with_newer_version."
+        " Plain as_of WITHOUT historical=True keeps the default behavior unchanged. When off,"
+        " historical=True raises instead of silently degrading.",
+        default=True,
+    )
 
 
 class MemoryConfig(BaseModel):

@@ -1006,6 +1006,46 @@ def _apply_similar_reinforcements(vector_store, dyn, pending):
                           context={"similarity": round(score, 6), "from_add": new_id})
 
 
+def _validate_historical(historical, as_of, temp) -> bool:
+    """v0.10: valida o modo RECORDAÇÃO HISTÓRICA. Pure — sem I/O.
+
+    O modo é um caminho EXPLÍCITO (decisão de produto, 28/07/2026): `as_of`
+    sozinho preserva o comportamento de sempre (filtro record-time +
+    elegibilidade v0.9); `historical=True` é quem muda a semântica — recordar
+    "o que eu sabia na época" não reforça nada e não usa peso de uso no
+    ranking. Fail-fast: âncora ausente ou feature desligada viram erro claro,
+    nunca um modo silenciosamente diferente do pedido.
+    """
+    if not historical:
+        return False
+    if temp is None or not getattr(temp, "historical_recall", False):
+        raise ValueError(
+            "historical recall is disabled (temporality.historical_recall=false "
+            "or temporality disabled)"
+        )
+    if as_of is None:
+        raise ValueError("historical=True requires as_of (a recollection needs its anchor)")
+    return True
+
+
+def _annotate_known_successors(memories) -> int:
+    """v0.10: marca resultados que têm um sucessor EXPLÍCITO conhecido.
+
+    HONESTO por contrato: detecta `superseded_by` (correção semântica v0.3 ou
+    versão de update v0.7) — NÃO detecta "qualquer fato mais novo sobre o
+    assunto" (detecção por assunto é outra feature). Só o booleano: resolver o
+    id da versão atual exige travessia de cadeia com riscos próprios
+    (ciclo/deletado/escopo) e o aviso não precisa dele.
+    """
+    n = 0
+    for doc in memories or []:
+        meta = doc.get("metadata") or {}
+        if meta.get(FIELD_SUPERSEDED_BY):
+            doc["has_newer_version"] = True
+            n += 1
+    return n
+
+
 def _t3_enabled(dyn, reinforce) -> bool:
     """Whether this particular search reinforces what it returns.
 
@@ -1168,7 +1208,7 @@ def _reinforce_hits_in_background(vector_store, dyn, targets) -> None:
                                   {"search_id": t.search_id, "rank": t.rank})
 
 
-def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None) -> List[Dict[str, Any]]:
+def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None, historical=False) -> List[Dict[str, Any]]:
     """Blend ACT-R activation (v0.2), the superseded penalty (v0.3) and event-time
     proximity (v0.6) into the reranked order.
 
@@ -1198,7 +1238,9 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
     # zeroing the fusion weight to keep exposure bias out of pool composition also
     # silently killed the bounded post-rerank tie-break, the one form of activation
     # the 2026-07-21 ablation actually vindicated.
-    dyn_active = dyn is not None and (getattr(dyn, "tie_band", 0.0) or 0.0) > 0
+    # v0.10: no modo recordação a ativação é inerte também no tie-break.
+    dyn_active = (dyn is not None and (getattr(dyn, "tie_band", 0.0) or 0.0) > 0
+                  and not historical)
     temp_active = temp is not None and temp.superseded_penalty > 0
     # v0.6 tie-break runs whenever event_ranking is on and the query has an anchor
     # — INDEPENDENT of event_ranking_weight (weight only gates the fusion term, so
@@ -2343,6 +2385,7 @@ class Memory(MemoryBase):
         event_to: Optional[str] = None,
         reinforce: Optional[bool] = None,
         search_id: Optional[str] = None,
+        historical: bool = False,
         **kwargs,
     ):
         """
@@ -2405,6 +2448,15 @@ class Memory(MemoryBase):
         as_of_iso, as_of_dt = (None, None)
         if as_of is not None and _temporality_config(self.config) is not None:
             as_of_iso, as_of_dt = parse_as_of(as_of)
+
+        # DeepMem0 v0.10: recordação histórica — decisão derivada UMA vez e
+        # lida por todos (gate de reforço, fusão, adjuster); recordar nunca
+        # reforça, mesmo com reinforce=True explícito. Config só é tocada
+        # quando o modo foi PEDIDO (instâncias nuas em testes upstream não
+        # têm config; mesmo padrão do as_of/v0.6).
+        if historical:
+            _validate_historical(historical, as_of, _temporality_config(self.config))
+            reinforce = False
 
         # DeepMem0 v0.6: event-time window — validate caller bounds fail-fast
         # (mirrors as_of) EVEN when temporality is off, so a malformed date is
@@ -2544,6 +2596,7 @@ class Memory(MemoryBase):
             dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
                            if (rerank and self.reranker) else 0),
             event_anchor=event_anchor,
+            historical=historical,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -2560,7 +2613,8 @@ class Memory(MemoryBase):
                 temp = _temporality_config(self.config)
                 if dyn is not None or temp is not None:
                     original_memories = _apply_post_rerank_adjustments(
-                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt, event_anchor=event_anchor
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt,
+                        event_anchor=event_anchor, historical=historical,
                     )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -2607,6 +2661,13 @@ class Memory(MemoryBase):
         response = {"results": original_memories}
         if as_of_iso is not None:
             response["as_of"] = as_of_iso
+        # DeepMem0 v0.10: no modo recordação, avisa quais resultados têm
+        # sucessor EXPLÍCITO conhecido ("há fatos mais atuais") + echo do modo.
+        if historical:
+            _n_newer = _annotate_known_successors(original_memories)
+            response["historical_recall"] = {
+                "as_of": as_of_iso, "results_with_newer_version": _n_newer,
+            }
         # DeepMem0 v0.6: echo the auto-detected ranking anchor OR the explicit
         # filter window (mutually exclusive — an explicit window suppresses
         # auto-detection). event_anchor is echoed whenever an anchor was found,
@@ -2721,7 +2782,7 @@ class Memory(MemoryBase):
                 return True
         return False
 
-    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None):
+    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None, historical=False):
         # Guard against None threshold (backward compat)
         if threshold is None:
             threshold = 0.1
@@ -2774,7 +2835,8 @@ class Memory(MemoryBase):
         # memories without a history stay neutral (no key in the dict).
         activation_boosts = {}
         dyn = _dynamics_config(self.config)
-        if dyn is not None and dyn.weight > 0:
+        # v0.10: recordação histórica não usa peso de uso — ativação inerte.
+        if dyn is not None and dyn.weight > 0 and not historical:
             now = _dynamics_utcnow()
             for cand in candidates:
                 # v0.9 MASK: a superseded record gets NO activation — with the
@@ -4488,6 +4550,7 @@ class AsyncMemory(MemoryBase):
         event_to: Optional[str] = None,
         reinforce: Optional[bool] = None,
         search_id: Optional[str] = None,
+        historical: bool = False,
         **kwargs,
     ):
         """
@@ -4552,6 +4615,15 @@ class AsyncMemory(MemoryBase):
         as_of_iso, as_of_dt = (None, None)
         if as_of is not None and _temporality_config(self.config) is not None:
             as_of_iso, as_of_dt = parse_as_of(as_of)
+
+        # DeepMem0 v0.10: recordação histórica — decisão derivada UMA vez e
+        # lida por todos (gate de reforço, fusão, adjuster); recordar nunca
+        # reforça, mesmo com reinforce=True explícito. Config só é tocada
+        # quando o modo foi PEDIDO (instâncias nuas em testes upstream não
+        # têm config; mesmo padrão do as_of/v0.6).
+        if historical:
+            _validate_historical(historical, as_of, _temporality_config(self.config))
+            reinforce = False
 
         # DeepMem0 v0.6: event-time window — validate caller bounds fail-fast
         # (mirrors as_of) EVEN when temporality is off, so a malformed date is
@@ -4693,6 +4765,7 @@ class AsyncMemory(MemoryBase):
             dense_anchors=(getattr(self.config, "rerank_dense_anchors", 5)
                            if (rerank and self.reranker) else 0),
             event_anchor=event_anchor,
+            historical=historical,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -4709,7 +4782,8 @@ class AsyncMemory(MemoryBase):
                 temp = _temporality_config(self.config)
                 if dyn is not None or temp is not None:
                     original_memories = _apply_post_rerank_adjustments(
-                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt, event_anchor=event_anchor
+                        original_memories, dyn=dyn, temp=temp, as_of=as_of_dt,
+                        event_anchor=event_anchor, historical=historical,
                     )
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -4754,6 +4828,13 @@ class AsyncMemory(MemoryBase):
         response = {"results": original_memories}
         if as_of_iso is not None:
             response["as_of"] = as_of_iso
+        # DeepMem0 v0.10: no modo recordação, avisa quais resultados têm
+        # sucessor EXPLÍCITO conhecido ("há fatos mais atuais") + echo do modo.
+        if historical:
+            _n_newer = _annotate_known_successors(original_memories)
+            response["historical_recall"] = {
+                "as_of": as_of_iso, "results_with_newer_version": _n_newer,
+            }
         # DeepMem0 v0.6: echo the auto-detected ranking anchor OR the explicit
         # filter window (mutually exclusive — an explicit window suppresses
         # auto-detection). event_anchor is echoed whenever an anchor was found,
@@ -4868,7 +4949,7 @@ class AsyncMemory(MemoryBase):
                 return True
         return False
 
-    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None):
+    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, as_of_dt=None, dense_anchors=0, event_anchor=None, historical=False):
         if threshold is None:
             threshold = 0.1
 
@@ -4918,7 +4999,8 @@ class AsyncMemory(MemoryBase):
         # Step 7b (DeepMem0 v0.2): lazy ACT-R activation over the candidate pool.
         activation_boosts = {}
         dyn = _dynamics_config(self.config)
-        if dyn is not None and dyn.weight > 0:
+        # v0.10: recordação histórica não usa peso de uso — ativação inerte.
+        if dyn is not None and dyn.weight > 0 and not historical:
             now = _dynamics_utcnow()
             for cand in candidates:
                 # v0.9 MASK: a superseded record gets NO activation — with the

@@ -219,6 +219,58 @@ def main() -> int:
     check(r_v1 is not None and r_v1_off is not None and r_v1 < r_v1_off,
           f"a elegibilidade MOVE o rank no as_of (on {r_v1} < off {r_v1_off})")
 
+    print("\n[E] recordação histórica (v0.10): ativação inerte, sem reforço, aviso de sucessor")
+    import time as _time
+
+    import mem0.memory.main as _main_mod
+
+    # E1: listas de IDS ORDENADOS idênticas com dynamics on vs off (não só o
+    # rank de um doc — crítica: invariante completo)
+    r_on = m.search(Q_HERMES_V1, user_id=USER, top_k=5, as_of=anchor, historical=True)
+    r_off = m_off.search(Q_HERMES_V1, user_id=USER, top_k=5, as_of=anchor, historical=True)
+    ids_on = [h.get("id") for h in r_on["results"]]
+    ids_off = [h.get("id") for h in r_off["results"]]
+    check(ids_on == ids_off and len(ids_on) > 0,
+          f"E1: ids ordenados IDÊNTICOS dynamics on vs off ({ids_on})")
+    # E2: aviso de sucessor conhecido (v1 é superseded pela v2)
+    v1_hit = next((h for h in r_on["results"] if h.get("id") == a1), None)
+    check(v1_hit is not None and v1_hit.get("has_newer_version") is True,
+          "E2: v1 volta marcada has_newer_version (sucessor explícito)")
+    hr = r_on.get("historical_recall") or {}
+    check(hr.get("results_with_newer_version", 0) >= 1 and hr.get("as_of"),
+          f"E3: echo historical_recall presente ({hr})")
+    # E4: recordar NUNCA reforça — mesmo reinforce=True explícito, com T3 LIGADO.
+    # Controle positivo primeiro: o MESMO instrumento vê t3 numa busca default.
+    m_t3 = build()
+    m_t3.config.dynamics.reinforce_on_search = True
+    seen_ctrl, seen_hist = [], []
+    _main_mod.reinforcement_observer = lambda *a: seen_ctrl.append(a[1])
+    try:
+        m_t3.search(Q_HERMES_V1, user_id=USER, top_k=5, as_of=anchor, reinforce=True)
+        _t0 = _time.time()
+        while not seen_ctrl and _time.time() - _t0 < 5:
+            _time.sleep(0.2)
+    finally:
+        _main_mod.reinforcement_observer = None
+    check("t3" in seen_ctrl, f"E4-controle: instrumento vê t3 na busca default ({seen_ctrl})")
+    _main_mod.reinforcement_observer = lambda *a: seen_hist.append(a[1])
+    try:
+        m_t3.search(Q_HERMES_V1, user_id=USER, top_k=5, as_of=anchor,
+                    historical=True, reinforce=True)
+        _time.sleep(2)
+    finally:
+        _main_mod.reinforcement_observer = None
+    check(seen_hist == [],
+          f"E4: recordação com reinforce=True NÃO reforça nada ({seen_hist})")
+    # E5: kill switch nunca degrada em silêncio
+    m_kill = build()
+    m_kill.config.temporality.historical_recall = False
+    try:
+        m_kill.search(Q_HERMES_V1, user_id=USER, top_k=5, as_of=anchor, historical=True)
+        check(False, "E5: historical com feature off deveria levantar erro")
+    except ValueError:
+        check(True, "E5: feature off => erro claro, nunca busca default disfarçada")
+
     print("\n[A2] ablação causal: MESMO corpus SEM herança (a vitória do [A] é da herança?)")
     cleanup()
     m_no = build(inherits=False)
