@@ -266,6 +266,58 @@ class TestVersionUpdateInheritanceBehavioral:
         assert store["v1"].payload["reinforced_at"] == self._head()["reinforced_at"]
         assert events == []
 
+    def test_async_twin_mirrors_the_inheritance(self):
+        """O twin ASYNC exercitado DE VERDADE (não só o planner compartilhado):
+        a paridade sync/async é a doença conhecida deste arquivo."""
+        import asyncio
+        import threading
+
+        import mem0.memory.main as main_mod
+        from mem0.configs.base import MemoryConfig
+
+        head_payload = self._head()
+        store = {"v1": SimpleNamespace(id="v1", payload=dict(head_payload))}
+        created, events = {}, []
+
+        async def _create(data, emb, metadata=None):
+            created["meta"] = dict(metadata or {})
+            store["v2"] = SimpleNamespace(id="v2", payload=dict(metadata or {}))
+            return "v2"
+
+        def _update(vector_id, vector=None, payload=None):
+            store[vector_id] = SimpleNamespace(id=vector_id, payload=dict(payload or {}))
+
+        async def _noop_async(*a, **k):
+            return None
+
+        cfg = MemoryConfig()
+        fake = SimpleNamespace(
+            config=cfg,
+            _version_lock=asyncio.Lock(),
+            vector_store=SimpleNamespace(
+                get=lambda vector_id: store.get(vector_id),
+                update=_update,
+            ),
+            _create_memory=_create,
+            _link_entities_for_memory=_noop_async,
+            _delete_memory=_noop_async,
+            db=SimpleNamespace(add_history=lambda *a, **k: None),
+        )
+        main_mod.reinforcement_observer = lambda *a: events.append((a[0], a[1], a[2]))
+        try:
+            current, old = asyncio.run(main_mod.AsyncMemory._version_update(
+                fake, "v1", "texto novo", {}, None, cfg.temporality))
+        finally:
+            main_mod.reinforcement_observer = None
+
+        assert (current, old) == ("v2", "v1")
+        meta = created["meta"]
+        assert meta["reinforced_by"] == ["created", "t3", "t2"], "async herda + T2"
+        assert meta["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+        assert store["v1"].payload["reinforced_at"] == head_payload["reinforced_at"], \
+            "head intocado também no async"
+        assert events == [("v2", "t2", "applied")]
+
 
 def test_build_caller_can_never_forge_dynamics():
     """Anti-forgery: mesmo com inherit ligado, dynamics do CALLER são
