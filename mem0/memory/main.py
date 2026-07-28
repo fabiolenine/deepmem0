@@ -984,7 +984,8 @@ def _apply_similar_reinforcements(vector_store, dyn, pending):
     Best-effort contract as measured for T2×T3; each attempt notifies with a
     structured outcome either way.
     """
-    for target_id, score, new_id in pending:
+    for target_id, score, new_id, *rest in pending:
+        new_hash = rest[0] if rest else None
         try:
             fresh = vector_store.get(vector_id=target_id)
         except Exception as e:
@@ -1003,7 +1004,13 @@ def _apply_similar_reinforcements(vector_store, dyn, pending):
             continue
         _reinforce_memory(vector_store, dyn, target_id, payload,
                           trigger=TRIGGER_SIMILAR,
-                          context={"similarity": round(score, 6), "from_add": new_id})
+                          context={"similarity": round(score, 6), "from_add": new_id,
+                                   # v0.10.1: hashes de CONTEÚDO no evento — sem eles o
+                                   # júri não distingue "texto mutado depois" de "texto
+                                   # da época" (limitação declarada, agora fechada p/
+                                   # eventos novos; antigos seguem indetectáveis)
+                                   "target_hash": payload.get("hash"),
+                                   "from_add_hash": new_hash})
 
 
 def _validate_historical(historical, as_of, temp) -> bool:
@@ -1998,7 +2005,7 @@ class Memory(MemoryBase):
                 )
                 if _sim is not None and _sim[0] not in pending_similarity_targets:
                     pending_similarity_targets.add(_sim[0])
-                    pending_similarity.append((_sim[0], _sim[1], memory_id))
+                    pending_similarity.append((_sim[0], _sim[1], memory_id, mem_hash))
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
@@ -4167,7 +4174,7 @@ class AsyncMemory(MemoryBase):
                 )
                 if _sim is not None and _sim[0] not in pending_similarity_targets:
                     pending_similarity_targets.add(_sim[0])
-                    pending_similarity.append((_sim[0], _sim[1], memory_id))
+                    pending_similarity.append((_sim[0], _sim[1], memory_id, mem_hash))
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 

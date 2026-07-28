@@ -173,7 +173,11 @@ class TestApplyDeferred:
         assert store.updates[0][1][FIELD_REINFORCED_BY][-1] == TRIGGER_SIMILAR
         (mem_id, trigger, outcome, ctx), = seen
         assert (mem_id, trigger, outcome) == ("m1", TRIGGER_SIMILAR, "applied")
-        assert ctx == {"similarity": 0.97, "from_add": "new-id"}, "ids e score, nunca texto"
+        # v0.10.1: hashes de conteúdo entram (mutação detectável pelo júri);
+        # continua SEM texto — ids, score e hashes apenas.
+        assert ctx["similarity"] == 0.97 and ctx["from_add"] == "new-id"
+        assert set(ctx) <= {"similarity", "from_add", "target_hash", "from_add_hash"}
+        assert "data" not in ctx
 
     def test_fresh_read_sees_superseded_and_skips(self):
         # o alvo foi supersedido DEPOIS da decisão (por outro fato do batch, ou
