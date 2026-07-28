@@ -56,6 +56,11 @@ patches) and are being baked into this fork as first-class code.
 | Frequency / recency (human memory) | **Paid platform only** — `decay` and `reference_date` raise errors in OSS | ACT-R base-level activation as a ranking signal, reinforcement timeline per memory, open source *(v0.2, shipped)* |
 | Fact evolution over time | Updated facts overwrite in place or coexist as unrelated near-duplicates; `reference_date` is a paid stub | Supersession chains detected at extraction ("was X, now Y" links old → new), superseded facts demoted-never-deleted, `as_of` time-travel search, optional `event_date` per fact *(v0.3, shipped)* |
 | Deferred / queued ingestion | `add()` blocks the caller for the full LLM extraction; processing time silently becomes the fact's record time | Record-time contracts for async pipelines: a caller-supplied `created_at` (the submission time) is honored end-to-end, and supersession direction arbitrates by record time — a queued fact that lost the race to a fresher write is **born superseded**, never demoting newer truth *(v0.4, shipped)* |
+| Event-time ranking | — | `event_date` window filters (`event_from`/`event_to`, partial dates: `"2023"`, `"2023-10"`) composing with `as_of`, plus automatic anchoring: a query naming exactly one date boosts event-proximate facts *(v0.6, shipped)* |
+| Updating a fact vs. time travel | `update()` rewrites content **in place** — the new text leaks into older `as_of` views | **Update versioning**: `update()` mints a new current version; the old one stays restorable at its own record time; dedicated lineage fields (no branching on stale-id updates, chain-safe deletes, durable delete intent) *(v0.7, shipped)* |
+| Re-encounter detection | Dedup requires a byte-identical MD5 — an LLM restating a fact in different words never matches, so the "re-encounter" reinforcement signal never fires | **Semantic re-encounter (T1S)**: a new fact whose nearest neighbor is a near-paraphrase (cosine threshold, measured on a live corpus) reinforces that neighbor **while the new fact is still stored** — nothing suppressed. A numeric-token guard blocks the measured false-positive class (same template, one identifier swapped, e.g. ids one digit apart at cosine 0.975) *(v0.8, shipped)* |
+| Fact evolution × usage history | — | An **updated fact inherits its usage timeline** (copy + a T2 reinforcement at update time — recency priced by the model, no magic constants); superseded records are activation-masked in ranking so a fact family never double-dips; crash-safe with queued-update retries by construction *(v0.9, shipped)* |
+| Recollection ("what did I know then") | — | **Historical recall**: `search(historical=True, as_of=...)` — an explicit second search path that never reinforces what it returns, keeps usage-derived activation fully inert, and flags results that have a known newer successor (`has_newer_version`) *(v0.10, shipped)* |
 | Search-time metadata filters | Scope and payload filters | Plus `min_importance`, `domain`, `memory_type`, `sort_by_importance` *(v0.1)* |
 | Ops tooling | — | Re-index migration (embedder/language cutover), BM25 backfill, eval harness + synthetic PT/EN corpus |
 
@@ -83,7 +88,50 @@ Honest notes:
 
 ## Status
 
-**v0.4 shipped** — ingest-time decoupling. Queueing an add separates *when a fact was said* from
+**v0.10 shipped** — historical recall. `search(historical=True, as_of=...)` is an *explicit*
+second search path for "what did I know back then": a recollection **never reinforces** the
+memories it returns (even with `reinforce=True`), usage-derived activation is fully inert in
+ranking (a memory's present-day popularity doesn't reorder the past), and results that have an
+explicitly linked newer fact come flagged `has_newer_version` with a response-level count —
+honest contract: it detects *linked* successors (corrections and update versions), not arbitrary
+newer facts on the same subject. Plain `as_of` without the flag keeps today's behavior unchanged.
+The feature switch off raises instead of silently degrading to a default search.
+
+**v0.9** — activation inheritance on versioned updates. An updated fact is the *same fact,
+evolved*: the new version **copies** the reinforcement timeline from its predecessor and receives
+a T2 reinforcement stamped at update time — recency is priced by the ACT-R equation itself, no
+artificial birth bonus (an additive newborn boost was tried once in production and measurably
+regressed ranking; the design review also killed a destructive "transfer" variant that a queued
+retry could have erased — the copy survives crash/purge/retry by construction, proven against a
+real store). Superseded records are activation-masked at both ranking stages so a fact family
+never double-dips, and a new Petrov-tail anchor (`first_seen_at`) keeps long-history activation
+honest across versions. Causal proof in `eval/eval_version_inheritance.py`: with inheritance the
+updated fact outranks an equally plausible fresh twin; **without it, the twin wins on the same
+corpus** — the win belongs to the inheritance, not the wording.
+
+**v0.8** — semantic re-encounter (T1S). Hash-based dedup reinforcement requires the extraction
+LLM to reproduce a fact byte-for-byte — measured on a live corpus, that had *never happened*.
+T1S runs one dense query per extracted fact: a near-paraphrase neighbor above a measured cosine
+threshold is reinforced while the new fact is still stored (nothing suppressed). A numeric-token
+guard (sub-multiset of digit sequences) blocks the labeled false-positive class — same template
+with one swapped identifier, which no cosine threshold separates. Fail-open by contract: an
+enrichment failure never costs a memory. Facts carrying a supersession mark never reinforce
+(a correction must not boost the fact it corrects).
+
+**v0.7** — update versioning. In-place `update()` used to rewrite content while keeping
+`created_at`, leaking new text into older `as_of` views. Now an update mints a **new current
+version** and marks the prior one superseded — restorable by any `as_of` anchor before the
+update, with dedicated lineage fields (a later update on a stale id resolves to the chain head:
+no branching; deletes walk the whole chain; a durable intent journal survives crashes).
+Invariants proven end-to-end in `eval/eval_update_versioning*.py`.
+
+**v0.6** — event-time-aware ranking. `event_date` (extracted per fact since v0.3) now
+participates in retrieval: explicit window filters (`event_from`/`event_to`, partial dates
+expand — `"2023"` is the year, `"2023-10"` the month) compose with `as_of` record-time; and a
+query naming exactly one date auto-anchors ranking, boosting event-proximate facts at fusion
+with a bounded post-rerank tie-break.
+
+**v0.4** — ingest-time decoupling. Queueing an add separates *when a fact was said* from
 *when the pipeline processed it*, and the core now keeps those honest: `metadata["created_at"]`
 supplied by the caller (canonically the submission time) is preserved through both the inference
 and raw paths — `as_of` anchors and history keep working across queue delays — and supersession
@@ -133,8 +181,10 @@ lemmatization and the extraction prompt), snake_case-safe BM25 indexing, fail-sa
 loading, reranker on-by-default with an over-fetched pool, metadata-aware search filters.
 Validated in a self-hosted production deployment before release (numbers below).
 
-Next, per `docs/roadmap.md`: update versioning (in-place updates visible to as-of anchors),
-event-date-aware ranking, and richer temporal queries over the supersession graph.
+Next, per `docs/roadmap.md`: calibrating the activation ranking weights against real labeled
+usage data (the reinforcement machinery ships fully instrumented — provenance per trigger,
+structured outcomes, exposure-time semantics — but its ranking influence defaults conservative
+until the data says otherwise), and richer temporal queries over the supersession graph.
 
 ## API
 
@@ -147,16 +197,23 @@ memory = Memory.from_config({
     "reranker": {"provider": "sentence_transformer",
                  "config": {"model": "BAAI/bge-reranker-v2-m3", "device": "cpu"}},
     "vector_store": {"provider": "qdrant", "config": {"collection_name": "memories"}},
-    "dynamics": {                           # v0.2: human-memory dynamics (all optional)
+    "dynamics": {                           # v0.2/v0.8: human-memory dynamics (all optional)
         "enabled": True,                    # on by default
         "weight": 0.15,                     # activation's share of the ranking
         "reinforcement_window": 3600,       # >=1 reinforcement/memory/hour, all triggers
         "reinforce_on_search": False,       # T3: opt-in, async, never blocks the hot path
+        "reinforce_top_n": 3,               # T3 touches recall, not list filler
+        "reinforce_on_similar": True,       # v0.8: T1S semantic re-encounter
+        "reinforce_similarity_threshold": 0.95,
     },
-    "temporality": {                        # v0.3: semantic temporality (all optional)
+    "temporality": {                        # v0.3..v0.10: temporality (all optional)
         "enabled": True,                    # on by default
         "superseded_penalty": 0.2,          # demotion for replaced facts (never exclusion)
         "extract_event_date": True,         # optional event_date per extracted fact
+        "event_ranking": True,              # v0.6: date-in-query boosts event-proximate facts
+        "version_on_update": True,          # v0.7: update() mints a new version
+        "version_inherits_dynamics": True,  # v0.9: the new version inherits the usage timeline
+        "historical_recall": True,          # v0.10: explicit recollection search path
     },
 })
 
@@ -167,8 +224,24 @@ memory.search("como fazemos deploy do serviço de autenticação?", user_id="dem
 # (detected by the extraction LLM); the old fact is demoted, never deleted.
 memory.add("Mudamos: o deploy do auth_service_v3 agora é blue-green, sem canary.", user_id="demo")
 
-# time travel: what did we know / what held on that date?
+# v0.7: an explicit update mints a NEW version; the old one stays restorable
+res = memory.update("<memory-id>", data="Deploy do auth_service_v3 é blue-green com gate manual.")
+# res["id"] = the new current version; res["old_id"] = the superseded one.
+# v0.9: the new version inherited the old one's usage timeline + a T2 event.
+
+# time travel (default path): what did we know / what held on that date?
 memory.search("como fazemos deploy?", user_id="demo", as_of="2026-03-15")
+
+# v0.10: RECOLLECTION — an explicit second path. Never reinforces, ranks
+# without usage activation, and flags results that have a newer linked fact.
+res = memory.search("como fazemos deploy?", user_id="demo",
+                    as_of="2026-03-15", historical=True)
+# res["historical_recall"] == {"as_of": ..., "results_with_newer_version": N}
+# each outdated hit carries has_newer_version=True
+
+# v0.6: event-time — WHEN the fact happened, distinct from record time
+memory.search("o que aconteceu na migração?", user_id="demo",
+              event_from="2023-10", event_to="2023-10")
 
 # audit trail of a memory (ADD / UPDATE / SUPERSEDED / DELETE)
 memory.history("<memory-id>")
@@ -232,8 +305,16 @@ reranker configurado nunca executar), over-fetch do pool de rerank, filtros de m
 ferramentas de migração/avaliação e — o diferencial — frequência/recência de memória humana em
 código aberto, algo que no upstream existe só na plataforma paga.
 
-Roadmap: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R);
-**v0.3** temporalidade semântica (validade e supersedência de fatos, consultas as-of).
+Entregas: **v0.1** português de primeira classe; **v0.2** dinâmica de memória humana (ACT-R);
+**v0.3** temporalidade semântica (supersedência, consultas as-of); **v0.4** contratos de
+record-time para ingestão assíncrona; **v0.6** ranking ciente de event-time (janelas
+`event_from`/`event_to` + âncora automática por data na consulta); **v0.7** versionamento de
+update (atualizar cria versão nova; a antiga continua restaurável no as-of); **v0.8**
+re-encontro semântico (re-declarar um fato em outras palavras reforça a memória existente — com
+guarda numérica contra identificadores trocados); **v0.9** herança de ativação (o fato
+atualizado herda sua linha do tempo de uso + reforço de recência); **v0.10** recordação
+histórica (`historical=True`: busca "o que eu sabia na época" que não reforça nada, ignora
+popularidade atual e avisa quando há fato mais novo ligado).
 Detalhes em `docs/roadmap.md`. Licença Apache-2.0; atribuição ao Mem0 em `NOTICE`.
 
 **Usar como skill do Claude:** `skill/deepmem0-memory.skill` faz o Claude usar essas
