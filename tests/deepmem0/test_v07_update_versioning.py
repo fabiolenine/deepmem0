@@ -152,14 +152,135 @@ def test_build_inherits_owner_and_arbitrary_custom_metadata():
         assert meta[k] == _head_payload()[k], k
 
 
-def test_build_resets_bookkeeping_dynamics_and_provenance():
+def test_build_resets_bookkeeping_and_provenance():
+    """v0.9: dynamics saíram desta lista — herdar a timeline virou DECISÃO
+    (inherit_dynamics), não acidente da blacklist. O resto continua não
+    herdando."""
     meta = _build_version_metadata(_head_payload(), "new text", None, TS, "v1", False)
-    for k in (FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, "reinforced_at",
-              "access_count", "last_accessed", "source_doc", "page_start",
-              "hash", "text_lemmatized", "updated_at"):
+    for k in (FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, "source_doc",
+              "page_start", "hash", "text_lemmatized", "updated_at"):
         assert k not in meta, f"{k} must not carry forward"
     # data is (re)computed by _create_memory downstream, not here
     assert "data" not in meta
+
+
+def test_build_dynamics_follow_the_inherit_flag():
+    """Sem a flag: versão nasce neutra (pré-v0.9 byte a byte). Com a flag: a
+    timeline do head COPIA — o head não é tocado por esta função (pura)."""
+    off = _build_version_metadata(_head_payload(), "new text", None, TS, "v1", False,
+                                  inherit_dynamics=False)
+    for k in ("reinforced_at", "access_count", "last_accessed"):
+        assert k not in off, f"{k} herdado sem a flag"
+    on = _build_version_metadata(_head_payload(), "new text", None, TS, "v1", False,
+                                 inherit_dynamics=True)
+    assert on["reinforced_at"] == ["2026-01-01T00:00:00+00:00"]
+    assert on["access_count"] == 5
+    assert on["last_accessed"] == "2026-01-02T00:00:00+00:00"
+
+
+class TestVersionUpdateInheritanceBehavioral:
+    """Exercita Memory._version_update DE VERDADE (self fake, método não-ligado):
+    a v2 nasce com a timeline copiada + T2, o head fica INTOCADO além das marcas
+    v0.7, e o notify sai DEPOIS do verify. Born-superseded não herda nada."""
+
+    def _run(self, head_payload, *, caller=None, flag=True):
+        import threading
+
+        import mem0.memory.main as main_mod
+        from mem0.configs.base import MemoryConfig
+
+        store = {"v1": SimpleNamespace(id="v1", payload=dict(head_payload))}
+        created, events = {}, []
+
+        def _create(data, emb, metadata=None):
+            created["meta"] = dict(metadata or {})
+            store["v2"] = SimpleNamespace(id="v2", payload=dict(metadata or {}))
+            return "v2"
+
+        def _update(vector_id, vector=None, payload=None):
+            store[vector_id] = SimpleNamespace(id=vector_id, payload=dict(payload or {}))
+
+        cfg = MemoryConfig()
+        cfg.temporality.version_inherits_dynamics = flag
+        fake = SimpleNamespace(
+            config=cfg,
+            _version_lock=threading.Lock(),
+            vector_store=SimpleNamespace(
+                get=lambda vector_id: store.get(vector_id),
+                update=_update,
+            ),
+            _create_memory=_create,
+            _link_entities_for_memory=lambda *a, **k: None,
+            _delete_memory=lambda *a, **k: None,
+            db=SimpleNamespace(add_history=lambda *a, **k: None),
+        )
+        main_mod.reinforcement_observer = (
+            lambda *a: events.append((a[0], a[1], a[2])))
+        try:
+            result = main_mod.Memory._version_update(
+                fake, "v1", "texto novo", {}, caller, cfg.temporality)
+        finally:
+            main_mod.reinforcement_observer = None
+        return result, created["meta"], store, events
+
+    def _head(self):
+        return {
+            "data": "texto velho", "created_at": "2026-01-01T00:00:00+00:00",
+            "user_id": "u",
+            "reinforced_at": ["2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"],
+            "reinforced_by": ["created", "t3"],
+            "access_count": 2, "reinforce_counts": {"t3": 1},
+        }
+
+    def test_forward_copies_timeline_adds_t2_and_leaves_head_intact(self):
+        (current, old), meta, store, events = self._run(self._head())
+        assert (current, old) == ("v2", "v1")
+        assert meta["reinforced_at"][0] == "2026-01-01T00:00:00+00:00"
+        assert meta["reinforced_by"] == ["created", "t3", "t2"]
+        assert meta["reinforce_counts"] == {"t3": 1, "t2": 1}
+        assert meta["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+        # head: timeline INTACTA (cópia, não transferência) + marcas v0.7
+        head = store["v1"].payload
+        assert head["reinforced_at"] == self._head()["reinforced_at"]
+        assert head["access_count"] == 2
+        assert head["superseded_by"] == "v2"
+        # T2 notificado no carrier NOVO, depois do verify
+        assert events == [("v2", "t2", "applied")]
+
+    def test_flag_off_is_pre_v09_byte_for_byte(self):
+        (current, _old), meta, store, events = self._run(self._head(), flag=False)
+        assert current == "v2"
+        for k in ("reinforced_at", "reinforced_by", "access_count",
+                  "reinforce_counts", "first_seen_at"):
+            assert k not in meta, f"{k} herdado com a flag OFF"
+        assert events == [], "sem herança não há T2 (comportamento pré-v0.9)"
+
+    def test_born_superseded_inherits_nothing(self):
+        # caller com created_at ANTERIOR ao head → born-superseded: o head segue
+        # atual e É ELE quem carrega a timeline; o recém-chegado nasce neutro.
+        (current, _old), meta, store, events = self._run(
+            self._head(), caller={"created_at": "2025-06-01T00:00:00+00:00"})
+        assert current == "v1", "head continua o atual"
+        for k in ("reinforced_at", "first_seen_at", "reinforce_counts"):
+            assert k not in meta, f"born-superseded herdou {k}"
+        assert store["v1"].payload["reinforced_at"] == self._head()["reinforced_at"]
+        assert events == []
+
+
+def test_build_caller_can_never_forge_dynamics():
+    """Anti-forgery: mesmo com inherit ligado, dynamics do CALLER são
+    descartados — só o head é fonte de timeline."""
+    forged = {"reinforced_at": ["2030-01-01T00:00:00+00:00"], "access_count": 999,
+              "reinforce_counts": {"t3": 999}, "first_seen_at": "1999-01-01T00:00:00+00:00"}
+    meta = _build_version_metadata(_head_payload(), "new text", forged, TS, "v1", False,
+                                   inherit_dynamics=True)
+    assert meta["access_count"] == 5, "access_count do caller venceu o do head"
+    assert meta["reinforced_at"] == ["2026-01-01T00:00:00+00:00"]
+    assert "first_seen_at" not in meta  # quem escreve é o planner, nunca o caller
+    off = _build_version_metadata(_head_payload(), "new text", forged, TS, "v1", False,
+                                  inherit_dynamics=False)
+    for k in forged:
+        assert k not in off, f"{k} forjado pelo caller com inherit off"
 
 
 def test_build_stamps_created_at_and_version_prev():

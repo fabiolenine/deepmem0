@@ -63,6 +63,14 @@ FIELD_LAST_SEARCH_REINFORCED_AT = "last_search_reinforced_at"
 #: silently stopped existing; this keeps the accounting whole even though the
 #: discarded TIMESTAMPS are gone for good.
 FIELD_REINFORCE_COUNTS = "reinforce_counts"
+#: First-encounter anchor for the Petrov folded tail, DECOUPLED from
+#: ``created_at`` (v0.9). Under update versioning a new version is minted with
+#: ``created_at = operation time`` while inheriting a timeline whose events
+#: precede it — anchoring the tail on the version's created_at would silently
+#: over-weight the folded history (the guard falls back to t_oldest). Absent on
+#: memories that never went through a versioned update; every consumer falls
+#: back to ``created_at``, which keeps pre-v0.9 behavior byte-for-byte.
+FIELD_FIRST_SEEN = "first_seen_at"
 
 DYNAMICS_FIELDS = (
     FIELD_REINFORCED_AT,
@@ -71,6 +79,7 @@ DYNAMICS_FIELDS = (
     FIELD_REINFORCED_BY,
     FIELD_LAST_SEARCH_REINFORCED_AT,
     FIELD_REINFORCE_COUNTS,
+    FIELD_FIRST_SEEN,
 )
 
 #: Bucket for events whose trigger cannot be known: a timeline written before
@@ -190,6 +199,22 @@ def activation_boost(activation: Optional[float]) -> float:
     return 1.0 / (1.0 + math.exp(-activation))
 
 
+def _anchor_ts(payload: Dict[str, Any]):
+    """First-encounter anchor as an ISO string: ``first_seen_at`` when VALID,
+    else ``created_at``.
+
+    The validation matters: a truthy-but-malformed ``first_seen_at`` under a
+    plain ``or`` would win and then parse to None downstream, silently disabling
+    the Petrov tail where a valid ``created_at`` was available all along.
+    """
+    if not payload:
+        return None
+    first = payload.get(FIELD_FIRST_SEEN)
+    if first is not None and _parse_ts(first) is not None:
+        return first
+    return payload.get("created_at")
+
+
 def boost_from_payload(
     payload: Dict[str, Any],
     *,
@@ -204,7 +229,7 @@ def boost_from_payload(
         payload.get(FIELD_ACCESS_COUNT),
         now=now,
         decay=decay,
-        first_seen=payload.get("created_at"),
+        first_seen=_anchor_ts(payload),
     )
     return activation_boost(activation)
 
@@ -254,10 +279,16 @@ def _has_seed(payload: Dict[str, Any], history: List[Any]) -> bool:
 
     Undetectable once the trim has dropped the anchor — an accepted limit: from
     then on the tally is carried forward instead of re-derived.
+
+    v0.9: compares against ``_anchor_ts`` (first_seen_at with created_at
+    fallback), not created_at directly — an inherited timeline lives on a
+    version whose created_at is the operation time, and comparing against THAT
+    would misread the old seed as a real event and fabricate an ``unknown``
+    tally entry in the migration path.
     """
     if not history:
         return False
-    created = _parse_ts(payload.get("created_at"))
+    created = _parse_ts(_anchor_ts(payload))
     first = _parse_ts(history[0])
     return created is not None and first is not None and created == first
 
@@ -349,7 +380,10 @@ def reinforcement_fields(
     counts = _carry_counts(payload, history, count)
 
     if not history:
-        created = payload.get("created_at")
+        # v0.9: the anchor, not created_at directly — a version whose inherited
+        # timeline was window-suppressed still carries first_seen_at; seeding
+        # from ITS created_at (= operation time) would fake a fresh encounter.
+        created = _anchor_ts(payload)
         if created and _parse_ts(created) is not None:
             history = [created]
             origins = [TRIGGER_CREATED]

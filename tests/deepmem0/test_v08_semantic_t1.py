@@ -312,6 +312,20 @@ class TestAddPathIntegration:
         assert [s[1] for s in seen] == ["t1"], "hash exato = t1, nunca t1s"
         assert store.inserted == [], "dedup exato mantém a supressão HERDADA de inserção"
 
+    def test_exact_hash_on_superseded_dedupes_but_never_reinforces(self):
+        """v0.9: a timeline do supersedido vive no sucessor — reforçá-lo
+        recriaria o double-dip que a máscara removeu. Dedup fica; t1 não."""
+        text = "fato byte a byte idêntico"
+        store = PipelineStore(corpus=[
+            _hit("m1", 0.99, text, created_at=hours_ago(72),
+                 hash=hashlib.md5(text.encode()).hexdigest(),
+                 superseded_by="m2"),
+        ])
+        seen = _events(store, [{"text": text}])
+        assert seen == [], f"supersedido não é reforçado — veio {seen}"
+        assert store.inserted == [], "a supressão de inserção do dedup exato fica"
+        assert store.updates == []
+
     def test_supersedes_intent_skips_semantic_reinforcement(self):
         # correção é quase-paráfrase com um valor trocado — reforçar o corrigido
         # é o pior caso; QUALQUER marca supersedes desliga o t1s para o fato

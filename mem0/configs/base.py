@@ -196,6 +196,19 @@ class MemoryTemporalityConfig(BaseModel):
         " as_of on updates.",
         default=True,
     )
+    version_inherits_dynamics: bool = Field(
+        description="DeepMem0 v0.9: a version minted by a versioned update() COPIES the ACT-R"
+        " reinforcement timeline (reinforced_at/by, access_count, tally, first_seen_at) from the"
+        " prior head and receives a T2 reinforcement event at operation time — an updated fact is"
+        " the same fact, evolved; without this every update() silently reset the usage history and"
+        " the T2 trigger did not exist at all in versioned mode. COPY, not transfer: the old"
+        " version keeps its timeline (crash-safe with queued-update retries; as_of time travel"
+        " keeps historical activation), and superseded records are activation-MASKED in ranking"
+        " instead, so the family never double-dips. Off: versions are born neutral (pre-v0.9"
+        " behavior). Only applies when ``version_on_update`` is active; born-superseded records"
+        " never inherit.",
+        default=True,
+    )
 
 
 class MemoryConfig(BaseModel):

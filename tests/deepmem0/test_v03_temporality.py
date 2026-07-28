@@ -189,10 +189,12 @@ class TestPostRerankAdjustments:
         assert ordered[0]["id"] == "old"  # was current at the anchor; higher rerank wins
         assert "superseded_penalty" not in ordered[0]
 
-    def test_activation_and_penalty_compose_in_single_sort(self):
+    def test_superseded_activation_is_masked_not_softening(self):
+        """v0.9 INVERTEU o contrato antigo ("ativação amortece a demoção"): com
+        a timeline COPIADA ao sucessor, um supersedido com histórico forte
+        ganharia boost E penalidade — cancelamento parcial = double-dip da
+        família. Agora a máscara zera a ativação onde a penalidade se aplica."""
         docs = self.make_docs()
-        # give the superseded doc a strong reinforcement history: activation
-        # must soften but not cancel the demotion in the same sort
         docs[0]["metadata"]["reinforced_at"] = [
             (datetime.now(timezone.utc) - timedelta(days=d)).isoformat() for d in (3, 2, 1)
         ]
@@ -202,7 +204,9 @@ class TestPostRerankAdjustments:
         ordered = _apply_post_rerank_adjustments(docs, dyn=dyn, temp=temp)
         top = ordered[0]
         assert top["id"] == "new"
-        assert ordered[1].get("activation", 0) > 0  # both adjustments visible
+        assert ordered[1].get("superseded_penalty") == temp.superseded_penalty
+        assert "activation" not in ordered[1], \
+            "supersedido MASCARADO — sem ativação para amortecer a demoção"
 
     def test_disabled_everything_keeps_order(self):
         ordered = _apply_post_rerank_adjustments(self.make_docs(), dyn=None, temp=None)

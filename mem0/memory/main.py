@@ -72,6 +72,7 @@ from mem0.utils.factory import (
 )
 from mem0.utils.dynamics import (
     DYNAMICS_FIELDS,
+    FIELD_FIRST_SEEN,
     OUTCOME_APPLIED,
     OUTCOME_DROPPED,
     OUTCOME_FAILED,
@@ -81,6 +82,8 @@ from mem0.utils.dynamics import (
     TRIGGER_SEARCH,
     TRIGGER_SIMILAR,
     TRIGGER_UPDATE,
+    _anchor_ts,
+    _parse_ts as _dynamics_parse_ts,
     boost_from_payload,
     reinforcement_fields,
     should_reinforce,
@@ -582,22 +585,29 @@ def _mark_superseded(vector_store, db, new_id, new_text, old_ids, new_created_at
 
 # --- DeepMem0 v0.7 (update versioning, roadmap item #7) ---------------------
 # Fields on the superseded head (v1) that are NOT inherited by its successor
-# (v2): derived (recomputed by _create_memory), version bookkeeping, the prior
-# version's usage/temporal state (a new version starts neutral), and per-source
-# provenance that does not apply to a fresh conversational version.
+# (v2): derived (recomputed by _create_memory), version bookkeeping, temporal
+# state, and per-source provenance that does not apply to a fresh
+# conversational version.
+#
+# v0.9: the dynamics fields are NO LONGER in this blanket blacklist — whether
+# the usage timeline carries forward became an explicit DECISION
+# (``version_inherits_dynamics``, handled by _plan_version_dynamics), not a
+# side effect of a list. They remain unconditionally blacklisted for CALLER
+# metadata (see _VERSION_CALLER_ONLY_BLOCKED): a client must never forge a
+# timeline through update(metadata=...).
 _VERSION_NON_INHERITED = frozenset({
     "data", "hash", "text_lemmatized", "created_at", "updated_at",
     FIELD_SUPERSEDED_BY, FIELD_SUPERSEDED_AT, FIELD_SUPERSEDES, FIELD_EVENT_DATE,
     FIELD_VERSION_PREV, FIELD_VERSION_NEXT, FIELD_LINEAGE_SCHEMA,
-    # EVERY dynamics field, from the single tuple that defines them: listing them
-    # by hand let two new ones (reinforced_by, last_search_reinforced_at) slip
-    # through, so a new version would inherit orphan provenance and an exposure
-    # clock that muted its own first retrieval for a day. A new version starts
-    # neutral — and that must not depend on someone remembering this list.
-    *DYNAMICS_FIELDS,
     "source_doc", "page_start", "page_end", "chunk_index", "content_type",
     "task_id",
 })
+
+# Dynamics are decided by _plan_version_dynamics for the HEAD side, but a
+# CALLER can never write them: derived from the single defining tuple so a new
+# dynamics field is forgery-blocked by default (the hand-kept list already let
+# two fields slip once).
+_VERSION_CALLER_ONLY_BLOCKED = frozenset(DYNAMICS_FIELDS)
 
 # Ownership/scope keys that are IMMUTABLE across versions: a caller can neither
 # change nor ADD a scope the head does not have (issue #4490 for actor_id; the
@@ -613,7 +623,8 @@ def _lineage_scope(payload) -> Tuple:
 
 
 def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
-                            head_id, extract_event_date) -> Dict[str, Any]:
+                            head_id, extract_event_date,
+                            inherit_dynamics: bool = False) -> Dict[str, Any]:
     """Field-by-field metadata policy for a new version (v2) minted when ``update()``
     supersedes ``head_payload`` (v1). Pure — no I/O.
 
@@ -637,11 +648,17 @@ def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
         caller.pop(k, None)          # anti-injection: only _version_update writes these
     for k in _IMMUTABLE_SCOPE:
         caller.pop(k, None)          # ownership is immutable across versions
+    # v0.9: dynamics COPY from the head is a decision (inherit_dynamics), never
+    # an accident of the blacklist; the caller can never write them regardless.
+    head_blocked = _VERSION_NON_INHERITED if inherit_dynamics else (
+        _VERSION_NON_INHERITED | _VERSION_CALLER_ONLY_BLOCKED
+    )
+    caller_blocked = _VERSION_NON_INHERITED | _VERSION_CALLER_ONLY_BLOCKED
     meta: Dict[str, Any] = {
-        k: v for k, v in head_payload.items() if k not in _VERSION_NON_INHERITED
+        k: v for k, v in head_payload.items() if k not in head_blocked
     }
     for k, v in caller.items():
-        if k not in _VERSION_NON_INHERITED:
+        if k not in caller_blocked:
             meta[k] = v
     # exact immutable scope from the head (including absence)
     for k in _IMMUTABLE_SCOPE:
@@ -658,6 +675,47 @@ def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
         if ev:
             meta[FIELD_EVENT_DATE] = ev
     return meta
+
+
+def _plan_version_dynamics(head_payload, dyn, operation_ts, *, inherit):
+    """Dynamics side of a versioned update, PURE (no I/O) and shared by the
+    sync and async twins so their semantics cannot drift.
+
+    Returns ``(extra_fields, t2_outcome)`` to merge into the new version's
+    metadata BEFORE the single ``_create_memory`` write (mirroring the legacy
+    in-place T2, which folds the reinforcement into the same atomic write):
+
+    - ``first_seen_at``: the family's first-encounter anchor (head's own
+      ``first_seen_at`` when valid, else head's ``created_at`` — propagates
+      v1→v2→v3). Stamped whenever inheriting, even with dynamics disabled:
+      the anchor is cheap and correct the day dynamics turns on.
+    - T2 planned over the HEAD's payload — never the new version's. This is
+      what kills the newborn step: with a neutral head, seeding from the new
+      version's ``created_at`` (= operation time) plus the T2 event at the
+      same instant would mint boost 0.667 out of thin air — WORSE than the
+      measured option-A regression (0.5, reverted). Over the head's payload
+      the seed adopts the fact's real first encounter.
+    - Window suppression suppresses only the T2 EVENT; the copy (done by
+      ``_build_version_metadata``) stands. A queued update whose
+      ``operation_ts`` predates the head's last event is likewise suppressed —
+      the exposed_at discipline: a late job neither back-dates nor re-opens.
+
+    ``t2_outcome`` is None when there was no decision to report (not
+    inheriting, or dynamics off); the caller notifies AFTER the verify pass.
+    """
+    if not inherit:
+        return {}, None
+    extra: Dict[str, Any] = {}
+    anchor = _anchor_ts(head_payload)
+    if anchor:
+        extra[FIELD_FIRST_SEEN] = anchor
+    if dyn is None:
+        return extra, None
+    now = _dynamics_parse_ts(operation_ts)
+    fields, outcome = plan_reinforcement(head_payload, dyn, TRIGGER_UPDATE, now=now)
+    if fields:
+        extra.update(fields)
+    return extra, outcome
 
 
 def _resolve_chain_head(get_fn, memory_id, max_hops: int = 64) -> Tuple[str, Any]:
@@ -983,6 +1041,10 @@ def _t3_targets(dyn, memories, *, search_id, exposed_at) -> List[ReinforcementTa
         )
         for i, doc in enumerate(selected, start=1)
         if doc.get("id")
+        # v0.9: um registro supersedido não é reforçado pela exposição — com a
+        # timeline copiada ao sucessor, reforçar o velho recriaria o double-dip
+        # que a máscara removeu (o t1s já pulava; T3 ficava inconsistente).
+        and not (doc.get("metadata") or {}).get(FIELD_SUPERSEDED_BY)
     ]
 
 
@@ -1158,13 +1220,26 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
             base = doc.get("score") or 0.0
         else:
             base = 1.0 / (1.0 + math.exp(-rerank_score))
+        # v0.9: the superseded decision comes FIRST — it both applies the
+        # penalty (as before) and MASKS activation: with the timeline copied to
+        # the successor, boosting the old version too would double-dip. Same
+        # predicate for both, so as_of views keep historical activation.
+        sup_applies = superseded_penalty_applies(
+            {
+                FIELD_SUPERSEDED_BY: meta.get(FIELD_SUPERSEDED_BY),
+                FIELD_SUPERSEDED_AT: meta.get(FIELD_SUPERSEDED_AT),
+            },
+            as_of=as_of,
+        )
         boost = 0.0
-        if dyn_active:
+        if dyn_active and not sup_applies:
             boost = boost_from_payload(
                 {
                     "reinforced_at": meta.get("reinforced_at"),
                     "access_count": meta.get("access_count"),
                     "created_at": doc.get("created_at"),
+                    # anchor decoupled from the version's created_at (v0.9)
+                    "first_seen_at": meta.get("first_seen_at"),
                 },
                 now=now,
                 decay=dyn.decay,
@@ -1176,13 +1251,7 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
             eprox = event_proximity(event_anchor, meta.get(FIELD_EVENT_DATE), event_window_days)
             if eprox > 0:
                 doc["event_proximity"] = round(eprox, 4)
-        if temp_active and superseded_penalty_applies(
-            {
-                FIELD_SUPERSEDED_BY: meta.get(FIELD_SUPERSEDED_BY),
-                FIELD_SUPERSEDED_AT: meta.get(FIELD_SUPERSEDED_AT),
-            },
-            as_of=as_of,
-        ):
+        if temp_active and sup_applies:
             doc["superseded_penalty"] = temp.superseded_penalty
             base -= temp.superseded_penalty
         enriched.append({"doc": doc, "base": base, "boost": boost, "eprox": eprox})
@@ -1819,8 +1888,13 @@ class Memory(MemoryBase):
                 # reinforcement signal — the upstream silent no-op becomes the hook.
                 # (An identical fact replaces nothing — its supersedes mark, if
                 # any, is ignored by design.)
+                # v0.9: a SUPERSEDED copy is deduped but NOT reinforced — its
+                # timeline lives on the successor now; boosting the old record
+                # would rebuild the double-dip the mask removed (t1s already
+                # skipped superseded targets; T1 was the inconsistency).
                 existing = existing_by_hash.get(mem_hash)
-                if dyn is not None and existing is not None:
+                if (dyn is not None and existing is not None
+                        and not (existing.payload or {}).get(FIELD_SUPERSEDED_BY)):
                     _reinforce_memory(
                         self.vector_store, dyn, existing.id, existing.payload,
                         trigger=TRIGGER_DEDUP,
@@ -2703,6 +2777,13 @@ class Memory(MemoryBase):
         if dyn is not None and dyn.weight > 0:
             now = _dynamics_utcnow()
             for cand in candidates:
+                # v0.9 MASK: a superseded record gets NO activation — with the
+                # timeline COPIED to its successor, boosting both would let the
+                # family double-dip (penalty − boost partially cancel on the old
+                # one). Same predicate as the penalty, so as_of time travel keeps
+                # historical activation for the then-current version.
+                if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
+                    continue
                 boost = boost_from_payload(cand["payload"], now=now, decay=dyn.decay)
                 if boost > 0:
                     activation_boosts[cand["id"]] = boost
@@ -3130,10 +3211,25 @@ class Memory(MemoryBase):
             caller = dict(metadata or {})
             operation_ts = caller.get("created_at") or _dynamics_utcnow().isoformat()
             born_superseded = supersession_inverted(operation_ts, head_payload.get("created_at"))
+            # DeepMem0 v0.9: an updated fact is the SAME fact, evolved — the new
+            # version COPIES the usage timeline (head untouched: crash-safe with
+            # queued-update retries, as_of keeps historical activation) and gets
+            # a T2 event. Decided BEFORE metadata is built; never for a
+            # born-superseded record (the head stays current there).
+            inherit_dyn = (
+                bool(getattr(temp, "version_inherits_dynamics", False))
+                and not born_superseded
+            )
             v2_meta = _build_version_metadata(
                 head_payload, data, caller, operation_ts, head_id,
                 getattr(temp, "extract_event_date", True),
+                inherit_dynamics=inherit_dyn,
             )
+            dyn_extra, t2_outcome = _plan_version_dynamics(
+                head_payload, _dynamics_config(self.config), operation_ts,
+                inherit=inherit_dyn,
+            )
+            v2_meta.update(dyn_extra)
             if born_superseded:
                 # v2 is OLDER than the head: born superseded BY it. In the version
                 # lineage v2 -> head (head gains v2 as a predecessor below). No
@@ -3188,15 +3284,20 @@ class Memory(MemoryBase):
                     except Exception as ce:
                         logger.error(f"Compensation delete of {new_id} failed: {ce}")
                 raise
+            # T2 notify only after the transition verified — same discipline as
+            # the legacy path: never report a reinforcement a failed write
+            # would have left unpersisted (compensation deletes the carrier).
+            if t2_outcome is not None:
+                _notify_reinforcement(new_id, TRIGGER_UPDATE, t2_outcome)
             logger.info(f"Versioned update: head={head_id} new={new_id} current={current_id} born={born_superseded}")
             return current_id, head_id
 
     def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
-            # ⚠️ T2 NÃO EXISTE neste modo: a versão nova nasce neutra por desenho
-            # (v0.7). Ligar/desligar version_on_update muda quais gatilhos de
-            # reforço existem — é dependência silenciosa, pinada em teste.
+            # v0.9: o T2 EXISTE neste modo — a versão nova herda a timeline do
+            # head (cópia) e ganha o evento T2, via _plan_version_dynamics
+            # (gated por version_inherits_dynamics; pinado em teste).
             return self._version_update(memory_id, data, existing_embeddings, metadata, temp)
         logger.info(f"Updating memory with {data=}")
 
@@ -3945,8 +4046,10 @@ class AsyncMemory(MemoryBase):
                 logger.debug(f"Skipping duplicate memory (hash match, async): {text[:50]}")
                 # DeepMem0 v0.2 (T1): re-encounter reinforces the existing memory.
                 # (An identical fact replaces nothing — supersedes mark ignored.)
+                # v0.9: supersedido é deduplicado mas NÃO reforçado (ver sync).
                 existing = existing_by_hash.get(mem_hash)
-                if dyn is not None and existing is not None:
+                if (dyn is not None and existing is not None
+                        and not (existing.payload or {}).get(FIELD_SUPERSEDED_BY)):
                     await asyncio.to_thread(
                         _reinforce_memory,
                         self.vector_store, dyn, existing.id, existing.payload,
@@ -4818,6 +4921,13 @@ class AsyncMemory(MemoryBase):
         if dyn is not None and dyn.weight > 0:
             now = _dynamics_utcnow()
             for cand in candidates:
+                # v0.9 MASK: a superseded record gets NO activation — with the
+                # timeline COPIED to its successor, boosting both would let the
+                # family double-dip (penalty − boost partially cancel on the old
+                # one). Same predicate as the penalty, so as_of time travel keeps
+                # historical activation for the then-current version.
+                if superseded_penalty_applies(cand["payload"], as_of=as_of_dt):
+                    continue
                 boost = boost_from_payload(cand["payload"], now=now, decay=dyn.decay)
                 if boost > 0:
                     activation_boosts[cand["id"]] = boost
@@ -5250,10 +5360,21 @@ class AsyncMemory(MemoryBase):
             caller = dict(metadata or {})
             operation_ts = caller.get("created_at") or _dynamics_utcnow().isoformat()
             born_superseded = supersession_inverted(operation_ts, head_payload.get("created_at"))
+            # DeepMem0 v0.9: cópia da timeline + T2 — ver o twin sync.
+            inherit_dyn = (
+                bool(getattr(temp, "version_inherits_dynamics", False))
+                and not born_superseded
+            )
             v2_meta = _build_version_metadata(
                 head_payload, data, caller, operation_ts, head_id,
                 getattr(temp, "extract_event_date", True),
+                inherit_dynamics=inherit_dyn,
             )
+            dyn_extra, t2_outcome = _plan_version_dynamics(
+                head_payload, _dynamics_config(self.config), operation_ts,
+                inherit=inherit_dyn,
+            )
+            v2_meta.update(dyn_extra)
             if born_superseded:
                 v2_meta[FIELD_VERSION_PREV] = []
                 v2_meta[FIELD_VERSION_NEXT] = head_id
@@ -5305,13 +5426,16 @@ class AsyncMemory(MemoryBase):
                     except Exception as ce:
                         logger.error(f"Compensation delete of {new_id} failed: {ce}")
                 raise
+            # T2 notify pós-verify — mesma disciplina do twin sync.
+            if t2_outcome is not None:
+                _notify_reinforcement(new_id, TRIGGER_UPDATE, t2_outcome)
             logger.info(f"Versioned update (async): head={head_id} new={new_id} current={current_id} born={born_superseded}")
             return current_id, head_id
 
     async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
         temp = _temporality_config(self.config)
         if temp is not None and getattr(temp, "version_on_update", False):
-            # ⚠️ T2 NÃO EXISTE neste modo (ver o caminho sync).
+            # v0.9: T2 existe neste modo via _plan_version_dynamics (ver sync).
             return await self._version_update(memory_id, data, existing_embeddings, metadata, temp)
         logger.info(f"Updating memory with {data=}")
 

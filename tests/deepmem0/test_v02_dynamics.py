@@ -8,6 +8,7 @@ from mem0.memory.main import (
     _apply_activation_post_rerank,
     _dynamics_config,
     _reinforce_memory,
+    plan_reinforcement,
 )
 from mem0.utils.dynamics import (
     FIELD_REINFORCE_COUNTS,
@@ -379,16 +380,15 @@ class TestReinforceMemory:
         assert store.payload["reinforced_by"][-1] == "t2"
         assert store.payload["reinforce_counts"] == {"t2": 1}
 
-    def test_t2_does_not_exist_under_version_on_update(self):
+    def test_versioned_update_routes_and_delegates_t2(self):
         """COMPORTAMENTAL: com version_on_update ligado (DEFAULT do fork) o
-        update roteia para o caminho versionado, a versão nova nasce neutra e o
-        gatilho T2 simplesmente não acontece.
-
-        Produção só tem T2 hoje porque um drop-in de contenção do v0.7 desliga o
-        versionamento — se ele sair, um gatilho desaparece sem aviso. Este teste
-        foi escrito como inspeção de fonte primeiro e só virou comportamental
-        depois: o teste de fonte teria passado sem provar nada em runtime.
-        """
+        update roteia para o caminho versionado. HISTÓRICO: até a v0.9 este
+        teste afirmava que o T2 NÃO existia nesse modo (a versão nascia neutra
+        e o gatilho sumia em silêncio); a v0.9 inverteu a decisão — o T2 vive
+        DENTRO de _version_update via _plan_version_dynamics, coberto pelos
+        testes de TestVersionDynamicsPlanner. Aqui fica só o contrato de
+        roteamento: nenhum T2 é emitido FORA do caminho versionado (o roteador
+        não pode duplicar o evento)."""
         import mem0.memory.main as main_mod
 
         routed, seen = [], []
@@ -403,7 +403,7 @@ class TestReinforceMemory:
             main_mod.reinforcement_observer = None
 
         assert routed == ["mem-1"], "deveria rotear para o caminho versionado"
-        assert seen == [], "não pode haver T2 quando o update cria uma versão nova"
+        assert seen == [], "o ROTEADOR não emite T2 — o evento pertence a _version_update"
 
     def test_observer_failure_never_breaks_bookkeeping(self):
         import mem0.memory.main as main_mod
@@ -581,10 +581,14 @@ class TestReinforceCounts:
         fields = reinforcement_fields(payload, trigger="t2")
         assert fields[FIELD_REINFORCE_COUNTS] == {"t2": 1}
 
-    def test_tally_is_not_inherited_by_a_new_version(self):
-        from mem0.memory.main import _VERSION_NON_INHERITED
+    def test_tally_inheritance_is_a_decision_not_a_blacklist_accident(self):
+        """v0.9: o tally sai da blacklist cega (herdar virou decisão explícita),
+        mas o CALLER continua proibido de escrevê-lo — a proveniência só pode
+        vir do head."""
+        from mem0.memory.main import _VERSION_CALLER_ONLY_BLOCKED, _VERSION_NON_INHERITED
 
-        assert FIELD_REINFORCE_COUNTS in _VERSION_NON_INHERITED
+        assert FIELD_REINFORCE_COUNTS not in _VERSION_NON_INHERITED
+        assert FIELD_REINFORCE_COUNTS in _VERSION_CALLER_ONLY_BLOCKED
 
 
 class TestExposureTime:
@@ -733,16 +737,191 @@ class TestWindowInteraction:
 
 
 class TestVersionInheritance:
-    """Uma versão nova nasce NEUTRA. Isto quebrou de verdade: a blacklist listava
-    três campos de dynamics à mão e os dois novos passaram — a v2 herdaria
-    proveniência órfã e um relógio de exposição que calaria a própria primeira
-    recuperação dela por 24h."""
+    """v0.9 INVERTEU o contrato: um fato atualizado é o MESMO fato, evoluído —
+    a versão nova COPIA a timeline do head (decisão version_inherits_dynamics,
+    default on) e ganha um T2. O que a versão pré-v0.9 protegia (blacklist
+    cega para o HEAD) virou proteção só contra o CALLER: um cliente nunca
+    forja timeline via update(metadata=...). A completude continua derivada da
+    tupla única — um campo novo de dynamics nasce bloqueado para forgery por
+    default, sem depender de lista mantida à mão."""
 
-    def test_no_dynamics_field_is_inherited(self):
-        from mem0.memory.main import _VERSION_NON_INHERITED
+    def test_every_dynamics_field_is_caller_forgery_blocked(self):
+        from mem0.memory.main import _VERSION_CALLER_ONLY_BLOCKED, _VERSION_NON_INHERITED
 
-        missing = [f for f in DYNAMICS_FIELDS if f not in _VERSION_NON_INHERITED]
-        assert missing == [], f"campos de dynamics herdados por uma versão nova: {missing}"
+        missing = [f for f in DYNAMICS_FIELDS if f not in _VERSION_CALLER_ONLY_BLOCKED]
+        assert missing == [], f"campos de dynamics forjáveis pelo caller: {missing}"
+        leaked = [f for f in DYNAMICS_FIELDS if f in _VERSION_NON_INHERITED]
+        assert leaked == [], (
+            f"campos de dynamics ainda na blacklist cega (a herança viraria no-op): {leaked}"
+        )
+
+
+class TestVersionDynamicsPlanner:
+    """_plan_version_dynamics: o lado ACT-R de um update versionado, PURO e
+    compartilhado pelos twins sync/async (a semântica não pode derivar).
+
+    O pin central é o ANTI-DEGRAU: o T2 planeja sobre o payload do HEAD, nunca
+    o da versão nova. Com head neutro, semear do created_at da v2 (= instante
+    da operação) + evento no MESMO instante cunharia boost 0.667 do nada —
+    PIOR que a opção A medida e revertida (0.5)."""
+
+    def _plan(self, head, dyn=None, op_ts=None, inherit=True):
+        from mem0.memory.main import _plan_version_dynamics
+
+        return _plan_version_dynamics(
+            head, dyn if dyn is not None else MemoryDynamicsConfig(),
+            op_ts or NOW.isoformat(), inherit=inherit,
+        )
+
+    def test_not_inheriting_returns_nothing(self):
+        extra, outcome = self._plan({"created_at": hours_ago(72)}, inherit=False)
+        assert extra == {} and outcome is None
+
+    def test_neutral_head_seeds_from_the_heads_created_at(self):
+        """Paridade com o T2 legado: mesmo seed, mesmo evento — nunca o degrau."""
+        head = {"data": "fato", "created_at": hours_ago(72)}
+        extra, outcome = self._plan(head)
+        assert outcome == "applied"
+        assert extra["first_seen_at"] == hours_ago(72)
+        assert extra["reinforced_at"][0] == hours_ago(72), \
+            "seed TEM que ser o created_at do HEAD, não o instante da operação"
+        assert extra["reinforced_by"] == ["created", "t2"]
+        legacy_fields, _ = plan_reinforcement(head, MemoryDynamicsConfig(), "t2", now=NOW)
+        assert extra["reinforced_at"] == legacy_fields["reinforced_at"]
+
+    def test_reinforced_head_appends_t2_and_carries_tally(self):
+        head = {"data": "fato", "created_at": hours_ago(96),
+                "reinforced_at": [hours_ago(96), hours_ago(48)],
+                "reinforced_by": ["created", "t3"],
+                "access_count": 2, "reinforce_counts": {"t3": 1}}
+        extra, outcome = self._plan(head)
+        assert outcome == "applied"
+        assert extra["reinforced_at"][0] == hours_ago(96)  # timeline preservada
+        assert extra["reinforced_by"] == ["created", "t3", "t2"]
+        assert extra["reinforce_counts"] == {"t3": 1, "t2": 1}, \
+            "tally herdado junto = sem migração fabricando bucket 'unknown'"
+        assert extra["access_count"] == 3
+
+    def test_window_suppresses_the_event_but_not_the_anchor(self):
+        head = {"data": "fato", "created_at": hours_ago(72),
+                "reinforced_at": [hours_ago(0.2)], "access_count": 2}
+        extra, outcome = self._plan(head)
+        assert outcome == "suppressed"
+        assert extra == {"first_seen_at": hours_ago(72)}, \
+            "a cópia (feita pelo _build) fica; só o EVENTO é suprimido"
+
+    def test_late_queued_job_is_suppressed_not_backdated(self):
+        # operation_ts (submitted_at da fila) ANTERIOR ao último evento do head:
+        # disciplina do exposed_at — job atrasado não retro-data nem reabre.
+        head = {"data": "fato", "created_at": hours_ago(72),
+                "reinforced_at": [hours_ago(1)], "access_count": 2}
+        extra, outcome = self._plan(head, op_ts=hours_ago(2))
+        assert outcome == "suppressed"
+
+    def test_dynamics_disabled_still_stamps_the_anchor(self):
+        from mem0.memory.main import _plan_version_dynamics
+
+        extra, outcome = _plan_version_dynamics(
+            {"created_at": hours_ago(72)}, None, NOW.isoformat(), inherit=True)
+        assert extra == {"first_seen_at": hours_ago(72)} and outcome is None
+
+    def test_anchor_propagates_across_versions(self):
+        # head já é uma v2: created_at = op anterior, first_seen_at = origem
+        head = {"created_at": hours_ago(24), "first_seen_at": hours_ago(720)}
+        extra, _ = self._plan(head)
+        assert extra["first_seen_at"] == hours_ago(720)
+
+    def test_malformed_anchor_falls_back_to_created_at(self):
+        head = {"created_at": hours_ago(24), "first_seen_at": "não é data"}
+        extra, _ = self._plan(head)
+        assert extra["first_seen_at"] == hours_ago(24), \
+            "first_seen_at truthy-mas-inválido não pode vencer um created_at válido"
+
+
+class TestSupersededEligibility:
+    """v0.9: com a timeline COPIADA ao sucessor, o registro supersedido perde
+    elegibilidade de ativação e de reforço — senão a família faria double-dip
+    (fusão: penalidade − boost se cancelam em parte) e a exposição na busca
+    re-semearia o registro velho. O t1s já pulava; T1/T3 eram a inconsistência."""
+
+    def test_t3_targets_skip_superseded(self):
+        from mem0.memory.main import _t3_targets
+
+        dyn = MemoryDynamicsConfig(reinforce_top_n=3)
+        docs = [
+            {"id": "old", "metadata": {"superseded_by": "new"}},
+            {"id": "new", "metadata": {}},
+        ]
+        got = _t3_targets(dyn, docs, search_id="s", exposed_at=NOW.isoformat())
+        assert [t.memory_id for t in got] == ["new"]
+
+    def test_post_rerank_mask_zeroes_activation_for_superseded(self):
+        from mem0.memory.main import _apply_post_rerank_adjustments
+        from mem0.configs.base import MemoryTemporalityConfig
+
+        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        temp = MemoryTemporalityConfig()
+        timeline = {"reinforced_at": [hours_ago(48), hours_ago(24)], "access_count": 2}
+        docs = [
+            {"id": "old", "rerank_score": 2.0, "created_at": hours_ago(72),
+             "metadata": {**timeline, "superseded_by": "new",
+                          "superseded_at": hours_ago(1)}},
+            {"id": "new", "rerank_score": 2.0, "created_at": hours_ago(1),
+             "metadata": dict(timeline)},
+        ]
+        out = _apply_post_rerank_adjustments(docs, dyn=dyn, temp=temp)
+        by_id = {d["id"]: d for d in out}
+        assert "activation" not in by_id["old"], "supersedido MASCARADO"
+        assert by_id["old"].get("superseded_penalty") == temp.superseded_penalty
+        assert by_id["new"].get("activation", 0) > 0, "o atual mantém a ativação"
+
+    def test_post_rerank_mask_respects_as_of_time_travel(self):
+        """as_of ANTES da supersedência: o registro era o atual — sem penalidade
+        E com ativação (a vista histórica fica íntegra; bônus da cópia sobre a
+        transferência, que a deixaria neutra)."""
+        from datetime import timedelta
+
+        from mem0.memory.main import _apply_post_rerank_adjustments
+        from mem0.configs.base import MemoryTemporalityConfig
+
+        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        temp = MemoryTemporalityConfig()
+        docs = [{"id": "old", "rerank_score": 2.0, "created_at": hours_ago(72),
+                 "metadata": {"reinforced_at": [hours_ago(48)], "access_count": 1,
+                              "superseded_by": "new", "superseded_at": hours_ago(1)}}]
+        anchor = NOW - timedelta(hours=24)  # antes da supersedência (1h atrás)
+        out = _apply_post_rerank_adjustments(docs, dyn=dyn, temp=temp, as_of=anchor)
+        assert "superseded_penalty" not in out[0]
+        assert out[0].get("activation", 0) > 0
+
+    def test_post_rerank_anchor_prefers_first_seen_at(self):
+        """A v2 (created_at = agora) com cauda dobrada usa first_seen_at como
+        âncora de Petrov — sem ele a cauda seria super-pesada em silêncio.
+
+        ⚠️ timestamps relativos ao RELÓGIO REAL: o adjuster usa utcnow() interno
+        (sem injeção) — o cenário fixo em 2030 fica no futuro e TODO Δt clampa
+        a 1 dia, apagando a diferença que o teste mede (foi o 1º modo de falha
+        deste teste)."""
+        from datetime import timedelta
+
+        from mem0.memory.main import _apply_post_rerank_adjustments
+        from mem0.utils.dynamics import utcnow
+
+        real_now = utcnow()
+
+        def ago(days):
+            return (real_now - timedelta(days=days)).isoformat()
+
+        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        base_meta = {"reinforced_at": [ago(3), ago(1)], "access_count": 30}
+        with_anchor = [{"id": "a", "rerank_score": 2.0, "created_at": ago(0.001),
+                        "metadata": {**base_meta, "first_seen_at": ago(365)}}]
+        without = [{"id": "a", "rerank_score": 2.0, "created_at": ago(0.001),
+                    "metadata": dict(base_meta)}]
+        got_anchor = _apply_post_rerank_adjustments(with_anchor, dyn=dyn)[0]["activation"]
+        got_plain = _apply_post_rerank_adjustments(without, dyn=dyn)[0]["activation"]
+        assert got_anchor < got_plain, \
+            "âncora antiga espalha a cauda dobrada => ativação MENOR que o fallback"
 
 
 class TestConfigSurface:
@@ -756,6 +935,9 @@ class TestConfigSurface:
         assert dyn.reinforce_on_search is False
         assert dyn.reinforce_top_n == 3
         assert dyn.reinforce_on_search_window == 86400
+
+    def test_version_inherits_dynamics_defaults_on(self):
+        assert MemoryConfig().temporality.version_inherits_dynamics is True
 
     def test_disabled_dynamics_resolves_to_none(self):
         config = MemoryConfig(dynamics=MemoryDynamicsConfig(enabled=False))

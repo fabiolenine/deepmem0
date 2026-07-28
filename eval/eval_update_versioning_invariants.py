@@ -68,8 +68,14 @@ try:
     check("mysql" in p1["data"].lower(), "v1 mantém conteúdo antigo (mysql)")
     check("postgresql" in p2["data"].lower(), "v2 tem conteúdo novo (postgresql)")
     check(p2.get("created_at") != t0 and p2.get("created_at") > t0, "v2.created_at = now (> T0)")
-    # neutral dynamics on v2
-    check("reinforced_at" not in p2 and "access_count" not in p2, "v2 nasce neutro (sem dynamics herdada)")
+    # v0.9: herança de ativação — o T2 sobre um head NEUTRO semeia do created_at
+    # DO HEAD (t0) e anexa o evento; v2 carrega timeline + âncora, v1 fica
+    # intocado (cópia, não transferência; aqui v1 era neutro e segue neutro).
+    check(p2.get("reinforced_at", [None])[0] == t0,
+          "v2 herda: seed da timeline = created_at do HEAD (t0), nunca o da operação")
+    check(p2.get("reinforced_by") == ["created", "t2"], "v2: proveniência [created, t2]")
+    check(p2.get("first_seen_at") == t0, "v2.first_seen_at = t0 (âncora de Petrov)")
+    check("reinforced_at" not in (p1 or {}), "v1 (neutro) segue neutro — head intocado")
 
     print("== present search returns v2, as_of returns v1 ==")
     now_hits = m.search("qual banco o atlas_ingest usa?", user_id=USER, top_k=5)["results"]
@@ -94,6 +100,12 @@ try:
     check(p2b.get("superseded_by") == v3, "v2 agora superseded_by v3 (resolveu p/ a cabeça!)")
     check(p3.get("_mem0_version_prev") == [v2], "v3._mem0_version_prev == [v2]")
     check(not p3.get("superseded_by"), "v3 é a nova cabeça vigente")
+    # v0.9: propagação da âncora pela cadeia (contra o store REAL) + janela:
+    # o update#2 roda segundos após o #1, então o T2 dele é SUPRIMIDO — v3
+    # copia a timeline de v2 sem evento novo.
+    check(p3.get("first_seen_at") == t0, "v3.first_seen_at propaga = t0 (v1→v2→v3)")
+    check(p3.get("reinforced_at") == p2b.get("reinforced_at"),
+          "v3 copia a timeline de v2 (T2 do update#2 suprimido pela janela de 1h)")
     sup2 = {vid: (payload(m, vid) or {}).get("superseded_by") for vid in (v1, v2, v3)}
     currents2 = [vid for vid, s in sup2.items() if not s]
     check(currents2 == [v3], f"ainda exatamente 1 vigente = v3 (SEM branching) (got {currents2})")
@@ -102,6 +114,36 @@ try:
     h = m.history(v1)
     events = [e.get("event") for e in h]
     check("SUPERSEDED" in events, f"history(v1) tem SUPERSEDED (got {events})")
+
+    print("== v0.9: crash→purge→retry NÃO perde a timeline (o blocker da transferência) ==")
+    # O ciclo real da fila v0.4: worker morre depois do update e antes do
+    # mark_done; o retry PURGA a v2 (created_at==submitted_at) e reprocessa.
+    # Com CÓPIA, a v1 fica intacta e a v2' re-herda; com transferência, a
+    # timeline teria morrido junto com a v2 purgada — é ESTE cenário que
+    # derrubou o desenho original no /critic-plan.
+    w1 = m.add("O worker Atlas processa 4 lotes em paralelo.", user_id=USER, infer=False)["results"][0]["id"]
+    pw = payload(m, w1)
+    tw0 = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+    pw.update({
+        "created_at": tw0, "updated_at": tw0,
+        "reinforced_at": [tw0, (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()],
+        "reinforced_by": ["created", "t3"], "access_count": 2,
+        "reinforce_counts": {"t3": 1},
+    })
+    m.vector_store.update(vector_id=w1, payload=pw)
+    w2 = m.update(w1, data="O worker Atlas processa 8 lotes em paralelo.")["id"]
+    check((payload(m, w2) or {}).get("reinforced_by", [])[-1:] == ["t2"], "1ª tentativa: v2 herdou + T2")
+    m.vector_store.delete(vector_id=w2)  # o purge-on-retry da fila
+    check((payload(m, w1) or {}).get("reinforced_at") is not None,
+          "v1 INTACTA após o purge (cópia, não transferência)")
+    # retry: mesmo update re-submetido contra o id original; version_next da v1
+    # está pendurado (v2 morta) → _resolve_chain_head trata v1 como head.
+    w2b = m.update(w1, data="O worker Atlas processa 8 lotes em paralelo.")["id"]
+    p_w2b = payload(m, w2b)
+    check(w2b not in (w1, w2) and p_w2b is not None, f"retry criou v2' nova ({w2b})")
+    check((p_w2b.get("reinforced_at") or [None])[0] == tw0,
+          "v2' RE-HERDOU a timeline da v1 intacta — histórico sobreviveu ao ciclo")
+    check(p_w2b.get("first_seen_at") == tw0, "v2'.first_seen_at re-ancorado em tw0")
 
     # === §F (v0.7.2): MATRIZ de as_of com timestamps FIXOS (determinística) =========
     # Boundary é inclusivo (lte em created_at); a penalidade de supersedência é isenta
