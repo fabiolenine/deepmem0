@@ -489,6 +489,11 @@ def _entity_collection_name(provider: str, collection_name: str) -> str:
     return f"{collection_name}{separator}entities"
 
 
+# delete_all pagination. Module-level so tests can shrink them.
+_DELETE_ALL_PAGE_SIZE = 1000
+_DELETE_ALL_MAX_PAGES = 1000
+
+
 # Cap for the entity-store scans done during cleanup. The number matters less
 # than the alarm: a silently truncated scan turns cleanup into a PARTIAL no-op,
 # leaving dangling links that nobody will ever go looking for.
@@ -3196,14 +3201,37 @@ class Memory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"})
-        # delete all vector memories and reset the collections
-        memories = self.vector_store.list(filters=filters)[0]
-        for memory in memories:
-            self._delete_memory(memory.id)
+        # Paginate. `list()` defaults to top_k=100 in several stores (Qdrant
+        # among them), so the old single untruncated call silently deleted at
+        # most one page and reported that as the whole job.
+        deleted = 0
+        attempted = set()
+        for _ in range(_DELETE_ALL_MAX_PAGES):
+            page = self.vector_store.list(filters=filters, top_k=_DELETE_ALL_PAGE_SIZE)[0]
+            # Stop on the first page that offers nothing NEW. Termination cannot
+            # rest on "the page came back empty": a row we failed to delete, or a
+            # store that does not reflect deletes immediately, would be re-listed
+            # forever. Each iteration either claims at least one unseen id or ends.
+            fresh = [m for m in page if m.id not in attempted]
+            if not fresh:
+                break
+            for memory in fresh:
+                attempted.add(memory.id)
+                try:
+                    self._delete_memory(memory.id)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"delete_all: memory {memory.id} could not be deleted: {e}")
+        else:
+            logger.warning("delete_all: page cap (%d) reached — scope may not be drained",
+                           _DELETE_ALL_MAX_PAGES)
+        if len(attempted) != deleted:
+            logger.warning("delete_all: %d of %d memories could not be deleted",
+                           len(attempted) - deleted, len(attempted))
 
-        logger.info(f"Deleted {len(memories)} memories")
+        logger.info(f"Deleted {deleted} memories")
 
-        decay_usage_notice = detect_decay_usage_from_delete_all(len(memories))
+        decay_usage_notice = detect_decay_usage_from_delete_all(deleted)
         if decay_usage_notice:
             display_decay_usage_notice(self, "sync", "delete_all", *decay_usage_notice)
         else:
@@ -5341,28 +5369,43 @@ class AsyncMemory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"})
-        memories = await asyncio.to_thread(self.vector_store.list, filters=filters)
+        # Paginate — see the sync twin: `list()` defaults to top_k=100 in several
+        # stores, so one untruncated call deleted at most a page and called it done.
+        deleted = 0
+        errors = []
+        attempted = set()
+        for _ in range(_DELETE_ALL_MAX_PAGES):
+            page = (await asyncio.to_thread(
+                self.vector_store.list, filters=filters, top_k=_DELETE_ALL_PAGE_SIZE))[0]
+            # Same "nothing new" termination as the sync twin — see there.
+            fresh = [m for m in page if m.id not in attempted]
+            if not fresh:
+                break
+            attempted.update(m.id for m in fresh)
+            results = await asyncio.gather(
+                *[self._delete_memory(m.id, skip_entity_cleanup=True) for m in fresh],
+                return_exceptions=True)
+            page_errors = [r for r in results if isinstance(r, BaseException)]
+            errors.extend(page_errors)
+            deleted += len(results) - len(page_errors)
+        else:
+            logger.warning("delete_all: page cap (%d) reached — scope may not be drained",
+                           _DELETE_ALL_MAX_PAGES)
 
-        delete_tasks = []
-        for memory in memories[0]:
-            delete_tasks.append(self._delete_memory(memory.id, skip_entity_cleanup=True))
-
-        results = await asyncio.gather(*delete_tasks, return_exceptions=True)
-
-        # No `_entity_store is not None` guard: a process that only ever deletes
+        # ONE bulk clear, after every page — not per page. No
+        # `_entity_store is not None` guard: a process that only ever deletes
         # never initializes the store, and skipping cleanup there is precisely
         # what leaves orphan rows behind. The helper decides.
         await self._bulk_clear_entity_store(filters)
 
-        errors = [r for r in results if isinstance(r, BaseException)]
         if errors:
-            logger.warning("Failed to delete %d out of %d memories", len(errors), len(results))
+            logger.warning("Failed to delete %d memories", len(errors))
             for err in errors:
                 logger.warning("Delete error: %s", err)
 
-        logger.info(f"Deleted {len(results) - len(errors)} memories")
+        logger.info(f"Deleted {deleted} memories")
 
-        decay_usage_notice = detect_decay_usage_from_delete_all(len(memories[0]))
+        decay_usage_notice = detect_decay_usage_from_delete_all(deleted)
         if decay_usage_notice:
             await display_decay_usage_notice_async(self, "async", "delete_all", *decay_usage_notice)
         else:

@@ -1291,3 +1291,119 @@ class TestEntityCleanupDurability:
 
         mock_memory.vector_store.delete.assert_not_called()
         assert calls == [], "a reused id must not have its entity links stripped"
+
+
+class TestDeleteAllPagination:
+    """`list()` defaults to top_k=100 in several stores (Qdrant among them).
+
+    The old single untruncated call deleted at most one page and reported that
+    as the whole job — which is why a production bulk delete "needed two passes"
+    and looked like a mystery instead of a paging boundary.
+    """
+
+    @pytest.fixture
+    def mock_memory(self, mocker):
+        _setup_mocks(mocker)
+        m = Memory()
+        m._entity_store = Mock()
+        m._entity_store.list.return_value = [[]]
+        return m
+
+    def _draining_store(self, memory, total, page_size, undeletable=()):
+        """A store that really drains as delete() is called."""
+        remaining = [f"mem-{i}" for i in range(total)]
+
+        def _list(filters=None, top_k=100):
+            return ([Mock(id=i) for i in remaining[:top_k]],)
+
+        def _delete_memory(mid, existing=None, **kw):
+            if mid in undeletable:
+                raise RuntimeError("undeletable")
+            remaining.remove(mid)
+            return mid
+
+        memory.vector_store.list = _list
+        memory._delete_memory = _delete_memory
+        return lambda: remaining
+
+    @pytest.mark.parametrize("total", [0, 1, 999, 1000, 1001, 2500])
+    def test_drains_across_page_boundaries(self, mock_memory, mocker, total):
+        """Includes exactly page_size, page_size+1 and >2 pages."""
+        mocker.patch("mem0.memory.main._DELETE_ALL_PAGE_SIZE", 1000)
+        left = self._draining_store(mock_memory, total, 1000)
+        mock_memory.delete_all(user_id="u")
+        assert left() == [], f"{len(left())} memórias sobraram de {total}"
+
+    def test_passes_top_k_explicitly(self, mock_memory, mocker):
+        """The actual bug was relying on the default. Pin the call."""
+        seen = []
+
+        def _list(filters=None, top_k=None):
+            seen.append(top_k)
+            return ([],)
+
+        mock_memory.vector_store.list = _list
+        mock_memory.delete_all(user_id="u")
+        assert seen and all(k is not None for k in seen), seen
+
+    def test_counts_deletions_not_pages(self, mock_memory, mocker):
+        """detect_decay_usage_from_delete_all must receive the TOTAL, or the
+        notice fires on the wrong threshold."""
+        mocker.patch("mem0.memory.main._DELETE_ALL_PAGE_SIZE", 10)
+        spy = mocker.patch("mem0.memory.main.detect_decay_usage_from_delete_all",
+                           return_value=None)
+        self._draining_store(mock_memory, 25, 10)
+        mock_memory.delete_all(user_id="u")
+        spy.assert_called_once_with(25)
+
+    def test_a_full_page_of_failures_terminates(self, mock_memory, mocker):
+        """Without a no-progress guard, re-listing an undeletable page loops
+        forever. The loop must stop rather than hang."""
+        mocker.patch("mem0.memory.main._DELETE_ALL_PAGE_SIZE", 5)
+        left = self._draining_store(mock_memory, 5, 5,
+                                    undeletable={f"mem-{i}" for i in range(5)})
+        mock_memory.delete_all(user_id="u")
+        assert len(left()) == 5   # nothing deleted, but we returned
+
+    def test_page_cap_is_reported(self, mock_memory, mocker, caplog):
+        mocker.patch("mem0.memory.main._DELETE_ALL_PAGE_SIZE", 1)
+        mocker.patch("mem0.memory.main._DELETE_ALL_MAX_PAGES", 3)
+        self._draining_store(mock_memory, 10, 1)
+        with caplog.at_level(logging.WARNING):
+            mock_memory.delete_all(user_id="u")
+        assert any("page cap" in r.message for r in caplog.records)
+
+
+class TestAsyncDeleteAllPagination:
+    @pytest.fixture
+    def mock_async_memory(self, mocker):
+        _setup_mocks(mocker)
+        m = AsyncMemory()
+        m._entity_store = Mock()
+        m._entity_store.list.return_value = [[]]
+        return m
+
+    @pytest.mark.asyncio
+    async def test_drains_and_bulk_clears_exactly_once(self, mock_async_memory, mocker):
+        """The bulk clear belongs AFTER every page, not once per page."""
+        mocker.patch("mem0.memory.main._DELETE_ALL_PAGE_SIZE", 10)
+        remaining = [f"mem-{i}" for i in range(25)]
+
+        def _list(filters=None, top_k=100):
+            return ([Mock(id=i) for i in remaining[:top_k]],)
+
+        async def _delete_memory(mid, existing=None, **kw):
+            remaining.remove(mid)
+            return mid
+
+        mock_async_memory.vector_store.list = _list
+        mock_async_memory._delete_memory = _delete_memory
+        clears = []
+        async def _bulk(filters):
+            clears.append(filters)
+        mock_async_memory._bulk_clear_entity_store = _bulk
+
+        await mock_async_memory.delete_all(user_id="u")
+
+        assert remaining == []
+        assert len(clears) == 1, f"bulk clear rodou {len(clears)}x"
