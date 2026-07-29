@@ -58,6 +58,7 @@ from mem0.memory.notices import (
 )
 from mem0.memory.utils import (
     extract_json,
+    normalize_linked_memory_ids,
     parse_messages,
     parse_vision_messages,
     process_telemetry_filters,
@@ -1516,9 +1517,14 @@ class Memory(MemoryBase):
                 # Update existing entity's linked_memory_ids
                 match = existing[0]
                 payload = match.payload or {}
-                linked_ids = payload.get("linked_memory_ids", [])
+                raw_linked = payload.get("linked_memory_ids")
+                linked_ids = normalize_linked_memory_ids(raw_linked)
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
+                # Write when the id is new OR when normalizing changed the value:
+                # that second case is how a row corrupted by some other writer
+                # heals on its next touch instead of staying broken forever.
+                if linked_ids != raw_linked:
                     payload["linked_memory_ids"] = linked_ids
                     self.entity_store.update(
                         vector_id=match.id,
@@ -1564,8 +1570,11 @@ class Memory(MemoryBase):
             for row in rows or []:
                 try:
                     payload = getattr(row, "payload", None) or {}
-                    linked = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked, list) or memory_id not in linked:
+                    # Normalizing (instead of `isinstance(...) -> continue`) is
+                    # what lets cleanup REACH a corrupted row; the old guard made
+                    # such a row keep its dangling refs forever.
+                    linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+                    if memory_id not in linked:
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
@@ -1574,20 +1583,15 @@ class Memory(MemoryBase):
                         except Exception as e:
                             logger.debug(f"Entity delete failed for id={row.id}: {e}")
                     else:
-                        entity_text = payload.get("data")
-                        if not isinstance(entity_text, str) or not entity_text:
-                            logger.debug(f"Entity id={row.id} missing 'data'; skipping update during cleanup")
-                            continue
-                        try:
-                            vec = self.embedding_model.embed(entity_text, "update")
-                        except Exception as e:
-                            logger.debug(f"Entity re-embed failed for '{entity_text}': {e}")
-                            continue
+                        # Payload-only update. The entity TEXT does not change
+                        # when we merely unlink a memory, so re-embedding was
+                        # pure cost: it re-encoded BM25 and rewrote the vector,
+                        # perturbing the entity HNSW graph on every delete.
                         new_payload = {**payload, "linked_memory_ids": remaining}
                         try:
                             self.entity_store.update(
                                 vector_id=row.id,
-                                vector=vec,
+                                vector=None,
                                 payload=new_payload,
                             )
                         except Exception as e:
@@ -2150,7 +2154,10 @@ class Memory(MemoryBase):
                             # Update existing entity
                             match = matches[0]
                             payload = match.payload or {}
-                            linked = set(payload.get("linked_memory_ids", []))
+                            # normalize_* is load-bearing here: a str payload fed
+                            # straight to set() iterates CHARACTER BY CHARACTER,
+                            # which is how real entity rows lost their links.
+                            linked = set(normalize_linked_memory_ids(payload.get("linked_memory_ids")))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
                             try:
@@ -3018,6 +3025,18 @@ class Memory(MemoryBase):
                         payload = match.payload if hasattr(match, 'payload') else {}
                         linked_memory_ids = payload.get("linked_memory_ids", [])
                         if not isinstance(linked_memory_ids, list):
+                            # Deliberately fail CLOSED here rather than normalize:
+                            # a malformed value must not become retrieval-active,
+                            # because a non-empty entity_boosts also raises the
+                            # score divisor for every candidate in the query.
+                            # But it must not be SILENT either — silence is how a
+                            # dead entity boost went unnoticed for weeks. Writers
+                            # normalize and self-heal; the reader only reports.
+                            logger.warning(
+                                "Entity %s has a malformed linked_memory_ids (%s); "
+                                "its boost is being skipped. Run "
+                                "check_corpus.py / repair_entity_links.py.",
+                                getattr(match, "id", "?"), type(linked_memory_ids).__name__)
                             continue
 
                         num_linked = max(len(linked_memory_ids), 1)
@@ -3709,9 +3728,13 @@ class AsyncMemory(MemoryBase):
             if existing and existing[0].score >= 0.95:
                 match = existing[0]
                 payload = match.payload or {}
-                linked_ids = payload.get("linked_memory_ids", [])
+                raw_linked = payload.get("linked_memory_ids")
+                linked_ids = normalize_linked_memory_ids(raw_linked)
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
+                # Same self-heal as the sync twin: normalizing changing the value
+                # is itself a reason to write.
+                if linked_ids != raw_linked:
                     payload["linked_memory_ids"] = linked_ids
                     await asyncio.to_thread(
                         self.entity_store.update,
@@ -3768,8 +3791,10 @@ class AsyncMemory(MemoryBase):
             for row in rows or []:
                 try:
                     payload = getattr(row, "payload", None) or {}
-                    linked = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked, list) or memory_id not in linked:
+                    # See the sync twin: normalizing is what lets cleanup reach a
+                    # corrupted row instead of skipping it forever.
+                    linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+                    if memory_id not in linked:
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
@@ -3778,21 +3803,14 @@ class AsyncMemory(MemoryBase):
                         except Exception as e:
                             logger.debug(f"Entity delete failed for id={row.id} (async): {e}")
                     else:
-                        entity_text = payload.get("data")
-                        if not isinstance(entity_text, str) or not entity_text:
-                            logger.debug(f"Entity id={row.id} missing 'data'; skipping update during cleanup (async)")
-                            continue
-                        try:
-                            vec = await asyncio.to_thread(self.embedding_model.embed, entity_text, "update")
-                        except Exception as e:
-                            logger.debug(f"Entity re-embed failed for '{entity_text}' (async): {e}")
-                            continue
+                        # Payload-only: unlinking does not change the entity text,
+                        # so re-embedding only cost time and churned the HNSW.
                         new_payload = {**payload, "linked_memory_ids": remaining}
                         try:
                             await asyncio.to_thread(
                                 self.entity_store.update,
                                 vector_id=row.id,
-                                vector=vec,
+                                vector=None,
                                 payload=new_payload,
                             )
                         except Exception as e:
@@ -4314,7 +4332,10 @@ class AsyncMemory(MemoryBase):
                         if matches and matches[0].score >= 0.95:
                             match = matches[0]
                             payload = match.payload or {}
-                            linked = set(payload.get("linked_memory_ids", []))
+                            # normalize_* is load-bearing here: a str payload fed
+                            # straight to set() iterates CHARACTER BY CHARACTER,
+                            # which is how real entity rows lost their links.
+                            linked = set(normalize_linked_memory_ids(payload.get("linked_memory_ids")))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
                             try:
@@ -5173,6 +5194,12 @@ class AsyncMemory(MemoryBase):
                     payload = match.payload if hasattr(match, 'payload') else {}
                     linked_memory_ids = payload.get("linked_memory_ids", [])
                     if not isinstance(linked_memory_ids, list):
+                        # Fail closed, but audibly — see the sync twin.
+                        logger.warning(
+                            "Entity %s has a malformed linked_memory_ids (%s); "
+                            "its boost is being skipped. Run "
+                            "check_corpus.py / repair_entity_links.py.",
+                            getattr(match, "id", "?"), type(linked_memory_ids).__name__)
                         continue
 
                     num_linked = max(len(linked_memory_ids), 1)

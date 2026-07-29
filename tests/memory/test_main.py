@@ -997,3 +997,190 @@ class TestAddPipelineEntityEmbeddingCountGuard:
         assert any("padding/truncating" in r.message for r in caplog.records), (
             "expected count-mismatch warning was not emitted"
         )
+
+
+class TestEntityLinkNormalization:
+    """A corrupt `linked_memory_ids` must not be amplified, and must self-heal.
+
+    Origin: an ad-hoc repair script wrote `str(list)` into the field; the next
+    `add` ran `set(payload.get("linked_memory_ids", []))`, and `set` on a string
+    iterates CHARACTERS. Real entity rows ended up holding 22 single characters
+    where their memory ids used to be.
+    """
+
+    CORRUPT = "['old-1', 'old-2']"
+
+    @pytest.fixture
+    def mock_memory(self, mocker):
+        _setup_mocks(mocker)
+        return Memory()
+
+    @pytest.fixture
+    def mock_async_memory(self, mocker):
+        _setup_mocks(mocker)
+        return AsyncMemory()
+
+    def _entity_match(self, payload, score=0.99, eid="ent-1"):
+        m = Mock()
+        m.id, m.score, m.payload = eid, score, payload
+        return m
+
+    # ---- writers: _upsert_entity ----------------------------------------
+    def test_upsert_entity_heals_a_corrupt_row(self, mock_memory):
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": self.CORRUPT})]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+
+        mock_memory._upsert_entity("alice", "PERSON", "mem-new", {"user_id": "u"})
+
+        written = store.update.call_args.kwargs["payload"]["linked_memory_ids"]
+        assert written == ["old-1", "old-2", "mem-new"]
+        assert len(written) == 3, "a str payload must not explode into characters"
+
+    def test_upsert_entity_heals_even_when_the_id_is_already_present(self, mock_memory):
+        """The old guard was `if memory_id not in linked_ids` — with a str value
+        `"mem-1" in "['mem-1']"` is True, so the row would never be repaired."""
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": "['mem-1']"})]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+
+        mock_memory._upsert_entity("alice", "PERSON", "mem-1", {"user_id": "u"})
+
+        store.update.assert_called_once()
+        assert store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["mem-1"]
+
+    def test_upsert_entity_does_not_rewrite_a_clean_unchanged_row(self, mock_memory):
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": ["mem-1"]})]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+
+        mock_memory._upsert_entity("alice", "PERSON", "mem-1", {"user_id": "u"})
+
+        store.update.assert_not_called()
+
+    # ---- writers: unlink -------------------------------------------------
+    def test_unlink_reaches_a_corrupt_row(self, mock_memory):
+        """The old `isinstance(...) -> continue` guard meant a corrupt row kept
+        its dangling refs forever, invisible to cleanup."""
+        row = Mock()
+        row.id, row.payload = "ent-1", {"data": "alice",
+                                        "linked_memory_ids": "['mem-1', 'mem-2']"}
+        store = Mock()
+        store.list.return_value = [[row]]
+        mock_memory._entity_store = store
+
+        mock_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+
+        assert store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["mem-2"]
+
+    def test_unlink_is_payload_only(self, mock_memory):
+        """Unlinking does not change the entity TEXT, so re-embedding was pure
+        cost: a full upsert re-encodes BM25 and perturbs the entity HNSW on
+        every single memory delete."""
+        row = Mock()
+        row.id, row.payload = "ent-1", {"data": "alice",
+                                        "linked_memory_ids": ["mem-1", "mem-2"]}
+        store = Mock()
+        store.list.return_value = [[row]]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+
+        mock_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+
+        assert store.update.call_args.kwargs["vector"] is None
+        mock_memory.embedding_model.embed.assert_not_called()
+
+    def test_unlink_still_deletes_a_row_that_empties(self, mock_memory):
+        row = Mock()
+        row.id, row.payload = "ent-1", {"data": "alice", "linked_memory_ids": ["mem-1"]}
+        store = Mock()
+        store.list.return_value = [[row]]
+        mock_memory._entity_store = store
+
+        mock_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+
+        store.delete.assert_called_once_with(vector_id="ent-1")
+
+    # ---- reader: fail closed, but audible --------------------------------
+    def test_reader_still_skips_a_malformed_row(self, mock_memory):
+        """Deliberately NOT normalized on read: a malformed value must not become
+        retrieval-active, because a non-empty entity_boosts also raises the score
+        divisor for every candidate in the query."""
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": "['mem-1']"}, score=0.9)]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1, 0.2, 0.3]])
+
+        boosts = mock_memory._compute_entity_boosts([("PERSON", "alice")], {"user_id": "u"})
+
+        assert boosts == {}
+
+    def test_reader_warns_instead_of_staying_silent(self, mock_memory, caplog):
+        """Silence is exactly how a dead entity boost survived for weeks."""
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": "['mem-1']"}, score=0.9)]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1, 0.2, 0.3]])
+
+        with caplog.at_level(logging.WARNING):
+            mock_memory._compute_entity_boosts([("PERSON", "alice")], {"user_id": "u"})
+
+        assert any("malformed linked_memory_ids" in r.message for r in caplog.records)
+
+    def test_reader_scores_a_clean_row_normally(self, mock_memory):
+        from mem0.utils.scoring import ENTITY_BOOST_WEIGHT
+
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": ["mem-1", "mem-2"]}, score=1.0)]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1, 0.2, 0.3]])
+
+        boosts = mock_memory._compute_entity_boosts([("PERSON", "alice")], {"user_id": "u"})
+
+        expected = 1.0 * ENTITY_BOOST_WEIGHT * (1.0 / (1.0 + 0.001 * 1))
+        assert boosts["mem-1"] == pytest.approx(expected)
+
+    # ---- async twins ------------------------------------------------------
+    @pytest.mark.asyncio
+    async def test_async_upsert_entity_heals_a_corrupt_row(self, mock_async_memory):
+        store = Mock()
+        store.search.return_value = [self._entity_match(
+            {"data": "alice", "linked_memory_ids": self.CORRUPT})]
+        mock_async_memory._entity_store = store
+        mock_async_memory.embedding_model = Mock()
+        mock_async_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+
+        await mock_async_memory._upsert_entity_async("alice", "PERSON", "mem-new", {"user_id": "u"})
+
+        written = store.update.call_args.kwargs["payload"]["linked_memory_ids"]
+        assert written == ["old-1", "old-2", "mem-new"]
+
+    @pytest.mark.asyncio
+    async def test_async_unlink_is_payload_only_and_reaches_corrupt_rows(self, mock_async_memory):
+        row = Mock()
+        row.id, row.payload = "ent-1", {"data": "alice",
+                                        "linked_memory_ids": "['mem-1', 'mem-2']"}
+        store = Mock()
+        store.list.return_value = [[row]]
+        mock_async_memory._entity_store = store
+        mock_async_memory.embedding_model = Mock()
+
+        await mock_async_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+
+        assert store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["mem-2"]
+        assert store.update.call_args.kwargs["vector"] is None
