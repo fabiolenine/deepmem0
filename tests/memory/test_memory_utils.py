@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import Mock
 
 from mem0.memory.utils import (
+    normalize_linked_memory_ids,
     parse_messages,
     parse_vision_messages,
     remove_spaces_from_entities,
@@ -150,3 +151,68 @@ class TestRemoveSpacesFromEntities:
         f = remove_spaces_from_entities([dict(base)], sanitize_relationship=False)[0]["relationship"]
         assert t == sanitize_relationship_for_cypher("a/b")
         assert f == "a/b"
+
+
+class TestNormalizeLinkedMemoryIds:
+    """Entity payload `linked_memory_ids` coercion.
+
+    Regression origin: an ad-hoc repair script stored `str(list)` into the field.
+    The next writer ran `set(payload.get("linked_memory_ids", []))`, which iterates
+    a string CHARACTER BY CHARACTER instead of raising, permanently replacing an
+    entity's real links with punctuation and hex digits.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (["a", "b"], ["a", "b"]),
+            ([], []),
+            (None, []),
+            ("['a', 'b']", ["a", "b"]),          # the corruption, recovered
+            ('["a", "b"]', ["a", "b"]),          # JSON-ish repr
+            ("('a', 'b')", ["a", "b"]),          # tuple repr
+            ("[]", []),
+            ("a", ["a"]),                        # bare string == one id
+            ("  a  ", ["a"]),
+            ("", []),
+            (("a", "b"), ["a", "b"]),
+            ({"b", "a"}, ["a", "b"]),            # set -> stable order
+            (["a", None, "", "b"], ["a", "b"]),  # holes dropped
+            (42, []),
+            ({"a": 1}, []),
+            ([1, 2], ["1", "2"]),                # non-str ids stringified
+        ],
+    )
+    def test_shapes(self, raw, expected):
+        assert normalize_linked_memory_ids(raw) == expected
+
+    def test_the_regression_by_name(self):
+        """The whole point: normalizing must NOT be character iteration."""
+        corrupt = "['a', 'b']"
+        assert normalize_linked_memory_ids(corrupt) == ["a", "b"]
+        assert normalize_linked_memory_ids(corrupt) != list(corrupt)
+        assert normalize_linked_memory_ids(corrupt) != sorted(set(corrupt))
+
+    def test_real_production_payload_is_recovered(self):
+        """The exact surviving `Brasília` value from the production corpus."""
+        raw = "['847c8849-9feb-4a82-b242-281aecd75ed2', '98831cc8-83d6-452b-b149-e003b008ce11']"
+        assert normalize_linked_memory_ids(raw) == [
+            "847c8849-9feb-4a82-b242-281aecd75ed2",
+            "98831cc8-83d6-452b-b149-e003b008ce11",
+        ]
+
+    def test_already_exploded_list_is_left_alone(self):
+        """Once a row is char-exploded the damage is done; the helper must not
+        invent recovery. `Mastercard`'s real shape: shrapnel + one surviving id.
+        Stripping shrapnel is a deployment-specific decision (repair script), not
+        this helper's job — ids are opaque here."""
+        raw = ["'", "-", "0", "a1c4b2ad-727c-45f0-b71a-b30842c4dcd2", "a"]
+        assert normalize_linked_memory_ids(raw) == raw
+
+    def test_malformed_string_never_raises(self):
+        for bad in ["[not python", "[1,", "['unterminated", "[[[[[[[[", "{'a': 1}"]:
+            assert isinstance(normalize_linked_memory_ids(bad), list)
+
+    def test_idempotent(self):
+        once = normalize_linked_memory_ids("['a', 'b']")
+        assert normalize_linked_memory_ids(once) == once

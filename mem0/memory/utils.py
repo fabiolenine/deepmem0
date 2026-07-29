@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import logging
 import re
@@ -110,6 +111,61 @@ def normalize_facts(raw_facts):
         if fact:
             normalized.append(fact)
     return normalized
+
+
+def normalize_linked_memory_ids(value: Any) -> List[str]:
+    """Coerce a persisted ``linked_memory_ids`` payload value into a list of ids.
+
+    Entity payloads are written by many hands — this library, backfill scripts,
+    ad-hoc repair scripts — and a single writer that stored ``str(list)`` instead
+    of the list is enough to poison every downstream writer, because
+    ``set("['a', 'b']")`` silently explodes into CHARACTERS instead of raising.
+    One such write produced entity rows holding 22 single-character "ids".
+
+    Shapes tolerated:
+      * ``list``        -> element-wise ``str()``, empty/None dropped, order kept
+      * ``str``         -> ``ast.literal_eval`` when it parses to a list/tuple
+                           (recovers a repr written by a buggy writer); otherwise
+                           the string is treated as ONE id -> ``[value]``
+      * ``tuple``/``set`` -> list (``set`` sorted, so callers get a stable order)
+      * anything else / ``None`` -> ``[]``
+
+    Deliberately does NOT filter by id shape: memory ids are opaque at this layer
+    and callers/tests legitimately use non-UUID ids. Deployments that guarantee a
+    specific id format enforce that in their own audit tooling, not here.
+
+    Never raises — a malformed payload must not break an add or a delete.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") or text.startswith("("):
+            try:
+                parsed = ast.literal_eval(text)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                logger.warning(
+                    "Recovered a serialized linked_memory_ids value (%d ids); "
+                    "some writer stored str(list) instead of the list",
+                    len(parsed),
+                )
+                return normalize_linked_memory_ids(list(parsed))
+        # Not a serialized container: a bare string is a single id.
+        return [text] if text else []
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if item is None:
+                continue
+            text = item if isinstance(item, str) else str(item)
+            if text:
+                out.append(text)
+        return out
+    return []
 
 
 def remove_code_blocks(content: str) -> str:
