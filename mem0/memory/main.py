@@ -489,6 +489,78 @@ def _entity_collection_name(provider: str, collection_name: str) -> str:
     return f"{collection_name}{separator}entities"
 
 
+# Cap for the entity-store scans done during cleanup. The number matters less
+# than the alarm: a silently truncated scan turns cleanup into a PARTIAL no-op,
+# leaving dangling links that nobody will ever go looking for.
+ENTITY_SCAN_TOP_K = int(os.environ.get("MEM0_ENTITY_SCAN_TOP_K", "100000"))
+
+
+def _entity_cleanup_enabled() -> bool:
+    """``auto`` (default) always cleans; ``lazy`` restores the old behaviour of
+    skipping cleanup in a process that never touched the entity store.
+
+    The old guard (``if self._entity_store is None: return``) was a silent
+    correctness hole: a short-lived process that only deletes — a test harness,
+    a smoke script, a cron job — never initializes the entity store, so every
+    link it should have removed survived forever. Those are exactly the orphan
+    rows found in the production corpus.
+    """
+    return os.environ.get("MEM0_ENTITY_CLEANUP", "auto").strip().lower() != "lazy"
+
+
+def _scan_entity_rows(store, search_filters):
+    """All entity rows in scope, with an explicit truncation alarm."""
+    listed = store.list(filters=search_filters, top_k=ENTITY_SCAN_TOP_K)
+    rows = listed[0] if isinstance(listed, (list, tuple)) and listed and isinstance(listed[0], list) else listed
+    rows = rows or []
+    if len(rows) >= ENTITY_SCAN_TOP_K:
+        logger.warning(
+            "Entity scan hit the %d-row cap for scope %s — cleanup is INCOMPLETE. "
+            "Raise MEM0_ENTITY_SCAN_TOP_K.", ENTITY_SCAN_TOP_K, search_filters)
+    return rows
+
+
+def unlink_memory_from_entity_rows(store, memory_id, filters):
+    """Remove `memory_id` from every entity row in scope. Synchronous.
+
+    Shared by the sync delete path and by BOTH reconcilers — the async
+    reconciler runs at construction time, where there is no event loop to await
+    the async variant, and duplicating this logic is how the two paths would
+    drift apart.
+    """
+    search_filters = {k: v for k, v in (filters or {}).items()
+                      if k in ("user_id", "agent_id", "run_id") and v}
+    try:
+        for row in _scan_entity_rows(store, search_filters):
+            try:
+                payload = getattr(row, "payload", None) or {}
+                # Normalizing (instead of `isinstance(...) -> continue`) is what
+                # lets cleanup REACH a corrupted row; the old guard made such a
+                # row keep its dangling refs forever.
+                linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+                if memory_id not in linked:
+                    continue
+                remaining = [mid for mid in linked if mid != memory_id]
+                if not remaining:
+                    try:
+                        store.delete(vector_id=row.id)
+                    except Exception as e:
+                        logger.debug(f"Entity delete failed for id={row.id}: {e}")
+                else:
+                    # Payload-only. Unlinking does not change the entity TEXT, so
+                    # re-embedding was pure cost: it re-encoded BM25 and rewrote
+                    # the vector, perturbing the entity HNSW on every delete.
+                    try:
+                        store.update(vector_id=row.id, vector=None,
+                                     payload={**payload, "linked_memory_ids": remaining})
+                    except Exception as e:
+                        logger.debug(f"Entity update failed for id={row.id}: {e}")
+            except Exception as e:
+                logger.debug(f"Entity cleanup error: {e}")
+    except Exception as e:
+        logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
+
+
 def _dynamics_config(config) -> Optional[Any]:
     """The MemoryDynamicsConfig when dynamics is enabled, else None."""
     dyn = getattr(config, "dynamics", None)
@@ -1553,53 +1625,16 @@ class Memory(MemoryBase):
 
         For each entity whose `linked_memory_ids` contains `memory_id`:
           - remove the id; if the list becomes empty, delete the entity record.
-          - otherwise re-embed the entity text and update the payload
-            (the vector store's update() requires a vector).
+          - otherwise update the payload only (no re-embed: the entity text is
+            unchanged, and a full upsert would churn the entity HNSW).
 
-        No-op if the entity store has never been initialized in this process.
         Errors on individual entities are swallowed at debug level; outer
-        failures are swallowed at warning level so the primary delete/update
-        path is never broken by entity cleanup.
+        failures at warning level, so the primary delete path is never broken by
+        entity cleanup.
         """
-        if self._entity_store is None:
+        if not _entity_cleanup_enabled():
             return
-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
-        try:
-            listed = self.entity_store.list(filters=search_filters, top_k=10000)
-            rows = listed[0] if isinstance(listed, (list, tuple)) and listed and isinstance(listed[0], list) else listed
-            for row in rows or []:
-                try:
-                    payload = getattr(row, "payload", None) or {}
-                    # Normalizing (instead of `isinstance(...) -> continue`) is
-                    # what lets cleanup REACH a corrupted row; the old guard made
-                    # such a row keep its dangling refs forever.
-                    linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
-                    if memory_id not in linked:
-                        continue
-                    remaining = [mid for mid in linked if mid != memory_id]
-                    if not remaining:
-                        try:
-                            self.entity_store.delete(vector_id=row.id)
-                        except Exception as e:
-                            logger.debug(f"Entity delete failed for id={row.id}: {e}")
-                    else:
-                        # Payload-only update. The entity TEXT does not change
-                        # when we merely unlink a memory, so re-embedding was
-                        # pure cost: it re-encoded BM25 and rewrote the vector,
-                        # perturbing the entity HNSW graph on every delete.
-                        new_payload = {**payload, "linked_memory_ids": remaining}
-                        try:
-                            self.entity_store.update(
-                                vector_id=row.id,
-                                vector=None,
-                                payload=new_payload,
-                            )
-                        except Exception as e:
-                            logger.debug(f"Entity update failed for id={row.id}: {e}")
-                except Exception as e:
-                    logger.debug(f"Entity cleanup error: {e}")
-        except Exception as e:
-            logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
+        unlink_memory_from_entity_rows(self.entity_store, memory_id, filters)
 
     def _link_entities_for_memory(self, memory_id, text, filters):
         """Extract entities from `text` and link them to `memory_id` in the
@@ -3509,12 +3544,14 @@ class Memory(MemoryBase):
                 role=existing_memory.payload.get("role"),
                 is_deleted=1,
             )
+        # Entity-store cleanup BEFORE committing the intent. Ordering matters:
+        # with commit-then-cleanup, a crash in between left no pending intent to
+        # retry, so the dangling entity links became permanent and invisible.
+        # Cleanup is idempotent, so replaying it on reconcile is safe.
+        self._remove_memory_from_entity_store(memory_id, session_filters)
+
         if self.db is not None:
             self.db.commit_delete(op_id)
-
-        # Entity-store cleanup: strip this memory's id from any entity records
-        # that linked to it. Non-fatal — the helper swallows errors.
-        self._remove_memory_from_entity_store(memory_id, session_filters)
 
         return memory_id
 
@@ -3526,8 +3563,10 @@ class Memory(MemoryBase):
         intent STATE (not the tombstone) is the authority on completion, so this
         converges from a crash at ANY point — no lost tombstone, no false 'completed'
         signal for a live vector. Idempotent; a single cheap query when nothing is
-        pending. Entity cleanup is skipped here (best-effort; stale links are benign
-        residue). Called once at init.
+        pending. Entity cleanup RUNS here too (it used to be skipped as "benign
+        residue" — it is not: those stale links are exactly the dangling refs the
+        corpus audit now reports, and they outlive the memory forever). Called
+        once at init.
         """
         if getattr(self, "db", None) is None:
             return 0
@@ -3547,6 +3586,7 @@ class Memory(MemoryBase):
                     except Exception:
                         before = {}
                 existing = self.vector_store.get(vector_id=mid)
+                spared = False
                 if existing is not None:
                     # ABA guard: only delete if the CURRENT vector is the SAME memory the
                     # intent targeted (created_at identity). A REUSED id (import/restore/manual)
@@ -3555,8 +3595,19 @@ class Memory(MemoryBase):
                     orig_created = before.get("created_at")
                     if orig_created and cur_created and cur_created != orig_created:
                         logger.warning(f"Reconcile: id {mid} appears REUSED (created_at differs) — sparing current vector")
+                        spared = True
                     else:
                         self.vector_store.delete(vector_id=mid)
+                if not spared:
+                    # The ABA guard extends to the entity store: stripping links for
+                    # a REUSED id would silently unlink the *new* memory that took it.
+                    try:
+                        scope = json.loads(intent.get("scope") or "{}")
+                    except Exception:
+                        scope = {}
+                    if not isinstance(scope, dict):
+                        scope = {}
+                    self._remove_memory_from_entity_store(mid, scope)
                 if not self.db.has_delete_tombstone(mid):
                     # faithful tombstone from the before-image (survives a crash that hit
                     # before the tombstone was written)
@@ -3766,13 +3817,12 @@ class AsyncMemory(MemoryBase):
         concurrent _delete_memory coroutines each try to read-modify-write
         the same entity rows' linked_memory_ids lists.
         """
-        if self._entity_store is None:
+        if not _entity_cleanup_enabled():
             return
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         try:
-            listed = await asyncio.to_thread(self.entity_store.list, filters=search_filters, top_k=10000)
-            rows = listed[0] if isinstance(listed, (list, tuple)) and listed and isinstance(listed[0], list) else listed
-            for row in rows or []:
+            rows = await asyncio.to_thread(_scan_entity_rows, self.entity_store, search_filters)
+            for row in rows:
                 try:
                     await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
                 except Exception as e:
@@ -3781,44 +3831,17 @@ class AsyncMemory(MemoryBase):
             logger.warning(f"Bulk entity store cleanup failed: {e}")
 
     async def _remove_memory_from_entity_store(self, memory_id, filters):
-        """Async variant of `Memory._remove_memory_from_entity_store`."""
-        if self._entity_store is None:
+        """Async variant of `Memory._remove_memory_from_entity_store`.
+
+        Delegates to the same helper off-thread rather than mirroring the logic:
+        the two copies had already drifted once (the sync one alone carried the
+        `isinstance` guard fix), and entity cleanup is not hot enough to justify
+        per-call awaits.
+        """
+        if not _entity_cleanup_enabled():
             return
-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
-        try:
-            listed = await asyncio.to_thread(self.entity_store.list, filters=search_filters, top_k=10000)
-            rows = listed[0] if isinstance(listed, (list, tuple)) and listed and isinstance(listed[0], list) else listed
-            for row in rows or []:
-                try:
-                    payload = getattr(row, "payload", None) or {}
-                    # See the sync twin: normalizing is what lets cleanup reach a
-                    # corrupted row instead of skipping it forever.
-                    linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
-                    if memory_id not in linked:
-                        continue
-                    remaining = [mid for mid in linked if mid != memory_id]
-                    if not remaining:
-                        try:
-                            await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
-                        except Exception as e:
-                            logger.debug(f"Entity delete failed for id={row.id} (async): {e}")
-                    else:
-                        # Payload-only: unlinking does not change the entity text,
-                        # so re-embedding only cost time and churned the HNSW.
-                        new_payload = {**payload, "linked_memory_ids": remaining}
-                        try:
-                            await asyncio.to_thread(
-                                self.entity_store.update,
-                                vector_id=row.id,
-                                vector=None,
-                                payload=new_payload,
-                            )
-                        except Exception as e:
-                            logger.debug(f"Entity update failed for id={row.id} (async): {e}")
-                except Exception as e:
-                    logger.debug(f"Entity cleanup error (async): {e}")
-        except Exception as e:
-            logger.warning(f"Entity store cleanup failed for memory_id={memory_id} (async): {e}")
+        await asyncio.to_thread(
+            unlink_memory_from_entity_rows, self.entity_store, memory_id, filters)
 
     async def _link_entities_for_memory(self, memory_id, text, filters):
         """Async variant of `Memory._link_entities_for_memory`."""
@@ -5326,8 +5349,10 @@ class AsyncMemory(MemoryBase):
 
         results = await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-        if self._entity_store is not None:
-            await self._bulk_clear_entity_store(filters)
+        # No `_entity_store is not None` guard: a process that only ever deletes
+        # never initializes the store, and skipping cleanup there is precisely
+        # what leaves orphan rows behind. The helper decides.
+        await self._bulk_clear_entity_store(filters)
 
         errors = [r for r in results if isinstance(r, BaseException)]
         if errors:
@@ -5672,11 +5697,14 @@ class AsyncMemory(MemoryBase):
                 role=existing_memory.payload.get("role"),
                 is_deleted=1,
             )
-        if self.db is not None:
-            await asyncio.to_thread(self.db.commit_delete, op_id)
-
+        # Cleanup BEFORE the commit — see the sync twin: with commit-then-cleanup
+        # a crash in between leaves no pending intent to retry, so the dangling
+        # entity links become permanent. Cleanup is idempotent.
         if not skip_entity_cleanup:
             await self._remove_memory_from_entity_store(memory_id, session_filters)
+
+        if self.db is not None:
+            await asyncio.to_thread(self.db.commit_delete, op_id)
 
         return memory_id
 
@@ -5704,6 +5732,7 @@ class AsyncMemory(MemoryBase):
                     except Exception:
                         before = {}
                 existing = self.vector_store.get(vector_id=mid)
+                spared = False
                 if existing is not None:
                     # ABA guard: only delete if the CURRENT vector is the SAME memory the
                     # intent targeted (created_at identity). A REUSED id (import/restore/manual)
@@ -5712,8 +5741,18 @@ class AsyncMemory(MemoryBase):
                     orig_created = before.get("created_at")
                     if orig_created and cur_created and cur_created != orig_created:
                         logger.warning(f"Reconcile: id {mid} appears REUSED (created_at differs) — sparing current vector")
+                        spared = True
                     else:
                         self.vector_store.delete(vector_id=mid)
+                if not spared and _entity_cleanup_enabled():
+                    # The ABA guard extends to the entity store: stripping links for
+                    # a REUSED id would silently unlink the *new* memory that took it.
+                    try:
+                        scope = json.loads(intent.get("scope") or "{}")
+                    except Exception:
+                        scope = {}
+                    unlink_memory_from_entity_rows(
+                        self.entity_store, mid, scope if isinstance(scope, dict) else {})
                 if not self.db.has_delete_tombstone(mid):
                     # faithful tombstone from the before-image (survives a crash that hit
                     # before the tombstone was written)

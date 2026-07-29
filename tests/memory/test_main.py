@@ -1184,3 +1184,110 @@ class TestEntityLinkNormalization:
 
         assert store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["mem-2"]
         assert store.update.call_args.kwargs["vector"] is None
+
+
+class TestEntityCleanupDurability:
+    """Cleanup must run where it used to be silently skipped, and must be
+    ordered so a crash leaves work to retry rather than permanent residue."""
+
+    @pytest.fixture
+    def mock_memory(self, mocker):
+        _setup_mocks(mocker)
+        return Memory()
+
+    def test_cleanup_runs_before_the_intent_is_committed(self, mock_memory):
+        """Ordering is the whole point. With commit-then-cleanup, a crash in
+        between left NO pending intent, so the dangling link became permanent
+        and invisible to the reconciler."""
+        order = []
+        db = Mock()
+        db.has_delete_tombstone.return_value = True
+        db.commit_delete.side_effect = lambda *a, **k: order.append("commit")
+        mock_memory.db = db
+        mock_memory._entity_store = Mock()
+        mock_memory._entity_store.list.return_value = [[]]
+        mocker_target = mock_memory._remove_memory_from_entity_store
+        mock_memory._remove_memory_from_entity_store = lambda *a, **k: order.append("cleanup")
+
+        existing = Mock()
+        existing.payload = {"data": "x", "user_id": "u",
+                            "created_at": "2026-01-01T00:00:00+00:00"}
+        mock_memory.vector_store.get.return_value = existing
+        mock_memory._delete_memory("mem-1", existing)
+
+        assert order == ["cleanup", "commit"], order
+        assert mocker_target is not None  # keep the original bound method referenced
+
+    def test_cleanup_no_longer_skipped_when_store_was_never_touched(self, mock_memory, monkeypatch):
+        """The old guard was `if self._entity_store is None: return`. A process
+        that only deletes never initializes the store, so every link it should
+        have removed survived — that is where the production orphan rows came
+        from."""
+        monkeypatch.delenv("MEM0_ENTITY_CLEANUP", raising=False)
+        mock_memory._entity_store = None
+        lazily_created = Mock()
+        lazily_created.list.return_value = [[]]
+        # monkeypatch (not a bare class assignment + del): deleting the attribute
+        # would strip the real property off Memory for every later test.
+        monkeypatch.setattr(Memory, "entity_store",
+                            property(lambda self: lazily_created), raising=True)
+        mock_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+        lazily_created.list.assert_called_once()
+
+    def test_lazy_escape_hatch_restores_old_behaviour(self, mock_memory, monkeypatch):
+        monkeypatch.setenv("MEM0_ENTITY_CLEANUP", "lazy")
+        store = Mock()
+        mock_memory._entity_store = store
+        mock_memory._remove_memory_from_entity_store("mem-1", {"user_id": "u"})
+        store.list.assert_not_called()
+
+    def test_scan_cap_is_loud_when_hit(self, caplog, monkeypatch):
+        """A silently truncated scan turns cleanup into a partial no-op."""
+        import mem0.memory.main as main_mod
+
+        monkeypatch.setattr(main_mod, "ENTITY_SCAN_TOP_K", 3)
+        store = Mock()
+        rows = [Mock(id=f"e{i}", payload={"linked_memory_ids": []}) for i in range(3)]
+        store.list.return_value = [rows]
+        with caplog.at_level(logging.WARNING):
+            main_mod._scan_entity_rows(store, {"user_id": "u"})
+        assert any("cap" in r.message and "INCOMPLETE" in r.message for r in caplog.records)
+
+    def test_scan_cap_silent_when_not_hit(self, caplog, monkeypatch):
+        import mem0.memory.main as main_mod
+
+        monkeypatch.setattr(main_mod, "ENTITY_SCAN_TOP_K", 10)
+        store = Mock()
+        store.list.return_value = [[Mock(id="e0", payload={})]]
+        with caplog.at_level(logging.WARNING):
+            main_mod._scan_entity_rows(store, {"user_id": "u"})
+        assert not [r for r in caplog.records if "INCOMPLETE" in r.message]
+
+    def test_reconcile_cleans_entities_but_spares_a_reused_id(self, mock_memory):
+        """ABA: if the id was reused by a DIFFERENT memory, the vector is spared —
+        and the entity links must be spared too, or we would unlink the new
+        memory that took the id."""
+        import mem0.memory.main as main_mod
+
+        calls = []
+        db = Mock()
+        db.list_pending_deletes.return_value = [
+            {"memory_id": "mem-1", "op_id": "op-1",
+             "scope": '{"user_id": "u"}',
+             "before_image": '{"created_at": "2026-01-01T00:00:00+00:00"}'},
+        ]
+        db.has_delete_tombstone.return_value = True
+        mock_memory.db = db
+        reused = Mock()
+        reused.payload = {"created_at": "2026-06-06T00:00:00+00:00"}  # different -> reused
+        mock_memory.vector_store.get.return_value = reused
+
+        orig = main_mod.unlink_memory_from_entity_rows
+        main_mod.unlink_memory_from_entity_rows = lambda *a, **k: calls.append(a)
+        try:
+            mock_memory.reconcile_pending_deletes()
+        finally:
+            main_mod.unlink_memory_from_entity_rows = orig
+
+        mock_memory.vector_store.delete.assert_not_called()
+        assert calls == [], "a reused id must not have its entity links stripped"
