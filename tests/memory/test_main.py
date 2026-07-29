@@ -1207,7 +1207,12 @@ class TestEntityCleanupDurability:
         mock_memory._entity_store = Mock()
         mock_memory._entity_store.list.return_value = [[]]
         mocker_target = mock_memory._remove_memory_from_entity_store
-        mock_memory._remove_memory_from_entity_store = lambda *a, **k: order.append("cleanup")
+
+        def _cleanup(*a, **k):
+            order.append("cleanup")
+            return True  # the contract: True == cleanup is known complete
+
+        mock_memory._remove_memory_from_entity_store = _cleanup
 
         existing = Mock()
         existing.payload = {"data": "x", "user_id": "u",
@@ -1407,3 +1412,132 @@ class TestAsyncDeleteAllPagination:
 
         assert remaining == []
         assert len(clears) == 1, f"bulk clear rodou {len(clears)}x"
+
+
+class TestCleanupFailureIsDurable:
+    """A swallowed cleanup failure must not be committed away.
+
+    Moving cleanup before the commit only closed the CRASH window. The helper
+    swallows its own errors, so committing regardless turned a transient
+    failure into a permanent dangling link — reconciliation had nothing left
+    to retry.
+    """
+
+    @pytest.fixture
+    def mock_memory(self, mocker):
+        _setup_mocks(mocker)
+        m = Memory()
+        m.db = Mock()
+        m.db.has_delete_tombstone.return_value = True
+        return m
+
+    def _existing(self):
+        e = Mock()
+        e.payload = {"data": "x", "user_id": "u", "created_at": "2026-01-01T00:00:00+00:00"}
+        return e
+
+    def test_intent_stays_pending_when_cleanup_fails(self, mock_memory):
+        store = Mock()
+        store.list.return_value = [[Mock(id="ent-1", payload={
+            "data": "alice", "linked_memory_ids": ["mem-1"]})]]
+        store.delete.side_effect = RuntimeError("entity store down")
+        mock_memory._entity_store = store
+
+        mock_memory._delete_memory("mem-1", self._existing())
+
+        mock_memory.db.commit_delete.assert_not_called()
+
+    def test_intent_commits_when_cleanup_succeeds(self, mock_memory):
+        store = Mock()
+        store.list.return_value = [[]]
+        mock_memory._entity_store = store
+
+        mock_memory._delete_memory("mem-1", self._existing())
+
+        mock_memory.db.commit_delete.assert_called_once()
+
+    def test_truncated_scan_counts_as_failure(self, mock_memory, monkeypatch):
+        """A capped scan cleaned only part of the scope — treating that as
+        success is what makes the residue invisible."""
+        import mem0.memory.main as main_mod
+
+        monkeypatch.setattr(main_mod, "ENTITY_SCAN_TOP_K", 2)
+        store = Mock()
+        store.list.return_value = [[Mock(id=f"e{i}", payload={"linked_memory_ids": []})
+                                   for i in range(2)]]
+        mock_memory._entity_store = store
+
+        mock_memory._delete_memory("mem-1", self._existing())
+
+        mock_memory.db.commit_delete.assert_not_called()
+
+    def test_helper_reports_success_and_failure(self):
+        import mem0.memory.main as main_mod
+
+        good = Mock()
+        good.list.return_value = [[]]
+        assert main_mod.unlink_memory_from_entity_rows(good, "m", {"user_id": "u"}) is True
+
+        bad = Mock()
+        bad.list.side_effect = RuntimeError("boom")
+        assert main_mod.unlink_memory_from_entity_rows(bad, "m", {"user_id": "u"}) is False
+
+
+class TestAsyncDeleteAllPartialFailureKeepsEntities:
+    @pytest.fixture
+    def mock_async_memory(self, mocker):
+        _setup_mocks(mocker)
+        return AsyncMemory()
+
+    @pytest.mark.asyncio
+    async def test_bulk_clear_skipped_when_some_deletes_failed(self, mock_async_memory):
+        """Bulk clear wipes EVERY entity row in the scope. With a partial
+        failure the surviving memories would silently lose their entity rows,
+        so fall back to per-memory unlinking for the ones that did delete."""
+        remaining = ["mem-1", "mem-2"]
+
+        def _list(filters=None, top_k=100):
+            return ([Mock(id=i) for i in remaining],)
+
+        async def _delete_memory(mid, existing=None, **kw):
+            if mid == "mem-2":
+                raise RuntimeError("nope")
+            remaining.remove(mid)
+            return mid
+
+        mock_async_memory.vector_store.list = _list
+        mock_async_memory._delete_memory = _delete_memory
+        bulk, per = [], []
+        async def _bulk(f): bulk.append(f)
+        async def _per(mid, f): per.append(mid)
+        mock_async_memory._bulk_clear_entity_store = _bulk
+        mock_async_memory._remove_memory_from_entity_store = _per
+
+        await mock_async_memory.delete_all(user_id="u")
+
+        assert bulk == [], "bulk clear would have wiped mem-2's entity rows"
+        assert per == ["mem-1"], per
+
+    @pytest.mark.asyncio
+    async def test_bulk_clear_used_when_everything_deleted(self, mock_async_memory):
+        remaining = ["mem-1", "mem-2"]
+
+        def _list(filters=None, top_k=100):
+            return ([Mock(id=i) for i in remaining],)
+
+        async def _delete_memory(mid, existing=None, **kw):
+            remaining.remove(mid)
+            return mid
+
+        mock_async_memory.vector_store.list = _list
+        mock_async_memory._delete_memory = _delete_memory
+        bulk, per = [], []
+        async def _bulk(f): bulk.append(f)
+        async def _per(mid, f): per.append(mid)
+        mock_async_memory._bulk_clear_entity_store = _bulk
+        mock_async_memory._remove_memory_from_entity_store = _per
+
+        await mock_async_memory.delete_all(user_id="u")
+
+        assert len(bulk) == 1
+        assert per == []

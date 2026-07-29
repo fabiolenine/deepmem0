@@ -514,19 +514,28 @@ def _entity_cleanup_enabled() -> bool:
 
 
 def _scan_entity_rows(store, search_filters):
-    """All entity rows in scope, with an explicit truncation alarm."""
+    """(rows, truncated) for the scope. Truncation is RETURNED, not just logged:
+    a silently truncated scan turns cleanup into a partial no-op, and the caller
+    has to know that before it commits a delete intent."""
     listed = store.list(filters=search_filters, top_k=ENTITY_SCAN_TOP_K)
     rows = listed[0] if isinstance(listed, (list, tuple)) and listed and isinstance(listed[0], list) else listed
     rows = rows or []
-    if len(rows) >= ENTITY_SCAN_TOP_K:
+    truncated = len(rows) >= ENTITY_SCAN_TOP_K
+    if truncated:
         logger.warning(
             "Entity scan hit the %d-row cap for scope %s — cleanup is INCOMPLETE. "
             "Raise MEM0_ENTITY_SCAN_TOP_K.", ENTITY_SCAN_TOP_K, search_filters)
-    return rows
+    return rows, truncated
 
 
-def unlink_memory_from_entity_rows(store, memory_id, filters):
+def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
     """Remove `memory_id` from every entity row in scope. Synchronous.
+
+    Returns True when the cleanup is known to be COMPLETE, False when anything
+    was swallowed (scan failure, a row that would not update, a truncated scan).
+    The caller needs that answer: committing the delete intent after a failed
+    cleanup is what turns a transient error into a permanent dangling link,
+    because reconciliation then has nothing left to retry.
 
     Shared by the sync delete path and by BOTH reconcilers — the async
     reconciler runs at construction time, where there is no event loop to await
@@ -535,8 +544,12 @@ def unlink_memory_from_entity_rows(store, memory_id, filters):
     """
     search_filters = {k: v for k, v in (filters or {}).items()
                       if k in ("user_id", "agent_id", "run_id") and v}
+    ok = True
     try:
-        for row in _scan_entity_rows(store, search_filters):
+        rows, truncated = _scan_entity_rows(store, search_filters)
+        if truncated:
+            ok = False
+        for row in rows:
             try:
                 payload = getattr(row, "payload", None) or {}
                 # Normalizing (instead of `isinstance(...) -> continue`) is what
@@ -550,6 +563,7 @@ def unlink_memory_from_entity_rows(store, memory_id, filters):
                     try:
                         store.delete(vector_id=row.id)
                     except Exception as e:
+                        ok = False
                         logger.debug(f"Entity delete failed for id={row.id}: {e}")
                 else:
                     # Payload-only. Unlinking does not change the entity TEXT, so
@@ -559,11 +573,15 @@ def unlink_memory_from_entity_rows(store, memory_id, filters):
                         store.update(vector_id=row.id, vector=None,
                                      payload={**payload, "linked_memory_ids": remaining})
                     except Exception as e:
+                        ok = False
                         logger.debug(f"Entity update failed for id={row.id}: {e}")
             except Exception as e:
+                ok = False
                 logger.debug(f"Entity cleanup error: {e}")
     except Exception as e:
+        ok = False
         logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
+    return ok
 
 
 def _dynamics_config(config) -> Optional[Any]:
@@ -1638,8 +1656,8 @@ class Memory(MemoryBase):
         entity cleanup.
         """
         if not _entity_cleanup_enabled():
-            return
-        unlink_memory_from_entity_rows(self.entity_store, memory_id, filters)
+            return True
+        return unlink_memory_from_entity_rows(self.entity_store, memory_id, filters)
 
     def _link_entities_for_memory(self, memory_id, text, filters):
         """Extract entities from `text` and link them to `memory_id` in the
@@ -3572,14 +3590,20 @@ class Memory(MemoryBase):
                 role=existing_memory.payload.get("role"),
                 is_deleted=1,
             )
-        # Entity-store cleanup BEFORE committing the intent. Ordering matters:
-        # with commit-then-cleanup, a crash in between left no pending intent to
-        # retry, so the dangling entity links became permanent and invisible.
+        # Entity-store cleanup BEFORE committing the intent, and the commit is
+        # CONDITIONAL on it. Ordering alone was not enough: the helper swallows
+        # its errors, so commit-anyway turned a transient failure into a
+        # permanent dangling link — reconciliation had nothing left to retry.
         # Cleanup is idempotent, so replaying it on reconcile is safe.
-        self._remove_memory_from_entity_store(memory_id, session_filters)
+        cleaned = self._remove_memory_from_entity_store(memory_id, session_filters)
 
         if self.db is not None:
-            self.db.commit_delete(op_id)
+            if cleaned:
+                self.db.commit_delete(op_id)
+            else:
+                logger.warning(
+                    "Delete of %s: entity cleanup incomplete — leaving the intent "
+                    "PENDING so reconciliation retries it.", memory_id)
 
         return memory_id
 
@@ -3615,6 +3639,7 @@ class Memory(MemoryBase):
                         before = {}
                 existing = self.vector_store.get(vector_id=mid)
                 spared = False
+                cleaned = True   # a SPARED id has nothing to clean
                 if existing is not None:
                     # ABA guard: only delete if the CURRENT vector is the SAME memory the
                     # intent targeted (created_at identity). A REUSED id (import/restore/manual)
@@ -3635,7 +3660,7 @@ class Memory(MemoryBase):
                         scope = {}
                     if not isinstance(scope, dict):
                         scope = {}
-                    self._remove_memory_from_entity_store(mid, scope)
+                    cleaned = self._remove_memory_from_entity_store(mid, scope)
                 if not self.db.has_delete_tombstone(mid):
                     # faithful tombstone from the before-image (survives a crash that hit
                     # before the tombstone was written)
@@ -3646,8 +3671,15 @@ class Memory(MemoryBase):
                         actor_id=before.get("actor_id"), role=before.get("role"),
                         is_deleted=1,
                     )
-                self.db.commit_delete(op)
-                reconciled += 1
+                if cleaned:
+                    self.db.commit_delete(op)
+                    reconciled += 1
+                else:
+                    # Intent stays PENDING on purpose: an incomplete entity
+                    # cleanup that we commit anyway is a dangling link nobody
+                    # will ever come back for.
+                    logger.warning(
+                        "Reconcile of %s: entity cleanup incomplete — intent stays PENDING.", mid)
             except Exception as e:
                 logger.warning(f"Reconcile of pending delete {op} ({mid}) failed: {e}")
         if reconciled:
@@ -3849,7 +3881,8 @@ class AsyncMemory(MemoryBase):
             return
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         try:
-            rows = await asyncio.to_thread(_scan_entity_rows, self.entity_store, search_filters)
+            rows, _truncated = await asyncio.to_thread(
+                _scan_entity_rows, self.entity_store, search_filters)
             for row in rows:
                 try:
                     await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
@@ -3867,8 +3900,8 @@ class AsyncMemory(MemoryBase):
         per-call awaits.
         """
         if not _entity_cleanup_enabled():
-            return
-        await asyncio.to_thread(
+            return True
+        return await asyncio.to_thread(
             unlink_memory_from_entity_rows, self.entity_store, memory_id, filters)
 
     async def _link_entities_for_memory(self, memory_id, text, filters):
@@ -5374,6 +5407,7 @@ class AsyncMemory(MemoryBase):
         deleted = 0
         errors = []
         attempted = set()
+        succeeded = []
         for _ in range(_DELETE_ALL_MAX_PAGES):
             page = (await asyncio.to_thread(
                 self.vector_store.list, filters=filters, top_k=_DELETE_ALL_PAGE_SIZE))[0]
@@ -5388,15 +5422,29 @@ class AsyncMemory(MemoryBase):
             page_errors = [r for r in results if isinstance(r, BaseException)]
             errors.extend(page_errors)
             deleted += len(results) - len(page_errors)
+            succeeded.extend(m.id for m, r in zip(fresh, results)
+                             if not isinstance(r, BaseException))
         else:
             logger.warning("delete_all: page cap (%d) reached — scope may not be drained",
                            _DELETE_ALL_MAX_PAGES)
 
-        # ONE bulk clear, after every page — not per page. No
+        # Entity cleanup, ONCE, after every page — not per page. No
         # `_entity_store is not None` guard: a process that only ever deletes
         # never initializes the store, and skipping cleanup there is precisely
         # what leaves orphan rows behind. The helper decides.
-        await self._bulk_clear_entity_store(filters)
+        #
+        # Bulk clear wipes EVERY entity row in the scope, which is only sound
+        # when the scope really emptied. With a partial failure, memories are
+        # still alive and would silently lose their entity rows — so fall back
+        # to per-memory unlinking for the ones that did get deleted.
+        if errors:
+            logger.warning(
+                "delete_all: %d deletions failed — unlinking per memory instead of "
+                "bulk-clearing, so surviving memories keep their entity rows", len(errors))
+            for mid in succeeded:
+                await self._remove_memory_from_entity_store(mid, filters)
+        else:
+            await self._bulk_clear_entity_store(filters)
 
         if errors:
             logger.warning("Failed to delete %d memories", len(errors))
@@ -5740,14 +5788,19 @@ class AsyncMemory(MemoryBase):
                 role=existing_memory.payload.get("role"),
                 is_deleted=1,
             )
-        # Cleanup BEFORE the commit — see the sync twin: with commit-then-cleanup
-        # a crash in between leaves no pending intent to retry, so the dangling
-        # entity links become permanent. Cleanup is idempotent.
+        # Cleanup BEFORE the commit, and the commit is CONDITIONAL on it —
+        # see the sync twin. Cleanup is idempotent.
+        cleaned = True
         if not skip_entity_cleanup:
-            await self._remove_memory_from_entity_store(memory_id, session_filters)
+            cleaned = await self._remove_memory_from_entity_store(memory_id, session_filters)
 
         if self.db is not None:
-            await asyncio.to_thread(self.db.commit_delete, op_id)
+            if cleaned:
+                await asyncio.to_thread(self.db.commit_delete, op_id)
+            else:
+                logger.warning(
+                    "Delete of %s: entity cleanup incomplete — leaving the intent "
+                    "PENDING so reconciliation retries it.", memory_id)
 
         return memory_id
 
@@ -5776,6 +5829,7 @@ class AsyncMemory(MemoryBase):
                         before = {}
                 existing = self.vector_store.get(vector_id=mid)
                 spared = False
+                cleaned = True   # a SPARED id has nothing to clean
                 if existing is not None:
                     # ABA guard: only delete if the CURRENT vector is the SAME memory the
                     # intent targeted (created_at identity). A REUSED id (import/restore/manual)
@@ -5794,7 +5848,7 @@ class AsyncMemory(MemoryBase):
                         scope = json.loads(intent.get("scope") or "{}")
                     except Exception:
                         scope = {}
-                    unlink_memory_from_entity_rows(
+                    cleaned = unlink_memory_from_entity_rows(
                         self.entity_store, mid, scope if isinstance(scope, dict) else {})
                 if not self.db.has_delete_tombstone(mid):
                     # faithful tombstone from the before-image (survives a crash that hit
@@ -5806,8 +5860,15 @@ class AsyncMemory(MemoryBase):
                         actor_id=before.get("actor_id"), role=before.get("role"),
                         is_deleted=1,
                     )
-                self.db.commit_delete(op)
-                reconciled += 1
+                if cleaned:
+                    self.db.commit_delete(op)
+                    reconciled += 1
+                else:
+                    # Intent stays PENDING on purpose: an incomplete entity
+                    # cleanup that we commit anyway is a dangling link nobody
+                    # will ever come back for.
+                    logger.warning(
+                        "Reconcile of %s: entity cleanup incomplete — intent stays PENDING.", mid)
             except Exception as e:
                 logger.warning(f"Reconcile of pending delete {op} ({mid}) failed: {e}")
         if reconciled:
