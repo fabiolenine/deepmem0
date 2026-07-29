@@ -1303,7 +1303,14 @@ class TestAsyncDeleteAllEntityRace:
         mem_b = MagicMock()
         mem_b.id = "mem-b"
         mem_b.payload = {"data": "Alice works at Acme", "user_id": "alice"}
-        mock_vector_store.list.return_value = ([mem_a, mem_b],)
+        # Store que DRENA: delete_all só limpa entidades em bloco depois de
+        # VERIFICAR que o escopo esvaziou, e um mock estático nunca esvazia.
+        _left = [mem_a, mem_b]
+        mock_vector_store.list.side_effect = (
+            lambda filters=None, top_k=100: (_left[:top_k],))
+        mock_vector_store.delete.side_effect = (
+            lambda vector_id: _left.__setitem__(
+                slice(None), [m for m in _left if m.id != vector_id]))
         mock_vector_store.get.side_effect = lambda vector_id: {"mem-a": mem_a, "mem-b": mem_b}[vector_id]
         mock_vector_factory.return_value = mock_vector_store
 

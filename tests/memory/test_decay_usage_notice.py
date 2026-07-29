@@ -189,7 +189,24 @@ async def test_async_delete_failure_does_not_trigger_decay_usage_notice(monkeypa
 async def test_async_delete_all_decay_usage_runs_after_success(monkeypatch):
     memory = make_async_memory()
     memories = [SimpleNamespace(id="memory-1"), SimpleNamespace(id="memory-2")]
-    memory.vector_store.list.return_value = (memories, None)
+    # O store DRENA conforme deleta. Um mock que devolve sempre as mesmas linhas
+    # não distingue "escopo esvaziou" de "estamos em loop", e delete_all agora
+    # VERIFICA que o escopo esvaziou antes de limpar entidades em bloco (zero
+    # erros de delete não prova escopo vazio: cap de página ou escrita
+    # concorrente deixam memória viva).
+    _left = list(memories)
+
+    def _list(filters=None, top_k=100):
+        return (_left[:top_k], None)
+
+    memory.vector_store.list.side_effect = _list
+
+    async def _deleted(mid, *a, **k):
+        _left[:] = [m for m in _left if m.id != mid]
+        return mid
+
+    memory._delete_memory = AsyncMock(side_effect=_deleted)
+    memory._bulk_clear_entity_store = AsyncMock(return_value=True)
     decay_notice = AsyncMock()
     first_run_notice = AsyncMock()
     detect_decay = MagicMock(return_value=("delete_all", "bulk_delete", None, 2))

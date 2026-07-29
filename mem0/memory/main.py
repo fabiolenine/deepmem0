@@ -3878,18 +3878,24 @@ class AsyncMemory(MemoryBase):
         the same entity rows' linked_memory_ids lists.
         """
         if not _entity_cleanup_enabled():
-            return
+            return True
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        ok = True
         try:
-            rows, _truncated = await asyncio.to_thread(
+            rows, truncated = await asyncio.to_thread(
                 _scan_entity_rows, self.entity_store, search_filters)
+            if truncated:
+                ok = False
             for row in rows:
                 try:
                     await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
                 except Exception as e:
+                    ok = False
                     logger.debug(f"Bulk entity delete failed for id={row.id}: {e}")
         except Exception as e:
+            ok = False
             logger.warning(f"Bulk entity store cleanup failed: {e}")
+        return ok
 
     async def _remove_memory_from_entity_store(self, memory_id, filters):
         """Async variant of `Memory._remove_memory_from_entity_store`.
@@ -5424,9 +5430,21 @@ class AsyncMemory(MemoryBase):
             deleted += len(results) - len(page_errors)
             succeeded.extend(m.id for m, r in zip(fresh, results)
                              if not isinstance(r, BaseException))
+            hit_page_cap = False
         else:
+            hit_page_cap = True
             logger.warning("delete_all: page cap (%d) reached — scope may not be drained",
                            _DELETE_ALL_MAX_PAGES)
+
+        # "Zero delete errors" is NOT enough to justify wiping every entity row in
+        # the scope: the page cap, or a memory written concurrently, can leave live
+        # memories behind. Verify the scope is actually empty first.
+        try:
+            leftover = (await asyncio.to_thread(
+                self.vector_store.list, filters=filters, top_k=1))[0]
+        except Exception:
+            leftover = [None]          # unknown -> assume not empty (fail safe)
+        vector_scope_empty = not leftover and not hit_page_cap
 
         # Entity cleanup, ONCE, after every page — not per page. No
         # `_entity_store is not None` guard: a process that only ever deletes
@@ -5437,14 +5455,28 @@ class AsyncMemory(MemoryBase):
         # when the scope really emptied. With a partial failure, memories are
         # still alive and would silently lose their entity rows — so fall back
         # to per-memory unlinking for the ones that did get deleted.
-        if errors:
-            logger.warning(
-                "delete_all: %d deletions failed — unlinking per memory instead of "
-                "bulk-clearing, so surviving memories keep their entity rows", len(errors))
+        # `skip_entity_cleanup=True` above means each _delete_memory committed its
+        # intent WITHOUT cleaning — so the durability guarantee has to be
+        # re-established here, per memory, using the intent ids we deferred.
+        cleanup_ok = True
+        if errors or not vector_scope_empty:
+            if errors:
+                logger.warning(
+                    "delete_all: %d deletions failed — unlinking per memory instead of "
+                    "bulk-clearing, so surviving memories keep their entity rows", len(errors))
+            else:
+                logger.warning(
+                    "delete_all: scope not verified empty — unlinking per memory "
+                    "instead of bulk-clearing")
             for mid in succeeded:
-                await self._remove_memory_from_entity_store(mid, filters)
+                if not await self._remove_memory_from_entity_store(mid, filters):
+                    cleanup_ok = False
         else:
-            await self._bulk_clear_entity_store(filters)
+            cleanup_ok = await self._bulk_clear_entity_store(filters)
+        if not cleanup_ok:
+            logger.warning(
+                "delete_all: entity cleanup INCOMPLETE for %s — dangling links may "
+                "remain; re-run or repair with scripts/repair_entity_links.py", filters)
 
         if errors:
             logger.warning("Failed to delete %d memories", len(errors))
