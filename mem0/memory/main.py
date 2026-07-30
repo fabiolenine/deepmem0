@@ -5716,6 +5716,14 @@ class AsyncMemory(MemoryBase):
         errors = []
         attempted = set()
         succeeded = []
+        # ⚠️ Inicializado ANTES do laço. Estava atribuído só no FIM do corpo, e o
+        # `break` da primeira página vazia pulava a atribuição sem executar o
+        # `else` — então `delete_all` num escopo SEM memórias morria com
+        # `UnboundLocalError` no `vector_scope_empty` lá embaixo. Escopo vazio é
+        # justamente o caso comum (id errado, escopo já drenado), e este gêmeo
+        # async nunca foi exercitado porque nada em produção chama `delete_all`:
+        # o MCP usa `safe_bulk_delete`.
+        hit_page_cap = False
         for _ in range(_DELETE_ALL_MAX_PAGES):
             page = (await asyncio.to_thread(
                 self.vector_store.list, filters=filters, top_k=_DELETE_ALL_PAGE_SIZE))[0]
@@ -5732,7 +5740,6 @@ class AsyncMemory(MemoryBase):
             deleted += len(results) - len(page_errors)
             succeeded.extend(m.id for m, r in zip(fresh, results)
                              if not isinstance(r, BaseException))
-            hit_page_cap = False
         else:
             hit_page_cap = True
             logger.warning("delete_all: page cap (%d) reached — scope may not be drained",

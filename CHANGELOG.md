@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### `AsyncMemory.delete_all` crashed on an empty scope
+
+`hit_page_cap` was assigned only at the end of the pagination loop body, so the
+`break` taken on an empty first page skipped both the assignment and the `else`
+clause, and the read further down raised `UnboundLocalError`. An empty scope is
+the ordinary case — a wrong id, or a scope already drained.
+
+It survived unnoticed because nothing calls `delete_all` in the deployment where
+it was found; the bulk path is used instead. Code with no caller is not correct
+code, it is unmeasured code.
+
 ## v0.11.0
 
 Same change set as v0.10.1, released under a minor version because it adds

@@ -1,10 +1,11 @@
+import asyncio
 import os
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from mem0.configs.base import MemoryConfig
-from mem0.memory.main import Memory
+from mem0.memory.main import AsyncMemory, Memory
 
 
 @pytest.fixture(autouse=True)
@@ -183,6 +184,42 @@ def test_delete_all(memory_instance):
     assert memory_instance._delete_memory.call_count == 2
     # Ensure the collection is NOT dropped — only matched memories should be removed
     memory_instance.vector_store.reset.assert_not_called()
+
+    assert result["message"] == "Memories deleted successfully!"
+
+
+def _async_memory():
+    """An AsyncMemory with the factories stubbed, built like the sync fixture.
+
+    The async twin does not delegate to the sync one, so it has to be exercised
+    on its own.
+    """
+    with (
+        patch("mem0.utils.factory.EmbedderFactory"),
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory"),
+        patch("mem0.memory.telemetry.capture_event"),
+    ):
+        mock_vector_store.create.return_value = Mock()
+        memory = AsyncMemory(MemoryConfig(version="v1.1"))
+    memory.vector_store.list = Mock(return_value=([], None))
+    return memory
+
+
+def test_async_delete_all_survives_an_empty_scope():
+    """Regression: the async twin crashed when the FIRST page came back empty.
+
+    ``hit_page_cap`` was assigned only at the end of the loop body, so the
+    ``break`` on an empty first page skipped it and skipped the ``else`` too,
+    raising ``UnboundLocalError`` at ``vector_scope_empty``. An empty scope is
+    the ordinary case — a wrong id, or a scope already drained — and it went
+    unnoticed because nothing calls ``delete_all`` in the deployment where this
+    was found.
+    """
+    memory = _async_memory()
+    memory._bulk_clear_entity_store = AsyncMock(return_value=True)
+
+    result = asyncio.run(memory.delete_all(user_id="nobody"))
 
     assert result["message"] == "Memories deleted successfully!"
 
