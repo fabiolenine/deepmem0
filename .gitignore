@@ -4,3 +4,7 @@ eval/baselines/
 .env
 .venv/
 .DS_Store
+
+# Claude Code loop state (efêmero)
+.claude/loop/
+.claude/settings.local.json

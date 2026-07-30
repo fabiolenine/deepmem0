@@ -2,355 +2,355 @@
   "_note": "Assinaturas das falhas PRÉ-EXISTENTES do fork. Comparação por nome é insuficiente: um defeito novo pode substituir a causa antiga dentro do mesmo teste.",
   "failures": {
     "::tests.embeddings.test_aws_bedrock_embeddings": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.embeddings.aws_bedrock import AWSBedrockEmbedding | mem0/embeddings/aws_bedrock.py:LINE: in <module> | raise ImportError(\"The 'boto3' library is required. Please install it using 'pip install boto3'.\") | E ImportError: The 'boto3' library is required. Please install it using 'pip install boto3'.",
+      "type": "ImportError"
     },
     "::tests.embeddings.test_azure_openai_embeddings": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.embeddings.azure_openai import AzureOpenAIEmbedding | mem0/embeddings/azure_openai.py:LINE: in <module> | from azure.identity import DefaultAzureCredential, get_bearer_token_provider | E ModuleNotFoundError: No module named 'azure'",
+      "type": "ImportError"
     },
     "::tests.llms.test_aws_bedrock": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.llms.aws_bedrock import AWSBedrockLLM, extract_provider | mem0/llms/aws_bedrock.py:LINE: in <module> | raise ImportError(\"The 'boto3' library is required. Please install it using 'pip install boto3'.\") | E ImportError: The 'boto3' library is required. Please install it using 'pip install boto3'.",
+      "type": "ImportError"
     },
     "::tests.llms.test_azure_openai": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.llms.azure_openai import AzureOpenAILLM | mem0/llms/azure_openai.py:LINE: in <module> | from azure.identity import DefaultAzureCredential, get_bearer_token_provider | E ModuleNotFoundError: No module named 'azure'",
+      "type": "ImportError"
     },
     "::tests.llms.test_azure_openai_structured": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.llms.azure_openai_structured import SCOPE, AzureOpenAIStructuredLLM | mem0/llms/azure_openai_structured.py:LINE: in <module> | from azure.identity import DefaultAzureCredential, get_bearer_token_provider | E ModuleNotFoundError: No module named 'azure'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_azure_ai_search": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_azure_ai_search.py:LINE: in <module> | from azure.core.exceptions import HttpResponseError | E ModuleNotFoundError: No module named 'azure'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_azure_mysql": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.azure_mysql import AzureMySQL, OutputData | mem0/vector_stores/azure_mysql.py:LINE: in <module> | raise ImportError( | E ImportError: Azure MySQL vector store requires PyMySQL and DBUtils. Please install them using 'pip install pymysql dbutils'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_baidu": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_baidu.py:LINE: in <module> | from pymochow.exception import ServerError | E ModuleNotFoundError: No module named 'pymochow'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_cassandra": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.cassandra import CassandraDB, OutputData | mem0/vector_stores/cassandra.py:LINE: in <module> | raise ImportError( | E ImportError: Apache Cassandra vector store requires cassandra-driver. Please install it using 'pip install cassandra-driver'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_chroma": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: class ChromaDbConfig(BaseModel): | mem0/configs/vector_stores/chroma.py:LINE: in ChromaDbConfig | raise ImportError(\"The 'chromadb' library is required. Please install it using 'pip install chromadb'.\") | E ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_elasticsearch": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_elasticsearch.py:LINE: in <module> | raise ImportError(\"Elasticsearch requires extra dependencies. Install with `pip install elasticsearch`\") from None | E ImportError: Elasticsearch requires extra dependencies. Install with `pip install elasticsearch`",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_faiss": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_faiss.py:LINE: in <module> | import faiss | E ModuleNotFoundError: No module named 'faiss'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_langchain_vector_store": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_langchain_vector_store.py:LINE: in <module> | from langchain_community.vectorstores import VectorStore | E ModuleNotFoundError: No module named 'langchain_community'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_milvus": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.milvus import MilvusDB | mem0/vector_stores/milvus.py:LINE: in <module> | raise ImportError(\"The 'pymilvus' library is required. Please install it using 'pip install pymilvus'.\") | E ImportError: The 'pymilvus' library is required. Please install it using 'pip install pymilvus'.",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_mongodb": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.mongodb import MongoDB | mem0/vector_stores/mongodb.py:LINE: in <module> | raise ImportError(\"The 'pymongo' library is required. Please install it using 'pip install pymongo'.\") | E ImportError: The 'pymongo' library is required. Please install it using 'pip install pymongo'.",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_opensearch": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_opensearch.py:LINE: in <module> | raise ImportError(\"OpenSearch requires extra dependencies. Install with `pip install opensearch-py`\") from None | E ImportError: OpenSearch requires extra dependencies. Install with `pip install opensearch-py`",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_pgvector": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.pgvector import ( | mem0/vector_stores/pgvector.py:LINE: in <module> | raise ImportError( | E ImportError: Neither 'psycopg' nor 'psycopg2' library is available. Please install one of them using 'pip install psycopg[pool]' or 'pip install psycopg2'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_pinecone": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.pinecone import PineconeDB | mem0/vector_stores/pinecone.py:LINE: in <module> | raise ImportError( | E ImportError: Pinecone requires extra dependencies. Install with `pip install pinecone pinecone-text`",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_s3_vectors": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_s3_vectors.py:LINE: in <module> | from botocore.exceptions import ClientError | E ModuleNotFoundError: No module named 'botocore'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_supabase": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.supabase import Supabase | mem0/vector_stores/supabase.py:LINE: in <module> | raise ImportError(\"The 'vecs' library is required. Please install it using 'pip install vecs'.\") | E ImportError: The 'vecs' library is required. Please install it using 'pip install vecs'.",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_upstash_vector": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: from mem0.vector_stores.upstash_vector import UpstashVector | mem0/vector_stores/upstash_vector.py:LINE: in <module> | raise ImportError(\"The 'upstash_vector' library is required. Please install it using 'pip install upstash_vector'.\") | E ImportError: The 'upstash_vector' library is required. Please install it using 'pip install upstash_vector'.",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_valkey": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_valkey.py:LINE: in <module> | from valkey.exceptions import ResponseError | E ModuleNotFoundError: No module named 'valkey'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_vertex_ai_vector_search": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: mem0/vector_stores/vertex_ai_vector_search.py:LINE: in <module> | from langchain.schema import Document # type: ignore[no-redef] | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E ModuleNotFoundError: No module named 'langchain'",
+      "type": "ImportError"
     },
     "::tests.vector_stores.test_weaviate": {
-      "message": "collection failure",
-      "type": ""
+      "message": "collection failure :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | tests/vector_stores/test_weaviate.py:LINE: in <module> | import weaviate | E ModuleNotFoundError: No module named 'weaviate'",
+      "type": "ImportError"
     },
     "tests.memory.test_decay_usage_notice::test_async_delete_decay_usage_runs_after_success": {
-      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config'",
+      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'AsyncMemory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_decay_usage_notice::test_async_delete_failure_does_not_trigger_decay_usage_notice": {
-      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config'",
+      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'AsyncMemory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_decay_usage_notice::test_sync_delete_below_threshold_uses_first_run_notice": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_decay_usage_notice::test_sync_delete_decay_usage_runs_after_success": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_decay_usage_notice::test_sync_delete_failure_does_not_trigger_decay_usage_notice": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_async_notice_wrapper_uses_shared_helper": {
-      "message": "AssertionError: assert [] == [(<MagicMock ...c', 'search')] Right contains one more item: (<MagicMock id=N>, 'async', 'search') Use -v to get more diff",
+      "message": "AssertionError: assert [] == [(<MagicMock ...c', 'search')] Right contains one more item: (<MagicMock id=N>, 'async', 'search') Use -v to get more diff :: E Right contains one more item: (<MagicMock id=N>, 'async', 'search') | E Use -v to get more diff | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_bad_or_disabled_payload_is_silent_and_safe[payload0-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_bad_or_disabled_payload_is_silent_and_safe[payload1-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_bad_or_disabled_payload_is_silent_and_safe[payload2-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_bad_or_disabled_payload_is_silent_and_safe[payload3-missing_copy-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_bad_or_disabled_payload_is_silent_and_safe[payload4-payload_disabled-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_bad_or_disabled_payload_is_silent_and_safe[payload0-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_bad_or_disabled_payload_is_silent_and_safe[payload1-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_bad_or_disabled_payload_is_silent_and_safe[payload2-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_bad_or_disabled_payload_is_silent_and_safe[payload3-missing_copy-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_bad_or_disabled_payload_is_silent_and_safe[payload4-payload_disabled-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_decay_usage_cap_blocks_before_posthog_eval": {
-      "message": "AssertionError: assert '' == 'Decay usage ...y usage CTA\\n' - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA... ...Full output truncated (4 lines hidden), use '-vv' to show",
+      "message": "AssertionError: assert '' == 'Decay usage ...y usage CTA\\n' - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA - Decay usage CTA... ...Full output truncated (4 lines hidden), use '-vv' to show :: E | E ...Full output truncated (4 lines hidden), use '-vv' to show | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_decay_usage_cap_ignores_old_entries": {
-      "message": "AssertionError: assert '' == 'Decay usage CTA\\n' - Decay usage CTA",
+      "message": "AssertionError: assert '' == 'Decay usage CTA\\n' - Decay usage CTA :: E | E - Decay usage CTA | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_decay_usage_delete_detection_stops_after_cap": {
-      "message": "AssertionError: assert ('delete_count', 'repeated_deletes', 6, None) is None + where ('delete_count', 'repeated_deletes', 6, None) = <function detect_decay_usage_from_delete at 0xADDR>() + where <function detect_decay_usage_from_delete at 0xADDR> = notices.detect_decay_usage_from_delete",
+      "message": "AssertionError: assert ('delete_count', 'repeated_deletes', 6, None) is None + where ('delete_count', 'repeated_deletes', 6, None) = <function detect_decay_usage_from_delete at 0xADDR>() + where <function detect_decay_usage_from_delete at 0xADDR> = notices.detect_decay_usage_from_delete :: E + where ('delete_count', 'repeated_deletes', 6, None) = <function detect_decay_usage_from_delete at 0xADDR>",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_decay_usage_displayed_logs_and_captures_event": {
-      "message": "AssertionError: assert '' == 'Decay usage CTA\\n' - Decay usage CTA",
+      "message": "AssertionError: assert '' == 'Decay usage CTA\\n' - Decay usage CTA :: E | E - Decay usage CTA | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_decay_usage_holdout_is_silent_but_captures_event": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_displayed_notice_logs_once_and_captures_event": {
-      "message": "AssertionError: assert '' == 'Mem0 OSS notice\\n' - Mem0 OSS notice",
+      "message": "AssertionError: assert '' == 'Mem0 OSS notice\\n' - Mem0 OSS notice :: E | E - Mem0 OSS notice | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_holdout_notice_is_silent_but_captures_event": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_notice_priority_scale_beats_first_run": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_notice_priority_temporal_usage_beats_scale_and_first_run": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_posthog_failure_is_silent_and_consumes_first_run": {
-      "message": "KeyError: 'notice_state'",
+      "message": "KeyError: 'notice_state' :: ^^^^^^^^^^^^^^^^^^^^^^ | E KeyError: 'notice_state' | | tests/memory/test_notices.py:LINE: KeyError",
       "type": "KeyError"
     },
     "tests.memory.test_notices::test_public_search_succeeds_when_first_run_flag_eval_fails": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_bad_or_disabled_payload_is_silent_and_safe[payload0-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_bad_or_disabled_payload_is_silent_and_safe[payload1-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_bad_or_disabled_payload_is_silent_and_safe[payload2-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_bad_or_disabled_payload_is_silent_and_safe[payload3-missing_copy-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_bad_or_disabled_payload_is_silent_and_safe[payload4-payload_disabled-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_cap_blocks_before_posthog_eval": {
-      "message": "AssertionError: assert '' == 'Scale top 50...cale top 50\\n' - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50... ...Full output truncated (4 lines hidden), use '-vv' to show",
+      "message": "AssertionError: assert '' == 'Scale top 50...cale top 50\\n' - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50 - Scale top 50... ...Full output truncated (4 lines hidden), use '-vv' to show :: E | E ...Full output truncated (4 lines hidden), use '-vv' to show | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_scale_threshold_cap_ignores_old_entries": {
-      "message": "AssertionError: assert '' == 'Scale top 50\\n' - Scale top 50",
+      "message": "AssertionError: assert '' == 'Scale top 50\\n' - Scale top 50 :: E | E - Scale top 50 | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_scale_threshold_displayed_logs_and_captures_event": {
-      "message": "AssertionError: assert '' == 'Scale top 50\\n' - Scale top 50",
+      "message": "AssertionError: assert '' == 'Scale top 50\\n' - Scale top 50 :: E | E - Scale top 50 | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_scale_threshold_holdout_is_silent_but_captures_event": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_scale_threshold_memory_count_event_marks_threshold_evaluated": {
-      "message": "AssertionError: assert '' == 'Scale count 2000\\n' - Scale count 2000",
+      "message": "AssertionError: assert '' == 'Scale count 2000\\n' - Scale count 2000 :: E | E - Scale count 2000 | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_scale_threshold_props_do_not_include_raw_user_inputs": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_bad_or_disabled_payload_is_silent_and_safe[payload0-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_bad_or_disabled_payload_is_silent_and_safe[payload1-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_bad_or_disabled_payload_is_silent_and_safe[payload2-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_bad_or_disabled_payload_is_silent_and_safe[payload3-missing_copy-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_bad_or_disabled_payload_is_silent_and_safe[payload4-payload_disabled-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_cap_blocks_before_posthog_eval": {
-      "message": "AssertionError: assert '' == 'Temporal usa...l usage CTA\\n' - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA... ...Full output truncated (4 lines hidden), use '-vv' to show",
+      "message": "AssertionError: assert '' == 'Temporal usa...l usage CTA\\n' - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA - Temporal usage CTA... ...Full output truncated (4 lines hidden), use '-vv' to show :: E | E ...Full output truncated (4 lines hidden), use '-vv' to show | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_temporal_usage_cap_ignores_old_entries": {
-      "message": "AssertionError: assert '' == 'Temporal usage CTA\\n' - Temporal usage CTA",
+      "message": "AssertionError: assert '' == 'Temporal usage CTA\\n' - Temporal usage CTA :: E | E - Temporal usage CTA | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_temporal_usage_displayed_logs_and_captures_event": {
-      "message": "AssertionError: assert '' == 'Temporal usage CTA\\n' - Temporal usage CTA",
+      "message": "AssertionError: assert '' == 'Temporal usage CTA\\n' - Temporal usage CTA :: E | E - Temporal usage CTA | | tests/memory/test_notices.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_notices::test_temporal_usage_holdout_is_silent_but_captures_event": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_notices::test_temporal_usage_props_do_not_include_raw_user_inputs": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_notices.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_async_fast_search_uses_first_run_notice": {
-      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config'",
+      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'AsyncMemory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_async_slow_search_triggers_performance_notice_after_success": {
-      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config'",
+      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'AsyncMemory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_async_temporal_usage_takes_precedence_over_slow_search": {
-      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config'",
+      "message": "AttributeError: 'AsyncMemory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'AsyncMemory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_bad_or_disabled_payload_is_silent_and_safe[payload0-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_bad_or_disabled_payload_is_silent_and_safe[payload1-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_bad_or_disabled_payload_is_silent_and_safe[payload2-missing_notice_config-False]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_bad_or_disabled_payload_is_silent_and_safe[payload3-missing_copy-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_bad_or_disabled_payload_is_silent_and_safe[payload4-payload_disabled-True]": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_cap_blocks_before_posthog_eval": {
-      "message": "AssertionError: assert '' == 'Performance ...ormance CTA\\n' - Performance CTA - Performance CTA - Performance CTA - Performance CTA - Performance CTA - Performance CTA... ...Full output truncated (4 lines hidden), use '-vv' to show",
+      "message": "AssertionError: assert '' == 'Performance ...ormance CTA\\n' - Performance CTA - Performance CTA - Performance CTA - Performance CTA - Performance CTA - Performance CTA... ...Full output truncated (4 lines hidden), use '-vv' to show :: E | E ...Full output truncated (4 lines hidden), use '-vv' to show | | tests/memory/test_performance_slow_query_notice.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_displayed_logs_and_captures_event": {
-      "message": "AssertionError: assert '' == 'Performance CTA\\n' - Performance CTA",
+      "message": "AssertionError: assert '' == 'Performance CTA\\n' - Performance CTA :: E | E - Performance CTA | | tests/memory/test_performance_slow_query_notice.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_holdout_is_silent_but_captures_event": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_performance_slow_query_props_do_not_include_raw_user_inputs": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'args'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'args' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'args' | | tests/memory/test_performance_slow_query_notice.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_sync_fast_search_uses_first_run_notice": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_sync_scale_takes_precedence_over_slow_search": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_sync_slow_search_triggers_performance_notice_after_success": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.memory.test_performance_slow_query_notice::test_sync_temporal_usage_takes_precedence_over_slow_search": {
-      "message": "AttributeError: 'Memory' object has no attribute 'config'",
+      "message": "AttributeError: 'Memory' object has no attribute 'config' :: ^^^^^^^^^^^ | E AttributeError: 'Memory' object has no attribute 'config' | | mem0/memory/main.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.test_main::test_add": {
@@ -358,167 +358,169 @@
       "type": "AssertionError"
     },
     "tests.test_memory::test_add_infer_true_caches_embedding_on_llm_rewrite": {
-      "message": "AssertionError: assert 2 == 1 + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch",
+      "message": "AssertionError: assert 2 == 1 + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch :: E + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count | E + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch | | tests/test_memory.py:",
       "type": "AssertionError"
     },
     "tests.test_memory::test_async_delete_memory_history_has_timestamps": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'kwargs' | | tests/test_memory.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.test_memory::test_delete_memory_history_has_timestamps": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'kwargs' | | tests/test_memory.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.test_memory::test_delete_memory_missing_created_at": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'kwargs' | | tests/test_memory.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.test_memory::test_delete_memory_normalizes_non_utc_created_at": {
-      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs'",
+      "message": "AttributeError: 'NoneType' object has no attribute 'kwargs' :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E AttributeError: 'NoneType' object has no attribute 'kwargs' | | tests/test_memory.py:LINE: AttributeError",
       "type": "AttributeError"
     },
     "tests.test_memory::test_get_all_rejects_user_id_kwarg": {
-      "message": "Failed: DID NOT RAISE ValueError",
+      "message": "Failed: DID NOT RAISE ValueError :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E Failed: DID NOT RAISE ValueError | | tests/test_memory.py:LINE: Failed",
       "type": "ValueError"
     },
     "tests.test_memory::test_search_rejects_user_id_kwarg": {
-      "message": "Failed: DID NOT RAISE ValueError",
+      "message": "Failed: DID NOT RAISE ValueError :: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | E Failed: DID NOT RAISE ValueError | | tests/test_memory.py:LINE: Failed",
       "type": "ValueError"
     },
     "tests.test_memory::test_update_infer_true_caches_embedding_on_llm_rewrite": {
-      "message": "AssertionError: assert 2 == 1 + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch",
+      "message": "AssertionError: assert 2 == 1 + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch :: E + where 2 = <MagicMock name='create().embed_batch' id=N>.call_count | E + where <MagicMock name='create().embed_batch' id=N> = <MagicMock name='create()' id=N>.embed_batch | | tests/test_memory.py:",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_curl_piped_help_works": {
-      "message": "assert 'Migrate Python OSS hosted-Qdrant memories' in '' + where '' = CompletedProcess(...) Couldn't open file PATH\\n\").stdout",
-      "type": ""
+      "message": "assert 'Migrate Python OSS hosted-Qdrant memories' in '' + where '' = CompletedProcess(...) Couldn't open file PATH\\n\").stdout :: E assert 'Migrate Python OSS hosted-Qdrant memories' in '' | E + where '' = CompletedProcess(...) Couldn't open file PATH\\n\").stdout | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
+      "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_email_code_authenticates_without_persisting_credentials": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_email_code_failure_reports_failed_telemetry": {
-      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode :: E AssertionError: assert 127 == 1 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_existing_api_key_authenticates_and_stitches_ids": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_export_all_uses_no_qdrant_filter": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_export_invalid_qdrant_credentials_fail_clearly": {
-      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode :: E AssertionError: assert 127 == 1 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_export_qdrant_memories_to_json_without_vectors_or_api_key": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_export_requires_scope_or_all": {
-      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode :: E AssertionError: assert 127 == 1 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_full_flow_auth_export_and_imports_memories": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_import_platform_memories_from_export_json": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_import_reports_changed_existing_without_update_or_add": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_import_skips_existing_identical_memory": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_invalid_stored_key_falls_back_to_email_code": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_malformed_config_does_not_crash_and_authenticates": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_missing_python3_prints_clear_shell_error": {
-      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: assert 127 == 1 + where 127 = CompletedProcess(...).returncode :: E AssertionError: assert 127 == 1 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.test_oss_to_platform_migrate::test_weird_telemetry_shape_does_not_crash": {
-      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode",
+      "message": "AssertionError: bash: PATH: Arquivo ou diretório inexistente assert 127 == 0 + where 127 = CompletedProcess(...).returncode :: E assert 127 == 0 | E + where 127 = CompletedProcess(...).returncode | | tests/test_oss_to_platform_migrate.py:LINE: AssertionError",
       "type": "AssertionError"
     },
     "tests.vector_stores.test_e2e_threshold.TestChromaDBThreshold::test_threshold_direction_not_inverted": {
-      "message": "ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.",
+      "message": "ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. :: > raise ImportError(\"The 'chromadb' library is required. Please install it using 'pip install chromadb'.\") | E ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. | | mem0/vector_stores/chroma.py:LINE: ImportError",
       "type": "ImportError"
     },
     "tests.vector_stores.test_e2e_threshold.TestChromaDBThreshold::test_threshold_filtering": {
-      "message": "ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.",
+      "message": "ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. :: > raise ImportError(\"The 'chromadb' library is required. Please install it using 'pip install chromadb'.\") | E ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. | | mem0/vector_stores/chroma.py:LINE: ImportError",
       "type": "ImportError"
     },
     "tests.vector_stores.test_e2e_threshold.TestFAISSCosineThreshold::test_threshold_filtering": {
-      "message": "ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).",
+      "message": "ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). :: ) | E ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). | | mem0/vector_stores/fais",
       "type": "ImportError"
     },
     "tests.vector_stores.test_e2e_threshold.TestFAISSEuclideanThreshold::test_threshold_filtering": {
-      "message": "ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).",
+      "message": "ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). :: ) | E ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). | | mem0/vector_stores/fais",
       "type": "ImportError"
     },
     "tests.vector_stores.test_redis::test_get_returns_none_for_missing_id": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_list_with_filter_builds_query": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_list_with_none_filters_matches_all": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_search_with_empty_or_all_none_filters_does_not_crash": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_search_with_none_filters_does_not_crash": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_update_with_none_vector_preserves_embedding": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_redis::test_update_with_vector_includes_embedding": {
-      "message": "ModuleNotFoundError: No module named 'redis'",
+      "message": "ModuleNotFoundError: No module named 'redis' :: > import redis | E ModuleNotFoundError: No module named 'redis' | | mem0/vector_stores/redis.py:LINE: ModuleNotFoundError",
       "type": "ModuleNotFoundError"
     },
     "tests.vector_stores.test_score_normalization.TestChromaDB::test_score_formula": {
-      "message": "failed on setup with \"ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.\"",
+      "message": "failed on setup with \"ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.\" :: > raise ImportError(\"The 'chromadb' library is required. Please install it using 'pip install chromadb'.\") | E ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. | | mem0/vector_stores/chroma.py:LINE: ImportError",
       "type": "ImportError"
     },
     "tests.vector_stores.test_score_normalization.TestChromaDB::test_scores_are_similarity": {
-      "message": "failed on setup with \"ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.\"",
+      "message": "failed on setup with \"ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'.\" :: > raise ImportError(\"The 'chromadb' library is required. Please install it using 'pip install chromadb'.\") | E ImportError: The 'chromadb' library is required. Please install it using 'pip install chromadb'. | | mem0/vector_stores/chroma.py:LINE: ImportError",
       "type": "ImportError"
     },
     "tests.vector_stores.test_score_normalization.TestFAISSCosine::test_scores_are_descending": {
-      "message": "failed on setup with \"ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).\"",
+      "message": "failed on setup with \"ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).\" :: ) | E ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). | | ",
       "type": "ImportError"
     },
     "tests.vector_stores.test_score_normalization.TestFAISSEuclidean::test_scores_are_similarity": {
-      "message": "failed on setup with \"ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).\"",
+      "message": "failed on setup with \"ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version).\" :: ) | E ImportError: Could not import faiss python package. Please install it with `pip install faiss-gpu` (for CUDA supported GPU) or `pip install faiss-cpu` (depending on Python version). | | ",
       "type": "ImportError"
     }
   },
+  "files": [],
   "inventory": {
     "errors": 28,
     "failures": 100,
     "skipped": 29,
     "tests": 1356
   },
-  "revision": "ae3e5c4-dirty"
+  "revision": "ae3e5c4-dirty",
+  "signature_version": "6785b1329e75"
 }
