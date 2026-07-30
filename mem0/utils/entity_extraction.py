@@ -156,6 +156,8 @@ _LEXICONS = {
         # Sufixos de ênfase ficam FORA do inglês: a coluna EN do golden é
         # congelada e não há defeito medido lá.
         "upper_emphasis_suffixes": (),
+        "trailing_function_words": ("of", "the", "in", "and", "for", "at",
+                                    "to", "with", "on", "by", "from", "as"),
     },
     "pt": {
         "generic_heads": _GENERIC_HEADS | _PT_GENERIC_HEADS,
@@ -173,6 +175,15 @@ _LEXICONS = {
             "ÇÃO", "ÇÕES", "SÃO", "SÕES", "MENTE", "AGEM", "ANDO", "ENDO",
             "INDO", "AVAM", "IAM", "AREM", "EREM", "IREM", "ECEM", "ARAM",
         ),
+        # Cauda funcional. O manifesto do N2 pegou o efeito colateral de filtrar
+        # adjetivo não-específico dentro do compound: `Engenharia de Dados` vira
+        # `Engenharia de`, `Head / Diretor de`, `Head de` — span terminado em
+        # preposição, que o E-GOLD deixa passar (2 tokens, sem verbo, dentro dos
+        # caps). Entidade não termina em preposição em nenhuma das duas línguas.
+        "trailing_function_words": ("de", "da", "do", "das", "dos", "em", "no",
+                                    "na", "nos", "nas", "para", "por", "com",
+                                    "sem", "sob", "sobre", "entre", "e", "ou",
+                                    "a", "o", "as", "os", "ao", "à", "/"),
     },
 }
 
@@ -265,6 +276,24 @@ def _strip_generic_ending(toks: list, endings=None) -> list:
     endings = _GENERIC_ENDINGS if endings is None else endings
     last = toks[-1].lemma_.lower() if hasattr(toks[-1], "lemma_") else toks[-1].lower()
     return toks[:-1] if last in endings and len(toks) > 2 else toks
+
+
+
+def _apara_cauda_funcional(frase: str, lex) -> str:
+    """Remove palavras funcionais do FIM do span.
+
+    Achado pelo manifesto do N2, não pelo golden: filtrar adjetivo não-específico
+    dentro do compound deixava a preposição órfã (`Engenharia de`). O golden não
+    via — dois tokens, sem verbo, dentro dos caps —, o manifesto viu porque
+    compara span a span em texto real.
+    """
+    caudas = lex.get("trailing_function_words") or ()
+    if not caudas:
+        return frase
+    partes = frase.split()
+    while len(partes) > 1 and partes[-1].lower().strip(",;:") in caudas:
+        partes.pop()
+    return " ".join(partes)
 
 
 def _lemmatize_compound(toks: list) -> str:
@@ -468,7 +497,8 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
                         lex["generic_endings"],
                     )
                     if filtered:
-                        phrase = _lemmatize_compound(filtered)
+                        phrase = _apara_cauda_funcional(
+                            _lemmatize_compound(filtered), lex)
                         if len(phrase) > 3 and " " in phrase:
                             entities.append(("COMPOUND", phrase))
             elif len(content) > 1 and has_spec_adj:
@@ -479,7 +509,8 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
                     lex["generic_endings"],
                 )
                 if filtered:
-                    phrase = _lemmatize_compound(filtered)
+                    phrase = _apara_cauda_funcional(
+                        _lemmatize_compound(filtered), lex)
                     if len(phrase) > 3 and " " in phrase:
                         entities.append(("COMPOUND", phrase))
 
