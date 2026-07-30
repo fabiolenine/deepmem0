@@ -530,6 +530,29 @@ def _scan_entity_rows(store, search_filters):
     return rows, truncated
 
 
+#: Hook for observability of DELETE, called as
+#: ``(memory_id, phase, metrics)`` where `metrics` carries what only the core can
+#: see. Same shape as `reinforcement_observer`, and for the same reason: a
+#: companion outside the core should not have to patch internals to observe.
+#:
+#: Instrumentar isto de fora era impossível sem reimplementar a função: `rows` e
+#: `truncated` são LOCAIS de `_scan_entity_rows`, e envolver `Memory.delete`
+#: público não os expõe. `truncated` é o dado que mais importa — é o único sinal
+#: de que a limpeza pode ter deixado vínculo para trás.
+#: Must never raise; exceptions are swallowed.
+delete_observer = None
+
+
+def _notify_delete(memory_id, phase, **metrics) -> None:
+    observer = delete_observer
+    if observer is None:
+        return
+    try:
+        observer(memory_id, phase, metrics)
+    except Exception:  # observabilidade nunca derruba o caminho de delete
+        pass
+
+
 def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
     """Remove `memory_id` from every entity row in scope. Synchronous.
 
@@ -547,8 +570,12 @@ def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
     search_filters = {k: v for k, v in (filters or {}).items()
                       if k in ("user_id", "agent_id", "run_id") and v}
     ok = True
+    t0 = time.time()
+    n_linhas = n_scan = 0
+    truncated = False
     try:
         rows, truncated = _scan_entity_rows(store, search_filters)
+        n_scan = len(rows)
         if truncated:
             ok = False
         for row in rows:
@@ -564,6 +591,7 @@ def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
                 if not remaining:
                     try:
                         store.delete(vector_id=row.id)
+                        n_linhas += 1
                     except Exception as e:
                         ok = False
                         logger.debug(f"Entity delete failed for id={row.id}: {e}")
@@ -574,6 +602,7 @@ def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
                     try:
                         store.update(vector_id=row.id, vector=None,
                                      payload={**payload, "linked_memory_ids": remaining})
+                        n_linhas += 1
                     except Exception as e:
                         ok = False
                         logger.debug(f"Entity update failed for id={row.id}: {e}")
@@ -583,6 +612,11 @@ def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
     except Exception as e:
         ok = False
         logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
+    _notify_delete(memory_id, "entity_cleanup",
+                   elapsed_ms=round((time.time() - t0) * 1000, 2),
+                   rows_scanned=n_scan, rows_touched=n_linhas,
+                   truncated=bool(truncated), complete=ok,
+                   scope={k: v for k, v in search_filters.items()})
     return ok
 
 

@@ -187,3 +187,126 @@ class TestWriterUsesTheKeyFirst:
             mem.entity_store.search.return_value = []
             Memory._upsert_entity(mem, "Fase", "PROPER", "m1", {"user_id": "u"})
             mem.entity_store.insert.assert_called_once()
+
+
+class TestCleanupVerdict:
+    """`unlink_memory_from_entity_rows` devolve o veredito de COMPLETUDE.
+
+    O chamador precisa dessa resposta: comitar a intenção de delete depois de uma
+    limpeza que falhou é o que transforma erro transitório em vínculo pendente
+    PERMANENTE — a reconciliação não tem mais o que repetir.
+
+    O caso do scan truncado é o que nenhum smoke contra Qdrant real alcança sem
+    um corpus de 100k entidades, e é justamente onde o silêncio custaria caro.
+    """
+
+    def test_truncated_scan_returns_false(self):
+        from unittest.mock import MagicMock
+
+        from mem0.memory.main import ENTITY_SCAN_TOP_K, unlink_memory_from_entity_rows
+
+        store = MagicMock()
+        # o store devolve EXATAMENTE o teto -> pode haver mais linhas invisíveis
+        linhas = []
+        for i in range(ENTITY_SCAN_TOP_K):
+            r = MagicMock()
+            r.id, r.payload = f"e{i}", {"data": "x", "linked_memory_ids": ["m1"]}
+            linhas.append(r)
+        store.list.return_value = [linhas]
+
+        ok = unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"})
+        assert ok is False, ("scan no teto pode ter deixado linha de fora; dizer "
+                            "'completo' aí é mentir para o chamador")
+
+    def test_complete_scan_returns_true(self):
+        from unittest.mock import MagicMock
+
+        from mem0.memory.main import unlink_memory_from_entity_rows
+
+        store = MagicMock()
+        r = MagicMock()
+        r.id, r.payload = "e1", {"data": "x", "linked_memory_ids": ["m1", "m2"]}
+        store.list.return_value = [[r]]
+
+        assert unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"}) is True
+        payload = store.update.call_args.kwargs["payload"]
+        assert payload["linked_memory_ids"] == ["m2"]
+
+    def test_row_that_fails_to_update_returns_false(self):
+        from unittest.mock import MagicMock
+
+        from mem0.memory.main import unlink_memory_from_entity_rows
+
+        store = MagicMock()
+        r = MagicMock()
+        r.id, r.payload = "e1", {"data": "x", "linked_memory_ids": ["m1", "m2"]}
+        store.list.return_value = [[r]]
+        store.update.side_effect = RuntimeError("qdrant fora do ar")
+
+        assert unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"}) is False
+
+
+class TestDeleteObserver:
+    """`delete_observer` expõe o que SÓ o core enxerga.
+
+    Instrumentar isto de fora era impossível sem reimplementar a função: `rows` e
+    `truncated` são LOCAIS de `_scan_entity_rows`, e envolver `Memory.delete`
+    público não os expõe. `truncated` é o dado que mais importa — é o único sinal
+    de que a limpeza pode ter deixado vínculo para trás.
+    """
+
+    def _store(self, n_linhas=1):
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        linhas = []
+        for i in range(n_linhas):
+            r = MagicMock()
+            r.id, r.payload = f"e{i}", {"data": "x", "linked_memory_ids": ["m1", "m2"]}
+            linhas.append(r)
+        store.list.return_value = [linhas]
+        return store
+
+    def test_emits_metrics_the_caller_cannot_see(self, monkeypatch):
+        from mem0.memory import main as M
+
+        vistos = []
+        monkeypatch.setattr(M, "delete_observer",
+                            lambda mid, fase, met: vistos.append((mid, fase, met)))
+        M.unlink_memory_from_entity_rows(self._store(3), "m1", {"user_id": "u"})
+
+        assert len(vistos) == 1
+        mid, fase, met = vistos[0]
+        assert mid == "m1" and fase == "entity_cleanup"
+        assert met["rows_scanned"] == 3 and met["rows_touched"] == 3
+        assert met["truncated"] is False and met["complete"] is True
+        assert met["elapsed_ms"] >= 0 and met["scope"] == {"user_id": "u"}
+
+    def test_truncation_is_visible_to_the_observer(self, monkeypatch):
+        from mem0.memory import main as M
+
+        vistos = []
+        monkeypatch.setattr(M, "delete_observer",
+                            lambda mid, fase, met: vistos.append(met))
+        M.unlink_memory_from_entity_rows(
+            self._store(M.ENTITY_SCAN_TOP_K), "m1", {"user_id": "u"})
+
+        assert vistos[0]["truncated"] is True
+        assert vistos[0]["complete"] is False
+
+    def test_observer_that_raises_never_breaks_the_delete(self, monkeypatch):
+        """Observabilidade não pode derrubar o caminho de delete."""
+        from mem0.memory import main as M
+
+        def _explode(*a, **k):
+            raise RuntimeError("coletor fora do ar")
+
+        monkeypatch.setattr(M, "delete_observer", _explode)
+        assert M.unlink_memory_from_entity_rows(
+            self._store(1), "m1", {"user_id": "u"}) is True
+
+    def test_no_observer_is_a_noop(self, monkeypatch):
+        from mem0.memory import main as M
+
+        monkeypatch.setattr(M, "delete_observer", None)
+        assert M.unlink_memory_from_entity_rows(
+            self._store(1), "m1", {"user_id": "u"}) is True
