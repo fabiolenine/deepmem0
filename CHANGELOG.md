@@ -1,6 +1,12 @@
 # Changelog
 
-## v0.10.1
+## v0.11.0
+
+Same change set as v0.10.1, released under a minor version because it adds
+functionality — a per-language spaCy pipeline, `doc.ents` in the extractor,
+technical-identifier recognition and the `delete_observer` hook — not only fixes.
+v0.10.1 is superseded and kept for anyone who already fetched it.
+
 
 The entity store was losing links in silence. This release fixes the cause at
 every writer, gives the extractor a Portuguese pipeline, and adds the instruments
