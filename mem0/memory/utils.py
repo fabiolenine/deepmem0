@@ -372,6 +372,59 @@ def remove_spaces_from_entities(
         cleaned.append(item)
     return cleaned
 
+
+def normalize_scope_id(value, name: str):
+    """Normaliza um identificador de ESCOPO (``user_id``/``agent_id``/``run_id``).
+
+    É a regra única de identidade de escopo: quem escreve e quem lê têm que
+    concordar byte a byte, porque o filtro do vector store é casamento EXATO de
+    valor. `" alice"` e `"alice"` são escopos diferentes para o Qdrant, e a
+    diferença não aparece como erro — aparece como resultado vazio.
+
+    Contrato:
+      * ``None`` passa (a ausência de escopo é decidida pelo chamador);
+      * ``int`` vira ``str``; `42` e `"42"` passam a ser o MESMO escopo;
+      * ``bool``, ``float`` e qualquer outro tipo são RECUSADOS;
+      * espaço nas pontas é aparado; vazio e espaço interno são recusados.
+
+    POR QUE COAGIR ``int`` MAS RECUSAR O RESTO. O contrato de metadata deste
+    projeto diz "rejeitar em vez de coagir", e a razão é um incidente real: 17
+    memórias gravadas com ``importance='high'`` sumiram de um filtro de alta
+    importância, porque a coerção teria que INVENTAR um float. ``int`` é a
+    exceção delimitada — `42` → `"42"` não inventa nada, é bijetivo, e UNIFICA o
+    escopo em vez de dividi-lo. Já ``str(42.0)`` é `"42.0"`, que não casa com
+    `"42"`, e ``str(True)`` é `"True"`, um escopo fantasma: os dois seriam
+    divisões SILENCIOSAS de escopo, exatamente o defeito que a doutrina evita.
+
+    ⚠️ ``bool`` precisa de guarda própria porque ``isinstance(True, int)`` é
+    ``True`` em Python — sem ela, `True` viraria o escopo `"True"`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Invalid {name}: got bool, which is not an identifier. "
+            f"Provide a string (or an integer id)."
+        )
+    if isinstance(value, int):
+        value = str(value)
+    elif not isinstance(value, str):
+        raise ValueError(
+            f"Invalid {name}: expected str (or int), got "
+            f"{type(value).__name__}. Provide a valid identifier."
+        )
+    trimmed = value.strip()
+    if trimmed == "":
+        raise ValueError(
+            f"Invalid {name}: cannot be empty or whitespace-only. Provide a valid identifier."
+        )
+    if any(c.isspace() for c in trimmed):
+        raise ValueError(
+            f"Invalid {name}: cannot contain whitespace. Provide a valid identifier without spaces."
+        )
+    return trimmed
+
+
 # Namespace fixo para ids determinísticos de entidade. Não muda: mudá-lo faria a
 # mesma entidade nascer com id diferente e recriaria a duplicata que ele evita.
 ENTITY_ID_NAMESPACE = uuid.UUID("6f9d3a1e-0c4b-5d8a-9e7f-2b1c3d4e5f60")

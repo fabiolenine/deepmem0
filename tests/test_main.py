@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from mem0.configs.base import MemoryConfig
-from mem0.memory.main import AsyncMemory, Memory
+from mem0.memory.main import AsyncMemory, Memory, _validate_and_trim_entity_id
+from mem0.memory.utils import normalize_scope_id
 
 
 @pytest.fixture(autouse=True)
@@ -188,42 +189,6 @@ def test_delete_all(memory_instance):
     assert result["message"] == "Memories deleted successfully!"
 
 
-def _async_memory():
-    """An AsyncMemory with the factories stubbed, built like the sync fixture.
-
-    The async twin does not delegate to the sync one, so it has to be exercised
-    on its own.
-    """
-    with (
-        patch("mem0.utils.factory.EmbedderFactory"),
-        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
-        patch("mem0.utils.factory.LlmFactory"),
-        patch("mem0.memory.telemetry.capture_event"),
-    ):
-        mock_vector_store.create.return_value = Mock()
-        memory = AsyncMemory(MemoryConfig(version="v1.1"))
-    memory.vector_store.list = Mock(return_value=([], None))
-    return memory
-
-
-def test_async_delete_all_survives_an_empty_scope():
-    """Regression: the async twin crashed when the FIRST page came back empty.
-
-    ``hit_page_cap`` was assigned only at the end of the loop body, so the
-    ``break`` on an empty first page skipped it and skipped the ``else`` too,
-    raising ``UnboundLocalError`` at ``vector_scope_empty``. An empty scope is
-    the ordinary case — a wrong id, or a scope already drained — and it went
-    unnoticed because nothing calls ``delete_all`` in the deployment where this
-    was found.
-    """
-    memory = _async_memory()
-    memory._bulk_clear_entity_store = AsyncMock(return_value=True)
-
-    result = asyncio.run(memory.delete_all(user_id="nobody"))
-
-    assert result["message"] == "Memories deleted successfully!"
-
-
 def test_get_all(memory_instance):
     mock_memories = [Mock(id="1", payload={"data": "Memory 1", "user_id": "test_user"})]
     memory_instance.vector_store.list = Mock(return_value=(mock_memories, None))
@@ -322,6 +287,278 @@ class TestEntityIdValidation:
         """add should reject user_id with internal whitespace."""
         with pytest.raises(ValueError, match="Invalid user_id.*cannot contain whitespace"):
             memory_instance.add("test message", user_id="user 123")
+
+
+SCOPE_NAMES = ["user_id", "agent_id", "run_id"]
+
+
+def _async_memory():
+    """An AsyncMemory with the factories stubbed, built the same way as the
+    sync fixture. The async twin validates on its own — it does not delegate to
+    the sync one — so it has to be exercised for real."""
+    with (
+        patch("mem0.utils.factory.EmbedderFactory"),
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory"),
+        patch("mem0.memory.telemetry.capture_event"),
+    ):
+        mock_vector_store.create.return_value = Mock()
+        memory = AsyncMemory(MemoryConfig(version="v1.1"))
+    memory.vector_store.list = Mock(return_value=([], None))
+    return memory
+
+
+class TestScopeIdNormalization:
+    """``normalize_scope_id`` — the single scope-identity rule.
+
+    The store filters on EXACT value, so writer and reader have to agree byte
+    for byte. A scope that does not match yields an empty result, never an
+    error, which is why these cases assert the MESSAGE and not merely that
+    something was raised.
+    """
+
+    def test_import_under_test_is_the_tree_that_contains_this_test(self):
+        """Guard: prove WHICH mem0 is under test, subprocess included.
+
+        An editable install can point somewhere other than the checkout the
+        tests live in, so a run started from the wrong directory exercises other
+        code and reports the result as fact. Co-location of the two modules is
+        not enough — both would satisfy it while coming from the wrong tree.
+
+        The repository root is derived from THIS file, so the assertion is
+        portable: it holds in any checkout and pins `mem0` to the same tree as
+        the tests exercising it.
+        """
+        import mem0.memory.main as main_mod
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        expected = os.path.join(repo_root, "mem0", "memory", "main.py")
+
+        assert os.path.realpath(main_mod.__file__) == os.path.realpath(expected), (
+            f"mem0 under test is {main_mod.__file__}, but the tests live in "
+            f"{repo_root} — the run is measuring another checkout"
+        )
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (42, "42"),  # a database primary key is a legitimate id
+            (0, "0"),  # falsy, and still a valid scope
+            (-7, "-7"),
+            ("alice", "alice"),
+            ("  alice  ", "alice"),
+            ("\talice\n", "alice"),
+        ],
+    )
+    def test_accepts_and_normalizes(self, name, raw, expected):
+        assert normalize_scope_id(raw, name) == expected
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    def test_none_passes_through(self, name):
+        """Absence of scope is the caller's decision, not this function's."""
+        assert normalize_scope_id(None, name) is None
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    @pytest.mark.parametrize(
+        "raw,fragment",
+        [
+            (42.0, "expected str (or int), got float"),
+            (True, "got bool"),
+            (False, "got bool"),
+            ({}, "expected str (or int), got dict"),
+            ([], "expected str (or int), got list"),
+            (b"x", "expected str (or int), got bytes"),
+            ("   ", "cannot be empty or whitespace-only"),
+            ("", "cannot be empty or whitespace-only"),
+            ("a b", "cannot contain whitespace"),
+            ("a\tb", "cannot contain whitespace"),
+        ],
+    )
+    def test_rejects_with_actionable_message(self, name, raw, fragment):
+        with pytest.raises(ValueError) as excinfo:
+            normalize_scope_id(raw, name)
+        message = str(excinfo.value)
+        assert fragment in message
+        # The message has to name the offending parameter, or the caller cannot
+        # tell WHICH of three scope arguments was wrong.
+        assert name in message
+
+    def test_float_is_not_coerced_because_it_would_split_the_scope(self):
+        """Why float is rejected instead of coerced, stated as a test.
+
+        ``str(42.0)`` is ``"42.0"``, which never matches the scope ``"42"`` that
+        the integer 42 writes. Coercing both would produce two scopes that look
+        like one — silently.
+        """
+        assert normalize_scope_id(42, "user_id") == "42"
+        with pytest.raises(ValueError, match="got float"):
+            normalize_scope_id(42.0, "user_id")
+
+    def test_bool_is_rejected_despite_being_an_int_subclass(self):
+        """``isinstance(True, int)`` is True in Python.
+
+        Without an explicit guard, ``True`` would be coerced to the scope
+        ``"True"`` — a scope nobody ever wrote to.
+        """
+        assert isinstance(True, int)  # the trap this guard exists for
+        with pytest.raises(ValueError, match="got bool"):
+            normalize_scope_id(True, "user_id")
+
+    def test_validator_alias_delegates(self):
+        """The private validator has to stay a thin alias, not a second copy.
+
+        Two implementations of one identity rule is how writer and reader drift
+        apart.
+        """
+        for value in (42, "  alice ", None):
+            assert _validate_and_trim_entity_id(value, "user_id") == normalize_scope_id(
+                value, "user_id"
+            )
+
+
+class TestDeleteAllScopeValidation:
+    """``delete_all`` normalizes scope before building the filter.
+
+    A delete against the wrong scope is silent by construction: nothing matches,
+    nothing is removed, and the call returns success. These tests assert the
+    filter ACTUALLY handed to the store, not merely that no exception escaped.
+    """
+
+    @staticmethod
+    def _arm(memory_instance):
+        memory_instance.vector_store.list = Mock(return_value=([], None))
+        return memory_instance
+
+    def test_delete_all_coerces_integer_user_id_before_list(self, memory_instance):
+        """Upstream's own assertion, kept so a future rebase cannot lose it."""
+        self._arm(memory_instance).delete_all(user_id=42)
+
+        assert memory_instance.vector_store.list.call_args.kwargs["filters"] == {
+            "user_id": "42"
+        }
+
+    def test_delete_all_accepts_zero_as_a_scope(self, memory_instance):
+        """``0`` is falsy and valid.
+
+        Validation has to run BEFORE the truthiness test, or 0 is dropped and
+        the call dies with "At least one filter is required" — the wrong error
+        for the right defect.
+        """
+        self._arm(memory_instance).delete_all(user_id=0)
+
+        assert memory_instance.vector_store.list.call_args.kwargs["filters"] == {
+            "user_id": "0"
+        }
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    def test_delete_all_trims_padded_scope(self, memory_instance, name):
+        """The reachable defect: a padded id matches nothing and deletes nothing."""
+        self._arm(memory_instance).delete_all(**{name: " alice "})
+
+        assert memory_instance.vector_store.list.call_args.kwargs["filters"] == {
+            name: "alice"
+        }
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    @pytest.mark.parametrize(
+        "raw,fragment",
+        [
+            ("a b", "cannot contain whitespace"),
+            ("   ", "cannot be empty or whitespace-only"),
+            (42.0, "expected str (or int), got float"),
+            (True, "got bool"),
+        ],
+    )
+    def test_delete_all_rejects_invalid_scope(self, memory_instance, name, raw, fragment):
+        self._arm(memory_instance)
+
+        with pytest.raises(ValueError) as excinfo:
+            memory_instance.delete_all(**{name: raw})
+
+        assert fragment in str(excinfo.value)
+        assert name in str(excinfo.value)
+        # It has to fail BEFORE touching the store: a rejected scope that had
+        # already listed rows would mean the guard runs too late to protect
+        # anything.
+        memory_instance.vector_store.list.assert_not_called()
+
+    def test_delete_all_still_requires_at_least_one_scope(self, memory_instance):
+        """Normalizing must not swallow the no-scope error."""
+        self._arm(memory_instance)
+
+        with pytest.raises(ValueError, match="At least one filter is required"):
+            memory_instance.delete_all()
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    def test_async_delete_all_trims_padded_scope(self, name):
+        """The async twin validates on its own.
+
+        Parameterized over EVERY scope name on purpose: the twin normalizes
+        with three separate lines, so dropping or mistyping one of them is
+        invisible to a test that only ever passes ``user_id``.
+
+        Driven through ``asyncio.run`` rather than a marker so the assertion
+        does not depend on the plugin's mode configuration.
+        """
+        memory = _async_memory()
+        memory._bulk_clear_entity_store = AsyncMock(return_value=True)
+
+        asyncio.run(memory.delete_all(**{name: " alice "}))
+
+        assert memory.vector_store.list.call_args_list[0].kwargs["filters"] == {
+            name: "alice"
+        }
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    def test_async_delete_all_coerces_integer_scope(self, name):
+        memory = _async_memory()
+        memory._bulk_clear_entity_store = AsyncMock(return_value=True)
+
+        asyncio.run(memory.delete_all(**{name: 42}))
+
+        assert memory.vector_store.list.call_args_list[0].kwargs["filters"] == {
+            name: "42"
+        }
+
+    @pytest.mark.parametrize("name", SCOPE_NAMES)
+    @pytest.mark.parametrize(
+        "raw,fragment",
+        [
+            ("a b", "cannot contain whitespace"),
+            ("   ", "cannot be empty or whitespace-only"),
+            (3.5, "expected str (or int), got float"),
+            (True, "got bool"),
+        ],
+    )
+    def test_async_delete_all_rejects_invalid_scope(self, name, raw, fragment):
+        memory = _async_memory()
+
+        with pytest.raises(ValueError) as excinfo:
+            asyncio.run(memory.delete_all(**{name: raw}))
+
+        assert fragment in str(excinfo.value)
+        # Naming the parameter is what tells the caller WHICH of the three
+        # arguments was wrong — and what catches a copy-paste that validates
+        # agent_id under the label "user_id".
+        assert name in str(excinfo.value)
+        memory.vector_store.list.assert_not_called()
+
+    def test_async_delete_all_survives_an_empty_scope(self):
+        """Regression: the async twin crashed when the FIRST page was empty.
+
+        ``hit_page_cap`` was assigned only at the end of the loop body, so the
+        ``break`` on an empty first page skipped it and skipped the ``else``
+        too — ``UnboundLocalError`` further down. An empty scope is the common
+        case (wrong id, scope already drained), and it went unnoticed because
+        nothing in production calls ``delete_all``.
+        """
+        memory = _async_memory()
+        memory._bulk_clear_entity_store = AsyncMock(return_value=True)
+
+        result = asyncio.run(memory.delete_all(user_id="nobody"))
+
+        assert result["message"] == "Memories deleted successfully!"
 
 
 class TestSearchParamValidation:

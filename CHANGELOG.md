@@ -13,6 +13,46 @@ It survived unnoticed because nothing calls `delete_all` in the deployment where
 it was found; the bulk path is used instead. Code with no caller is not correct
 code, it is unmeasured code.
 
+### Scope identifiers are normalized at one place, and `delete_all` uses it
+
+A scope filter is an EXACT value match. `" alice"` and `"alice"` are different
+scopes to the vector store, and the difference never surfaces as an error — it
+surfaces as an empty result. On a delete that is worse than a crash: nothing
+matches, nothing is removed, and the call returns success.
+
+`normalize_scope_id(value, name)` is now public in `mem0.memory.utils`, next to
+the other identity primitives. `_validate_and_trim_entity_id` is a thin alias
+over it. Making it public is the point: every boundary that builds a scope filter
+needs the same rule, and depending on a leading-underscore name to get it means
+depending on an implementation detail.
+
+**Non-string ids no longer crash on `.strip()`**, but they are not blanket-coerced
+either:
+
+* `int` becomes `str` — a database primary key is a legitimate id, and `42` and
+  `"42"` become the SAME scope rather than two;
+* `bool`, `float`, and everything else are REJECTED with a message naming the
+  parameter and the type received.
+
+The asymmetry is deliberate. `str(42.0)` is `"42.0"`, which never matches the
+`"42"` that the integer writes, and `str(True)` is `"True"`, a scope nobody wrote
+to. Both would be silent scope splits. `bool` needs its own guard because
+`isinstance(True, int)` is `True` in Python.
+
+**`delete_all` validates again, in both twins.** The paginating rewrite of this
+method dropped the validation calls, so the sync and async `delete_all` were the
+only scope entry points accepting a raw argument. Validation runs before the
+filter is built and before the truthiness test — otherwise `user_id=0` is
+discarded and the call dies with "At least one filter is required", the wrong
+error for the right defect.
+
+Tests are parameterized over `user_id`, `agent_id` and `run_id` — the async twin
+normalizes with three separate lines, so a test that only ever passes `user_id`
+cannot see one of them being dropped. Success cases assert the filter actually
+handed to the store, rejection cases assert the exception type, the message and
+the parameter named in it, and each of the eleven guards was falsified by
+reverting its own hunk alone and requiring the expected failure.
+
 ## v0.11.0
 
 Same change set as v0.10.1, released under a minor version because it adds

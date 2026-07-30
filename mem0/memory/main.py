@@ -63,6 +63,7 @@ from mem0.memory.utils import (
     link_key,
     links_do_payload,
     normalize_entity_key,
+    normalize_scope_id,
     extract_json,
     normalize_linked_memory_ids,
     parse_messages,
@@ -256,12 +257,20 @@ def _apply_metadata_post_filters(
     return out
 
 
-def _validate_and_trim_entity_id(value: Optional[str], name: str) -> Optional[str]:
+def _validate_and_trim_entity_id(value: Optional[Any], name: str) -> Optional[str]:
     """
     Validates and normalizes an entity ID.
+    - Coerces integer ids to str (a database primary key is a legitimate id)
+    - Rejects bool, float and any other non-string type
     - Trims leading/trailing whitespace
     - Rejects empty or whitespace-only strings
     - Rejects strings containing internal whitespace
+
+    Thin alias over :func:`mem0.memory.utils.normalize_scope_id`, which is the
+    PUBLIC form of this rule. It is public because the same normalization has to
+    happen at every boundary that builds a scope filter — including callers
+    outside this package — and depending on a leading-underscore name to do it
+    would be depending on an implementation detail.
 
     Args:
         value: The entity ID value to validate
@@ -273,18 +282,7 @@ def _validate_and_trim_entity_id(value: Optional[str], name: str) -> Optional[st
     Raises:
         ValueError: If entity ID is invalid
     """
-    if value is None:
-        return None
-    trimmed = value.strip()
-    if trimmed == "":
-        raise ValueError(
-            f"Invalid {name}: cannot be empty or whitespace-only. Provide a valid identifier."
-        )
-    if any(c.isspace() for c in trimmed):
-        raise ValueError(
-            f"Invalid {name}: cannot contain whitespace. Provide a valid identifier without spaces."
-        )
-    return trimmed
+    return normalize_scope_id(value, name)
 
 
 def _validate_search_params(threshold: Optional[float] = None, top_k: Optional[int] = None) -> None:
@@ -3461,6 +3459,21 @@ class Memory(MemoryBase):
             agent_id (str, optional): ID of the agent to delete memories for. Defaults to None.
             run_id (str, optional): ID of the run to delete memories for. Defaults to None.
         """
+        # ⚠️ Normalizar ANTES de montar `filters`, e antes do teste de verdade.
+        # Duas razões, nessa ordem:
+        #   1. o filtro do store é casamento EXATO — `delete_all(user_id=" alice")`
+        #      não casava nada e a chamada voltava SEM ERRO, tendo apagado zero.
+        #      Escopo errado em delete é silencioso por natureza: não há resultado
+        #      vazio para ninguém estranhar;
+        #   2. `if user_id:` antes da normalização descarta `0`, e a chamada morre
+        #      em "At least one filter is required" — mensagem errada para o
+        #      defeito certo. Depois da coerção, `0` é `"0"`, que é verdadeiro.
+        # Este trecho é uma REGRESSÃO NOSSA: o upstream valida aqui, e a
+        # reescrita de paginação deste método deixou a validação para trás.
+        user_id = _validate_and_trim_entity_id(user_id, "user_id")
+        agent_id = _validate_and_trim_entity_id(agent_id, "agent_id")
+        run_id = _validate_and_trim_entity_id(run_id, "run_id")
+
         filters: Dict[str, Any] = {}
         if user_id:
             filters["user_id"] = user_id
@@ -5695,6 +5708,13 @@ class AsyncMemory(MemoryBase):
             agent_id (str, optional): ID of the agent to delete memories for. Defaults to None.
             run_id (str, optional): ID of the run to delete memories for. Defaults to None.
         """
+        # Mesma normalização do gêmeo sync — ver o comentário longo lá. O gêmeo
+        # async precisa dela por conta própria: não delega para o sync, e já
+        # houve defeito que existia só neste lado por essa razão.
+        user_id = _validate_and_trim_entity_id(user_id, "user_id")
+        agent_id = _validate_and_trim_entity_id(agent_id, "agent_id")
+        run_id = _validate_and_trim_entity_id(run_id, "run_id")
+
         filters = {}
         if user_id:
             filters["user_id"] = user_id
@@ -5722,7 +5742,7 @@ class AsyncMemory(MemoryBase):
         # `UnboundLocalError` no `vector_scope_empty` lá embaixo. Escopo vazio é
         # justamente o caso comum (id errado, escopo já drenado), e este gêmeo
         # async nunca foi exercitado porque nada em produção chama `delete_all`:
-        # o MCP usa `safe_bulk_delete`.
+        # o MCP usa `safe_bulk_delete`. Reproduzido em a473615 antes da correção.
         hit_page_cap = False
         for _ in range(_DELETE_ALL_MAX_PAGES):
             page = (await asyncio.to_thread(
