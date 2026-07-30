@@ -407,3 +407,59 @@ class TestLostUpdateRace:
         store.get.return_value = r
         assert self._mem(store)._reconcilia_vinculo("e1", "mA") is True
         store.update.assert_not_called()
+
+
+class TestChaveDeVinculoNaoRessuscita:
+    """Desvincular tem que apagar a CHAVE, não só o item da lista.
+
+    `set_payload` faz MERGE: gravar o payload sem a chave NÃO a remove. Como
+    `links_do_payload` une lista + chaves, o vínculo recém-deletado
+    RESSUSCITAVA — o mesmo defeito de vínculo pendente que este trabalho existe
+    para eliminar, reintroduzido pela própria correção de concorrência.
+    """
+
+    def _store(self, payload):
+        from unittest.mock import MagicMock
+
+        row = MagicMock()
+        row.id, row.payload = "e1", payload
+        store = MagicMock()
+        store.list.return_value = [[row]]
+        return store
+
+    def test_a_chave_do_vinculo_removido_e_apagada(self):
+        from mem0.memory.main import unlink_memory_from_entity_rows
+        from mem0.memory.utils import link_key
+
+        store = self._store({"data": "x", "linked_memory_ids": ["m1", "m2"],
+                             link_key("m1"): 1, link_key("m2"): 1})
+        assert unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"}) is True
+        store.delete_payload_keys.assert_called_once_with("e1", [link_key("m1")])
+
+    def test_o_payload_gravado_NAO_carrega_a_chave_de_volta(self):
+        """Apagar a chave e depois gravar o payload lido a traria de volta pelo
+        merge — a ordem é parte da correção, não detalhe."""
+        from mem0.memory.main import unlink_memory_from_entity_rows
+        from mem0.memory.utils import link_key
+
+        store = self._store({"data": "x", "linked_memory_ids": ["m1", "m2"],
+                             link_key("m1"): 1, link_key("m2"): 1})
+        unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"})
+        gravado = store.update.call_args.kwargs["payload"]
+        assert link_key("m1") not in gravado, gravado
+        assert gravado["linked_memory_ids"] == ["m2"]
+        assert gravado[link_key("m2")] == 1, "a chave dos OUTROS não pode sumir"
+
+    def test_store_sem_suporte_marca_limpeza_INCOMPLETA(self):
+        """Não poder apagar a chave significa que o vínculo pode voltar; dizer
+        'completo' aí seria mentir para quem decide comitar o delete."""
+        from unittest.mock import MagicMock
+
+        from mem0.memory.main import unlink_memory_from_entity_rows
+        from mem0.memory.utils import link_key
+
+        store = self._store({"data": "x", "linked_memory_ids": ["m1", "m2"],
+                             link_key("m1"): 1})
+        del store.delete_payload_keys           # store antigo, sem o método
+        store.mock_add_spec(["list", "update", "delete"])
+        assert unlink_memory_from_entity_rows(store, "m1", {"user_id": "u"}) is False

@@ -752,13 +752,35 @@ def unlink_memory_from_entity_rows(store, memory_id, filters) -> bool:
                     # Payload-only. Unlinking does not change the entity TEXT, so
                     # re-embedding was pure cost: it re-encoded BM25 and rewrote
                     # the vector, perturbing the entity HNSW on every delete.
+                    # ORDEM IMPORTA, e me custou duas tentativas: apagar a
+                    # chave ANTES do update não adianta, porque o update grava o
+                    # payload lido — que ainda a contém — e o MERGE do
+                    # `set_payload` a traz de volta.
+                    limpo = {k: v for k, v in payload.items()
+                             if k != link_key(memory_id)}
+                    limpo["linked_memory_ids"] = remaining
                     try:
-                        store.update(vector_id=row.id, vector=None,
-                                     payload={**payload, "linked_memory_ids": remaining})
+                        store.update(vector_id=row.id, vector=None, payload=limpo)
                         n_linhas += 1
                     except Exception as e:
                         ok = False
                         logger.debug(f"Entity update failed for id={row.id}: {e}")
+                    # `set_payload` faz MERGE: gravar sem a chave NÃO a apaga, e
+                    # `links_do_payload` (união de lista + chaves) RESSUSCITARIA
+                    # o vínculo recém-deletado — o mesmo defeito de vínculo
+                    # pendente que este trabalho existe para eliminar. Store sem
+                    # esse suporte torna a limpeza INCOMPLETA, e o veredito é o
+                    # que impede comitar o delete sobre limpeza que não houve.
+                    try:
+                        store.delete_payload_keys(row.id, [link_key(memory_id)])
+                    except AttributeError:
+                        ok = False
+                        logger.warning("store sem delete_payload_keys: %s fica e "
+                                       "o vínculo pode ressuscitar",
+                                       link_key(memory_id))
+                    except Exception as e:
+                        ok = False
+                        logger.debug(f"delete_payload_keys failed for {row.id}: {e}")
             except Exception as e:
                 ok = False
                 logger.debug(f"Entity cleanup error: {e}")

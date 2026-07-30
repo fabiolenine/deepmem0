@@ -576,6 +576,19 @@ class Qdrant(VectorStoreBase):
         """
         return self.client.get_collections()
 
+    def delete_payload_keys(self, vector_id, keys, wait: bool = True):
+        """Remove CHAVES do payload de um ponto.
+
+        ⚠️ NECESSÁRIO porque `set_payload` faz MERGE: reescrever o payload sem uma
+        chave NÃO a remove. Sem isto, desvincular uma memória tirava o id da lista
+        `linked_memory_ids` e deixava `lnk_<id>` para trás — e como a
+        reconstrução faz a UNIÃO das duas fontes, o vínculo deletado
+        RESSUSCITAVA. Vínculo pendente é exatamente o defeito que este trabalho
+        existe para eliminar.
+        """
+        self.client.delete_payload(collection_name=self.collection_name,
+                                   keys=list(keys), points=[vector_id], wait=wait)
+
     def delete_col(self):
         """Delete a collection."""
         self.client.delete_collection(collection_name=self.collection_name)
