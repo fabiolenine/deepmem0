@@ -310,3 +310,100 @@ class TestDeleteObserver:
         monkeypatch.setattr(M, "delete_observer", None)
         assert M.unlink_memory_from_entity_rows(
             self._store(1), "m1", {"user_id": "u"}) is True
+
+
+class TestLostUpdateRace:
+    """As DUAS ordens da corrida — a que a reconciliação resolve e a que não.
+
+    ⚠️ Estes testes existem porque eu afirmei que a reconciliação "fecha" a
+    corrida check-then-insert. Não fecha. Escrever o teste é que mostrou:
+    montei o cenário, ele não encenou perda nenhuma, e a razão é que a ordem
+    ruim acontece DEPOIS de o escritor A terminar — fora do alcance dele.
+    """
+
+    def _mem(self, store):
+        from unittest.mock import MagicMock
+
+        from mem0.memory.main import Memory
+
+        mem = MagicMock(spec=Memory)
+        mem.entity_store = store
+        mem._reconcilia_vinculo = Memory._reconcilia_vinculo.__get__(mem)
+        return mem
+
+    def test_ordem_que_a_reconciliacao_RESOLVE(self):
+        """A insere · B sobrescreve · A relê: A vê o valor de B e reanexa."""
+        from unittest.mock import MagicMock
+
+        estado = {"linked": ["mB"]}          # B já sobrescreveu antes da releitura
+
+        def _get(vector_id=None):
+            r = MagicMock()
+            r.payload = {"data": "x", "linked_memory_ids": list(estado["linked"])}
+            return r
+
+        def _update(vector_id=None, vector=None, payload=None):
+            estado["linked"] = list(payload["linked_memory_ids"])
+
+        store = MagicMock()
+        store.get.side_effect = _get
+        store.update.side_effect = _update
+
+        assert self._mem(store)._reconcilia_vinculo("e1", "mA") is True
+        assert set(estado["linked"]) == {"mA", "mB"}, estado
+
+    def test_ordem_que_NINGUEM_resolve_do_lado_do_cliente(self):
+        """A insere · A relê · A TERMINA · B sobrescreve.
+
+        Quando B escreve, A já saiu. Nenhum número de tentativas alcança uma
+        escrita posterior — e é por isso que o residual é DETECTADO (cobertura de
+        vínculo do check_corpus, e o próximo add da mesma entidade reanexa), não
+        prevenido. Fingir o contrário seria a mentira que este teste impede.
+        """
+        from unittest.mock import MagicMock
+
+        estado = {"linked": ["mA"]}
+        store = MagicMock()
+
+        def _get(vector_id=None):
+            r = MagicMock()
+            r.payload = {"data": "x", "linked_memory_ids": list(estado["linked"])}
+            return r
+
+        store.get.side_effect = _get
+        assert self._mem(store)._reconcilia_vinculo("e1", "mA") is True
+        store.update.assert_not_called()      # A viu o próprio valor: nada a fazer
+        estado["linked"] = ["mB"]             # B sobrescreve DEPOIS
+        assert "mA" not in estado["linked"], (
+            "o vínculo de A está perdido e nenhuma releitura de A o recupera")
+
+    def test_escrita_concorrente_sustentada_AVISA_em_vez_de_mentir(self, caplog):
+        import logging
+        from unittest.mock import MagicMock
+
+        store = MagicMock()
+
+        def _get(vector_id=None):
+            # payload FRESCO a cada leitura: o outro escritor sobrescreve sempre.
+            # Reaproveitar o mesmo dict fazia o loop convergir contra a própria
+            # escrita e o teste dizia "grudou" sem nada ter grudado.
+            r = MagicMock()
+            r.payload = {"data": "x", "linked_memory_ids": ["mB"]}
+            return r
+
+        store.get.side_effect = _get
+        with caplog.at_level(logging.WARNING):
+            ok = self._mem(store)._reconcilia_vinculo("e1", "mA", tentativas=3)
+        assert ok is False
+        assert any("NÃO grudou" in rec.message for rec in caplog.records), \
+            [rec.message for rec in caplog.records]
+
+    def test_vinculo_ja_presente_e_no_op(self):
+        from unittest.mock import MagicMock
+
+        store = MagicMock()
+        r = MagicMock()
+        r.payload = {"data": "x", "linked_memory_ids": ["mA"]}
+        store.get.return_value = r
+        assert self._mem(store)._reconcilia_vinculo("e1", "mA") is True
+        store.update.assert_not_called()

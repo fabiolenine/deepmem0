@@ -1181,7 +1181,12 @@ class TestEntityLinkNormalization:
     # ---- async twins ------------------------------------------------------
     @pytest.mark.asyncio
     async def test_async_upsert_entity_heals_a_corrupt_row(self, mock_async_memory):
+        # `list` vazio força o caminho da SONDA VETORIAL, que é onde a linha
+        # legada (sem `data_normalized`) é alcançada. Sem isto o duplo devolve um
+        # Mock truthy no lookup exato e a sonda nunca roda — o mesmo artefato que
+        # já tinha quebrado o gêmeo síncrono.
         store = Mock()
+        store.list.return_value = []
         store.search.return_value = [self._entity_match(
             {"data": "alice", "linked_memory_ids": self.CORRUPT})]
         mock_async_memory._entity_store = store

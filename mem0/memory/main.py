@@ -530,6 +530,117 @@ def _scan_entity_rows(store, search_filters):
     return rows, truncated
 
 
+# ============================================================
+# Helpers de IDENTIDADE de entidade — compartilhados pelos DOIS gêmeos
+# ============================================================
+# ⚠️ Nasceram como métodos só de `Memory`, e `_upsert_entity_async` (que vive em
+# `AsyncMemory`) passou a chamá-los: `AttributeError` a cada escrita, engolido
+# pelo `except` largo do upsert e transformado num warning. Ou seja, TODA escrita
+# de entidade do caminho assíncrono falharia em silêncio. Como função de módulo o
+# gêmeo não tem como divergir de novo.
+
+def entidade_por_chave(entity_store, chave, search_filters, checks_ref=None):
+    """Linha de entidade com esta chave normalizada NESTE escopo, ou None.
+
+    Identidade EXATA, e é a diferença que importa: a identidade era a
+    SIMILARIDADE do vetor (>= 0.95), que é probabilística. O corpus mostrou o
+    preço — `FASE`/`Fase`, `docker compose`/`Docker Compose`,
+    `Hilbert transform`/`Hilbert Transform` viraram linhas SEPARADAS, cada uma
+    com sua fatia de vínculos, e qual delas recebe o boost passou a depender
+    da grafia que o usuário digitou.
+    """
+    try:
+        achados = entity_store.list(
+            filters={**search_filters, "data_normalized": chave}, top_k=1)
+    except Exception as exc:      # store sem suporte ao filtro: cai na sonda
+        logger.debug("lookup por chave normalizada indisponível: %s", exc)
+        return None
+    # VALIDAR A FORMA, não só a verdade. `list()` de um store que devolva
+    # outra coisa — ou de um duplo de teste — é truthy, e aceitar truthy como
+    # acerto fazia o caminho exato "encontrar" um registro inexistente e
+    # pular a sonda vetorial. Três testes existentes quebraram exatamente
+    # nisso, o que é o instrumento funcionando: um store real que mude o tipo
+    # de retorno produziria a mesma falha silenciosa em produção.
+    if isinstance(achados, tuple):
+        achados = achados[0] if achados else []
+    if not isinstance(achados, list) or not achados:
+        return None
+    if isinstance(achados[0], list):
+        achados = achados[0]
+        if not achados:
+            return None
+    linha = achados[0]
+    pl = getattr(linha, "payload", None)
+    if getattr(linha, "id", None) is None or not isinstance(pl, dict):
+        return None
+    # Escopo e chave têm que CASAR de fato: um filtro ignorado pelo store
+    # devolveria a primeira linha qualquer, e ela seria fundida com esta.
+    if pl.get("data_normalized") != chave:
+        return None
+    for k, v in search_filters.items():
+        if pl.get(k) != v:
+            return None
+    return linha
+
+
+def reconcilia_vinculo(entity_store, entity_id, memory_id, tentativas: int = 4):
+    """Relê e reanexa o vínculo. ESTREITA a janela de lost-update; NÃO fecha.
+
+    ⚠️ AFIRMAÇÃO CORRIGIDA. Eu escrevi que isto "fecha" a corrida
+    check-then-insert. Não fecha, e a análise honesta é esta:
+
+      * ordem que ISTO RESOLVE — A insere · B sobrescreve · A relê: A vê o
+        valor de B, reanexa o próprio id, os dois sobrevivem;
+      * ordem que NINGUÉM resolve do lado do cliente — A insere · A relê ·
+        A termina · B sobrescreve: quando B escreve, A já foi embora. Nenhum
+        número de tentativas de A alcança uma escrita posterior a ela.
+
+    Qdrant faz MERGE de CHAVES no `set_payload`, mas o valor de uma chave de
+    LISTA é substituído: não existe união atômica para usar, e sem CAS não há
+    fecho client-side. O residual é DETECTADO, não prevenido — pela cobertura
+    de vínculo do `check_corpus` e porque o próximo add da mesma entidade
+    reanexa o id que faltava.
+
+    As tentativas existem para o caso em que a sobrescrita chega durante a
+    própria reconciliação; o teto fica declarado e o fracasso vira WARNING,
+    porque um vínculo perdido em silêncio foi a origem de todo este trabalho.
+    """
+    for tentativa in range(1, tentativas + 1):
+        try:
+            atual = entity_store.get(vector_id=entity_id)
+            # CÓPIA: mutar o dict que veio do store faz a leitura seguinte
+            # enxergar a própria escrita se o store reaproveitar o objeto —
+            # o loop passa a convergir contra si mesmo em vez de contra o
+            # estado real. Um teste encontrou isso ao devolver o mesmo dict
+            # duas vezes.
+            payload = dict((getattr(atual, "payload", None) or {}) if atual else {})
+            linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+            if memory_id in linked:
+                return True
+            linked.append(memory_id)
+            payload["linked_memory_ids"] = linked
+            entity_store.update(vector_id=entity_id, vector=None,
+                                     payload=payload)
+            logger.info("entity %s: vínculo %s reanexado (tentativa %d)",
+                        entity_id, memory_id, tentativa)
+        except Exception as exc:
+            logger.debug("reconciliação de vínculo falhou para %s: %s",
+                         entity_id, exc)
+            return False
+    try:
+        atual = entity_store.get(vector_id=entity_id)
+        ok = memory_id in normalize_linked_memory_ids(
+            (getattr(atual, "payload", None) or {}).get("linked_memory_ids"))
+    except Exception:
+        ok = False
+    if not ok:
+        logger.warning(
+            "entity %s: vínculo %s NÃO grudou em %d tentativas — escrita "
+            "concorrente sustentada. O vínculo está perdido e isto é o "
+            "aviso, não um detalhe de log.", entity_id, memory_id, tentativas)
+    return ok
+
+
 #: Hook for observability of DELETE, called as
 #: ``(memory_id, phase, metrics)`` where `metrics` carries what only the core can
 #: see. Same shape as `reinforcement_observer`, and for the same reason: a
@@ -1632,47 +1743,7 @@ class Memory(MemoryBase):
         return self._entity_store
 
     def _entidade_por_chave(self, chave, search_filters):
-        """Linha de entidade com esta chave normalizada NESTE escopo, ou None.
-
-        Identidade EXATA, e é a diferença que importa: a identidade era a
-        SIMILARIDADE do vetor (>= 0.95), que é probabilística. O corpus mostrou o
-        preço — `FASE`/`Fase`, `docker compose`/`Docker Compose`,
-        `Hilbert transform`/`Hilbert Transform` viraram linhas SEPARADAS, cada uma
-        com sua fatia de vínculos, e qual delas recebe o boost passou a depender
-        da grafia que o usuário digitou.
-        """
-        try:
-            achados = self.entity_store.list(
-                filters={**search_filters, "data_normalized": chave}, top_k=1)
-        except Exception as exc:      # store sem suporte ao filtro: cai na sonda
-            logger.debug("lookup por chave normalizada indisponível: %s", exc)
-            return None
-        # VALIDAR A FORMA, não só a verdade. `list()` de um store que devolva
-        # outra coisa — ou de um duplo de teste — é truthy, e aceitar truthy como
-        # acerto fazia o caminho exato "encontrar" um registro inexistente e
-        # pular a sonda vetorial. Três testes existentes quebraram exatamente
-        # nisso, o que é o instrumento funcionando: um store real que mude o tipo
-        # de retorno produziria a mesma falha silenciosa em produção.
-        if isinstance(achados, tuple):
-            achados = achados[0] if achados else []
-        if not isinstance(achados, list) or not achados:
-            return None
-        if isinstance(achados[0], list):
-            achados = achados[0]
-            if not achados:
-                return None
-        linha = achados[0]
-        pl = getattr(linha, "payload", None)
-        if getattr(linha, "id", None) is None or not isinstance(pl, dict):
-            return None
-        # Escopo e chave têm que CASAR de fato: um filtro ignorado pelo store
-        # devolveria a primeira linha qualquer, e ela seria fundida com esta.
-        if pl.get("data_normalized") != chave:
-            return None
-        for k, v in search_filters.items():
-            if pl.get(k) != v:
-                return None
-        return linha
+        return entidade_por_chave(self.entity_store, chave, search_filters)
 
     def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
         """Upsert an entity into the entity store, linking it to a memory."""
@@ -1739,29 +1810,9 @@ class Memory(MemoryBase):
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}': {e}")
 
-    def _reconcilia_vinculo(self, entity_id, memory_id):
-        """Relê a linha e reanexa o vínculo se um escritor concorrente o perdeu.
-
-        Com id determinístico a corrida deixa de criar duplicata e passa a ser
-        lost-update: dois escritores inserem no mesmo ponto e o segundo sobrescreve
-        o payload do primeiro. Reler e reanexar custa uma leitura e fecha a
-        janela; falhar aqui não pode derrubar o add, então é best-effort e
-        registrado.
-        """
-        try:
-            atual = self.entity_store.get(vector_id=entity_id)
-            payload = (getattr(atual, "payload", None) or {}) if atual else {}
-            linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
-            if memory_id not in linked:
-                linked.append(memory_id)
-                payload["linked_memory_ids"] = linked
-                self.entity_store.update(vector_id=entity_id, vector=None,
-                                         payload=payload)
-                logger.info("entity %s: vínculo %s reanexado após escrita "
-                            "concorrente", entity_id, memory_id)
-        except Exception as exc:
-            logger.debug("reconciliação de vínculo falhou para %s: %s",
-                         entity_id, exc)
+    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas: int = 4):
+        return reconcilia_vinculo(self.entity_store, entity_id, memory_id,
+                                  tentativas)
 
     def _remove_memory_from_entity_store(self, memory_id, filters):
         """Strip `memory_id` from every entity record scoped to `filters`.
@@ -1791,7 +1842,7 @@ class Memory(MemoryBase):
                 return
             seen = set()
             for entity_type, entity_text in entities:
-                key = entity_text.strip().lower()
+                key = normalize_entity_key(entity_text)
                 if not key or key in seen:
                     continue
                 seen.add(key)
@@ -2275,7 +2326,7 @@ class Memory(MemoryBase):
             for idx, (memory_id, text, embedding, payload) in enumerate(records):
                 entities = all_entities[idx] if idx < len(all_entities) else []
                 for entity_type, entity_text in entities:
-                    key = entity_text.strip().lower()
+                    key = normalize_entity_key(entity_text)
                     if key in global_entities:
                         global_entities[key][2].add(memory_id)
                     else:
@@ -2339,6 +2390,7 @@ class Memory(MemoryBase):
                             linked = set(normalize_linked_memory_ids(payload.get("linked_memory_ids")))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
+                            payload["data_normalized"] = key
                             try:
                                 self.entity_store.update(
                                     vector_id=match.id,
@@ -2350,9 +2402,18 @@ class Memory(MemoryBase):
                         else:
                             # New entity — collect for batch insert
                             to_insert_vectors.append(valid_vectors[j])
-                            to_insert_ids.append(str(uuid.uuid4()))
+                            # ⚠️ ESTE é o escritor que roda em todo `add` com
+                            # infer=True — a Fase 7 em lote. Ele ficou com
+                            # `uuid4()` e sem `data_normalized` enquanto
+                            # `_upsert_entity` ganhava identidade determinística,
+                            # e o resultado seria pior que não ter consertado
+                            # nada: o corpus passa a ter DUAS regras de
+                            # identidade conforme o caminho que escreveu.
+                            to_insert_ids.append(
+                                entity_point_id(search_filters, key))
                             to_insert_payloads.append({
                                 "data": entity_text,
+                                "data_normalized": key,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
                                 **search_filters,
@@ -3153,7 +3214,7 @@ class Memory(MemoryBase):
         seen = set()
         deduped = []
         for entity_type, entity_text in query_entities[:8]:
-            key = entity_text.strip().lower()
+            key = normalize_entity_key(entity_text)
             if key and key not in seen:
                 seen.add(key)
                 deduped.append((entity_type, entity_text))
@@ -3943,13 +4004,29 @@ class AsyncMemory(MemoryBase):
             )
         return self._entity_store
 
+    def _entidade_por_chave(self, chave, search_filters):
+        return entidade_por_chave(self.entity_store, chave, search_filters)
+
+    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas: int = 4):
+        return reconcilia_vinculo(self.entity_store, entity_id, memory_id,
+                                  tentativas)
+
     async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
         """Async variant of `_upsert_entity` — per-entity search-then-update-or-insert."""
         try:
             entity_embedding = await asyncio.to_thread(self.embedding_model.embed, entity_text, "add")
             search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
 
-            existing = await asyncio.to_thread(
+            chave = normalize_entity_key(entity_text)
+
+            # ⚠️ O gêmeo assíncrono ficou para trás quando o síncrono ganhou
+            # identidade normalizada, e um gêmeo que diverge é pior que nenhum:
+            # o mesmo corpus passa a ter duas regras de identidade dependendo de
+            # qual caminho escreveu. Mesma ordem do síncrono — chave exata
+            # primeiro, sonda vetorial só para linha LEGADA.
+            exata = await asyncio.to_thread(
+                self._entidade_por_chave, chave, search_filters)
+            existing = [exata] if exata is not None else await asyncio.to_thread(
                 self.entity_store.search,
                 query=entity_text,
                 vectors=entity_embedding,
@@ -3957,7 +4034,7 @@ class AsyncMemory(MemoryBase):
                 filters=search_filters,
             )
 
-            if existing and existing[0].score >= 0.95:
+            if existing and (exata is not None or existing[0].score >= 0.95):
                 match = existing[0]
                 payload = match.payload or {}
                 raw_linked = payload.get("linked_memory_ids")
@@ -3965,9 +4042,13 @@ class AsyncMemory(MemoryBase):
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
                 # Same self-heal as the sync twin: normalizing changing the value
-                # is itself a reason to write.
-                if linked_ids != raw_linked:
+                # is itself a reason to write — and so is a row that still lacks
+                # the identity key, because it can never be found by the exact
+                # lookup and keeps having its case-variant duplicate born beside it.
+                precisa_chave = payload.get("data_normalized") != chave
+                if linked_ids != raw_linked or precisa_chave:
                     payload["linked_memory_ids"] = linked_ids
+                    payload["data_normalized"] = chave
                     await asyncio.to_thread(
                         self.entity_store.update,
                         vector_id=match.id,
@@ -3975,9 +4056,10 @@ class AsyncMemory(MemoryBase):
                         payload=payload,
                     )
             else:
-                entity_id = str(uuid.uuid4())
+                entity_id = entity_point_id(search_filters, chave)
                 entity_payload = {
                     "data": entity_text,
+                    "data_normalized": chave,
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
                     **{k: v for k, v in search_filters.items()},
@@ -3988,6 +4070,7 @@ class AsyncMemory(MemoryBase):
                     ids=[entity_id],
                     payloads=[entity_payload],
                 )
+                await asyncio.to_thread(self._reconcilia_vinculo, entity_id, memory_id)
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}' (async): {e}")
 
@@ -4040,7 +4123,7 @@ class AsyncMemory(MemoryBase):
                 return
             seen = set()
             for entity_type, entity_text in entities:
-                key = entity_text.strip().lower()
+                key = normalize_entity_key(entity_text)
                 if not key or key in seen:
                     continue
                 seen.add(key)
@@ -4490,7 +4573,7 @@ class AsyncMemory(MemoryBase):
             for idx, (memory_id, text, embedding, payload) in enumerate(records):
                 entities = all_entities[idx] if idx < len(all_entities) else []
                 for entity_type, entity_text in entities:
-                    key = entity_text.strip().lower()
+                    key = normalize_entity_key(entity_text)
                     if key in global_entities:
                         global_entities[key][2].add(memory_id)
                     else:
@@ -4551,6 +4634,7 @@ class AsyncMemory(MemoryBase):
                             linked = set(normalize_linked_memory_ids(payload.get("linked_memory_ids")))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
+                            payload["data_normalized"] = key
                             try:
                                 await asyncio.to_thread(
                                     self.entity_store.update,
@@ -4562,9 +4646,18 @@ class AsyncMemory(MemoryBase):
                                 logger.debug(f"Entity update failed for '{entity_text}' (async): {e}")
                         else:
                             to_insert_vectors.append(valid_vectors[j])
-                            to_insert_ids.append(str(uuid.uuid4()))
+                            # ⚠️ ESTE é o escritor que roda em todo `add` com
+                            # infer=True — a Fase 7 em lote. Ele ficou com
+                            # `uuid4()` e sem `data_normalized` enquanto
+                            # `_upsert_entity` ganhava identidade determinística,
+                            # e o resultado seria pior que não ter consertado
+                            # nada: o corpus passa a ter DUAS regras de
+                            # identidade conforme o caminho que escreveu.
+                            to_insert_ids.append(
+                                entity_point_id(search_filters, key))
                             to_insert_payloads.append({
                                 "data": entity_text,
+                                "data_normalized": key,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
                                 **search_filters,
@@ -5355,7 +5448,7 @@ class AsyncMemory(MemoryBase):
         seen = set()
         deduped = []
         for entity_type, entity_text in query_entities[:8]:
-            key = entity_text.strip().lower()
+            key = normalize_entity_key(entity_text)
             if key and key not in seen:
                 seen.add(key)
                 deduped.append((entity_type, entity_text))
