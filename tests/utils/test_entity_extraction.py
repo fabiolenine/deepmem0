@@ -148,20 +148,29 @@ class TestSpanHygiene:
         assert "Meridian" in spans
         assert not any(s.endswith(" faz") for s in spans), spans
 
-    @pytest.mark.xfail(
-        reason="Needs a Portuguese model (N3). The English pipeline tags the "
-               "Portuguese auxiliary `foi` as NOUN, so it survives the "
-               "noun-chunk content filter — every POS-keyed hygiene rule is "
-               "inert on Portuguese text. Measured: 'Ontem eu viajei para "
-               "Recife' tags ALL five tokens PROPN, including the pronoun and "
-               "the verb.",
-        strict=True,
-    )
-    def test_portuguese_verb_inside_noun_chunk_span(self):
+    def test_portuguese_verb_no_longer_survives_in_a_span(self):
+        """Was an xfail(strict=True) waiting for a Portuguese model (N3).
+
+        The English pipeline tagged the Portuguese auxiliary `foi` as NOUN, so
+        it slipped through the noun-chunk content filter and every POS-keyed
+        rule was inert. With `pt_core_news_sm` the same token tags AUX and the
+        filter finally bites. The strict xfail existed so that landing the model
+        would BREAK THE BUILD instead of leaving a silent gap; this is that
+        break, resolved.
+        """
         from mem0.utils.entity_extraction import extract_entities
 
-        for _, span in extract_entities("Mem0 foi concluída ontem."):
+        for _, span in extract_entities("Mem0 foi concluída ontem.", language="pt"):
             assert " foi " not in span, span
+
+    def test_english_pipeline_still_cannot_do_it(self):
+        """The limitation was the MODEL, not the code: without a Portuguese
+        pipeline the same sentence still leaks. Pinning this keeps the reason
+        for the language parameter visible."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = [t for _, t in extract_entities("Mem0 foi concluída ontem.")]
+        assert any(" foi " in s for s in spans), spans
 
     def test_caps_reject_clause_length_spans(self):
         from mem0.utils.entity_extraction import (
@@ -296,3 +305,100 @@ class TestLanguageAwareLexicon:
         assert "Fase" in spans, "fallback must be the English behaviour"
         assert any("no lexicon for language" in r.message for r in caplog.records), \
             [r.message for r in caplog.records]
+
+
+class TestNamedEntitiesAndIdentifiers:
+    """`doc.ents` and technical identifiers (N3/N4).
+
+    The extractor carried four hand-rolled branches and never consulted
+    `doc.ents` — the trained recogniser of the very model it was already
+    loading. And a technical corpus is full of lowercase identifiers that no
+    capitalisation rule can reach.
+    """
+
+    def test_named_entities_are_used(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "Ontem eu viajei para Recife com a Alice.", language="pt")}
+        assert {"Recife", "Alice"} <= spans, spans
+
+    def test_sentence_initial_name_survives(self):
+        """The `has_mid_cap` guard dropped it, because without a Portuguese
+        model a sentence-initial capital is indistinguishable from a name."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "Northwind encerrou o projeto em dezembro.", language="pt")}
+        assert "Northwind" in spans, spans
+
+    def test_recogniser_span_containing_a_verb_is_rejected(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "O Docker Compose sobe o Qdrant e o docker compose derruba.",
+            language="pt")}
+        assert not any("derruba" in s for s in spans), spans
+
+    def test_lowercase_identifiers_are_extracted(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "O num_ctx do llama-tiny3 subiu e o entity store guarda "
+            "linked_memory_ids com embed-v2.", language="pt")}
+        for termo in ("num_ctx", "llama-tiny3", "linked_memory_ids", "embed-v2"):
+            assert termo in spans, f"{termo} sumiu: {spans}"
+
+    def test_identifier_with_an_assigned_value(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "A decisão foi manter event_tie_band=0.002.", language="pt")}
+        assert "event_tie_band" in spans, spans
+
+    def test_slashed_path_is_kept_whole(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "O reranker BAAI/bge-reranker-v2-m3 roda em CPU.", language="pt")}
+        assert "BAAI/bge-reranker-v2-m3" in spans, spans
+
+    def test_hyphenated_common_words_are_not_identifiers(self):
+        """A separator alone is not enough — a digit or an underscore is
+        required, or `guarda-chuva` and `bem-vindo` would become entities."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "Comprei um guarda-chuva e disse bem-vindo.", language="pt")}
+        assert "guarda-chuva" not in spans and "bem-vindo" not in spans, spans
+
+    def test_portuguese_genitive_stays_inside_a_place_name(self):
+        """N1 removed prepositions from the connector whitelist because in
+        English `in`/`at` GLUED distinct entities. In Portuguese the genitive
+        does the opposite — it is internal to the name."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "O voo sai de Sao Paulo com destino ao Rio de Janeiro.",
+            language="pt")}
+        assert "Rio de Janeiro" in spans, spans
+
+    def test_section_label_is_not_an_entity(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "A Fase 7 do add faz a ligação em lote.", language="pt")}
+        assert "Fase 7" not in spans, spans
+
+    def test_wrapper_span_is_dropped_but_legit_compound_survives(self):
+        """Only connective tissue authorises dropping the longer span. The
+        broad version of this rule ate `Samsung phone` and the verbatim quote
+        `The Great Gatsby`."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        pt = {t for _, t in extract_entities(
+            "Alice trabalhou na Northwind in Sao Paulo.", language="pt")}
+        assert "Northwind" in pt and "Northwind in Sao Paulo" not in pt, pt
+
+        en = extract_entities("Sam bought a Samsung phone.")
+        assert ("COMPOUND", "Samsung phone") in en, en

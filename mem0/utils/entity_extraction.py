@@ -80,6 +80,18 @@ _GENERIC_CAPS = {
 }
 
 
+# Connectors allowed INSIDE a proper-noun sequence (branch A).
+#
+# `in`, `at`, `for` and `is` were in this set and glued distinct entities into one
+# span: `Northwind in São Paulo` became a single PROPER, and the substring
+# cleanup below then DELETED `Northwind` for being contained in it. Measured on
+# the production corpus: the two memories a human would call the `Northwind`
+# answer had no entity link at all because of this.
+#
+# `is` is a verb — it was never defensible. `of`, `the`, `and` and `'s` stay:
+# they are internal to real names (`Bank of America`, `The Rolling Stones`).
+_CONNECTORS = {"'s", "of", "the", "and"}
+
 # ============================================================
 # LÉXICO POR IDIOMA (N2)
 # ============================================================
@@ -144,6 +156,8 @@ _PT_GENERIC_CAPS = {
     "métodos", "ferramentas", "opções", "ideias", "dicas", "recursos",
     "resultado", "resultados", "decisão", "decisões", "objetivo", "objetivos",
     "contexto", "motivo", "causa", "problema", "solução", "conteúdo",
+    "run", "runs", "rodada", "rodadas", "bloco", "blocos", "seção", "seções",
+    "run", "runs", "rodada", "rodadas", "bloco", "blocos", "seção", "seções",
 }
 
 _LEXICONS = {
@@ -158,6 +172,12 @@ _LEXICONS = {
         "upper_emphasis_suffixes": (),
         "trailing_function_words": ("of", "the", "in", "and", "for", "at",
                                     "to", "with", "on", "by", "from", "as"),
+        # `doc.ents` do modelo inglês é o que o upstream já tinha e nunca
+        # consultou; ligá-lo em EN mudaria a coluna congelada sem defeito medido.
+        "use_ner": False,
+        "trust_pos": False,
+        "identifiers": True,
+        "connectors": _CONNECTORS,
     },
     "pt": {
         "generic_heads": _GENERIC_HEADS | _PT_GENERIC_HEADS,
@@ -184,6 +204,19 @@ _LEXICONS = {
                                     "na", "nos", "nas", "para", "por", "com",
                                     "sem", "sob", "sobre", "entre", "e", "ou",
                                     "a", "o", "as", "os", "ao", "à", "/"),
+        # Com `pt_core_news_sm` o POS finalmente vale: `viajei` sai VERB (era
+        # PROPN), `tem` sai VERB (era NOUN). Só aqui as regras ancoradas em POS
+        # deixam de ser inertes — e `doc.ents`, que o extrator NUNCA consultou
+        # em 4 ramos artesanais, passa a ser a fonte primária de nome próprio.
+        "use_ner": True,
+        "trust_pos": True,
+        "identifiers": True,
+        # `de`/`da`/`do` são INTERNOS a nome próprio em português — `Rio de
+        # Janeiro`, `Vitória da Conquista`. O N1 tirou preposição da whitelist
+        # porque em inglês `in`/`at` COLAVAM entidades distintas
+        # (`Northwind in São Paulo`); em português a preposição de genitivo faz
+        # o oposto. `e` fica FORA: colaria `Qdrant e Ollama`.
+        "connectors": _CONNECTORS | {"de", "da", "do", "das", "dos"},
     },
 }
 
@@ -233,17 +266,6 @@ def _e_enfase_em_caixa_alta(txt: str, lex) -> bool:
 
 
 # Markdown/formatting markers to skip during extraction
-# Connectors allowed INSIDE a proper-noun sequence (branch A).
-#
-# `in`, `at`, `for` and `is` were in this set and glued distinct entities into one
-# span: `Northwind in São Paulo` became a single PROPER, and the substring
-# cleanup below then DELETED `Northwind` for being contained in it. Measured on
-# the production corpus: the two memories a human would call the `Northwind`
-# answer had no entity link at all because of this.
-#
-# `is` is a verb — it was never defensible. `of`, `the`, `and` and `'s` stay:
-# they are internal to real names (`Bank of America`, `The Rolling Stones`).
-_CONNECTORS = {"'s", "of", "the", "and"}
 
 # Sanity caps. An entity is a NAME, not a clause: a span with six words is a
 # badly cut sentence. Measured (29/07/2026): 16 of the 81 spans the extractor
@@ -278,6 +300,73 @@ def _strip_generic_ending(toks: list, endings=None) -> list:
     return toks[:-1] if last in endings and len(toks) > 2 else toks
 
 
+
+
+# Rótulos de NER -> tipo interno. Nome de pessoa, lugar, organização e "misc"
+# são todos NOME PRÓPRIO para efeito de entidade; o tipo interno só existe para
+# a precedência de deduplicação (PROPER > COMPOUND > QUOTED > NOUN).
+_NER_LABEL_TO_TYPE = {
+    "PER": "PROPER", "PERSON": "PROPER",
+    "LOC": "PROPER", "GPE": "PROPER", "FAC": "PROPER",
+    "ORG": "PROPER",
+    "MISC": "PROPER", "PRODUCT": "PROPER", "EVENT": "PROPER",
+    "WORK_OF_ART": "PROPER", "LANGUAGE": "PROPER", "NORP": "PROPER",
+}
+
+
+# ============================================================
+# IDENTIFICADORES TÉCNICOS (N4)
+# ============================================================
+# Classe descoberta pelo golden depois que o N3 destravou o resto: `num_ctx`,
+# `llama-tiny3`, `embed-v2`, `linked_memory_ids`, `legacy_job_v2`, `Graph7` sumiam
+# TODOS. O ramo de nome próprio exige inicial maiúscula, e o NER não os conhece.
+#
+# O POS não serve aqui, e isso é MEDIDO, não suposto — com o modelo português os
+# mesmos identificadores saem `num_ctx/VERB`, `linked_memory_ids/ADJ`,
+# `legacy_job_v2/ADJ`, `Graph7/NUM`. A forma serve: o tokenizador os mantém
+# inteiros, e a marca é separador interno ou dígito.
+#
+# O DÍGITO OU O UNDERSCORE SÃO OBRIGATÓRIOS. Sem isso, `guarda-chuva` e
+# `bem-vindo` entrariam como identificador — palavra hifenizada comum é
+# exatamente o falso positivo que uma regra só de separador criaria.
+_RE_IDENT = re.compile(
+    r"""^(?:
+          [A-Za-z][A-Za-z0-9]*(?:[_][A-Za-z0-9_]+)+     # num_ctx, linked_memory_ids
+        | [A-Za-z][A-Za-z0-9]*(?:[-.][A-Za-z0-9]+)*\d[A-Za-z0-9.\-]*  # embed-v2, Graph7, llama-tiny3
+        )$""",
+    re.X,
+)
+
+
+def _identificadores(doc) -> List[Tuple[str, str]]:
+    """Tokens com forma de identificador, incluindo caminhos com barra.
+
+    A junção por `/` varre a RUN inteira e aceita se QUALQUER parte tiver forma
+    de identificador: `BAAI/bge-reranker-v2-m3` começa por `BAAI`, que sozinho é
+    só uma palavra maiúscula — partir só de partes que já casam a forma deixava
+    o prefixo de fora e devolvia as duas metades soltas.
+    """
+    achados: List[Tuple[str, str]] = []
+    toks = list(doc)
+    i = 0
+    while i < len(toks):
+        # extensão máxima de uma run colada por "/"
+        j = i
+        while (j + 2 < len(toks) and toks[j + 1].text == "/"
+               and not toks[j].whitespace_ and not toks[j + 1].whitespace_
+               and re.match(r"^[A-Za-z0-9][\w.\-]*$", toks[j + 2].text)):
+            j += 2
+        # `event_tie_band=0.002` chega como UM token, e o `=` reprovava a forma
+        # inteira: o identificador sumia junto com o valor.
+        partes = [toks[k].text.split("=", 1)[0] for k in range(i, j + 1, 2)]
+        if any(_RE_IDENT.match(x) for x in partes):
+            span = "/".join(partes)
+            if len(span) > 2:
+                achados.append(("PROPER", span))
+            i = j + 1
+            continue
+        i += 1
+    return achados
 
 def _apara_cauda_funcional(frase: str, lex) -> str:
     """Remove palavras funcionais do FIM do span.
@@ -330,7 +419,7 @@ def extract_entities(text: str, language: str = "en") -> List[Tuple[str, str]]:
     """
     from mem0.utils.spacy_models import get_nlp_full
 
-    nlp = get_nlp_full()
+    nlp = get_nlp_full(language)
     if nlp is None:
         return []
 
@@ -362,7 +451,7 @@ def extract_entities_batch(texts: List[str], batch_size: int = 32,
 
     from mem0.utils.spacy_models import get_nlp_full
 
-    nlp = get_nlp_full()
+    nlp = get_nlp_full(language)
     if nlp is None:
         return [[] for _ in texts]
 
@@ -383,6 +472,28 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     text = doc.text
     tokens = list(doc)
 
+    # === TECHNICAL IDENTIFIERS ===
+    if lex.get("identifiers"):
+        entities.extend(_identificadores(doc))
+
+    # === NAMED ENTITIES (doc.ents) ===
+    # O extrator tinha 4 ramos artesanais e NUNCA consultava `doc.ents` — o
+    # reconhecedor treinado do próprio modelo que ele já carregava. União em
+    # nível de span, com precedência para o NER na sobreposição (a dedup por
+    # tipo abaixo garante isso: PROPER vence COMPOUND para o mesmo texto).
+    if lex.get("use_ner"):
+        confia = lex.get("trust_pos")
+        for ent in getattr(doc, "ents", ()):
+            tipo = _NER_LABEL_TO_TYPE.get(ent.label_)
+            if not tipo or len(ent.text.strip()) <= 2:
+                continue
+            # O reconhecedor erra: em `o docker compose derruba` devolve
+            # `compose derruba` como MISC. Entidade não contém verbo — e só com
+            # o modelo da língua dá para saber que `derruba` é verbo.
+            if confia and any(t.pos_ in {"VERB", "AUX"} for t in ent):
+                continue
+            entities.append((tipo, ent.text.strip()))
+
     # === PROPER NOUN SEQUENCES ===
     i = 0
     while i < len(tokens):
@@ -398,19 +509,28 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
             j = i + 1
             while j < len(tokens):
                 t = tokens[j]
-                if (t.text and t.text[0].isupper()) or t.text.lower() in _CONNECTORS:
+                if (t.text and t.text[0].isupper()) or t.text.lower() in lex["connectors"]:
                     seq.append((t, j))
                     j += 1
                 else:
                     break
             # Strip trailing function words
-            while seq and seq[-1][0].text.lower() in _CONNECTORS:
+            while seq and seq[-1][0].text.lower() in lex["connectors"]:
                 seq.pop()
             if seq:
+                # A guarda `has_mid_cap` existe porque, sem POS confiável, uma
+                # maiúscula de início de frase é indistinguível de nome próprio —
+                # e em português com modelo inglês TODA palavra saía PROPN
+                # (medido: `Ontem/PROPN eu/PROPN viajei/PROPN`). Com o modelo da
+                # língua o POS vale, e `Northwind/PROPN encerrou/VERB` é legível:
+                # início de frase deixa de ser motivo para descartar a entidade.
+                # Era esta guarda que apagava a resposta que um humano daria.
+                confia_pos = lex.get("trust_pos")
                 has_mid_cap = any(
-                    not _is_sentence_start(tokens, idx)
+                    (not _is_sentence_start(tokens, idx)
+                     or (confia_pos and t.pos_ == "PROPN"))
                     for (t, idx) in seq
-                    if t.text[0].isupper() and t.text.lower() not in _CONNECTORS
+                    if t.text[0].isupper() and t.text.lower() not in lex["connectors"]
                 )
                 if has_mid_cap:
                     phrase = "".join(t.text_with_ws for (t, idx) in seq).strip()
@@ -467,10 +587,17 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
             if not head:
                 continue
             head_generic = head.lemma_.lower() in lex["generic_heads"]
+            # VERB/AUX só entram na exclusão quando o POS é confiável: com o
+            # modelo inglês sobre português o verbo sai NOUN/PROPN (`tem/NOUN`),
+            # então filtrar por POS era inerte lá — e mexer nisso em inglês
+            # moveria a coluna congelada do golden sem defeito medido.
+            _fora = {"DET", "PRON", "PUNCT", "PART", "ADP", "SCONJ", "NUM"}
+            if lex.get("trust_pos"):
+                _fora = _fora | {"VERB", "AUX", "CCONJ", "ADV"}
             content = [
                 t
                 for t in group
-                if t.pos_ not in {"DET", "PRON", "PUNCT", "PART", "ADP", "SCONJ", "NUM"} and (t.pos_ == "ADJ" or not t.is_stop)
+                if t.pos_ not in _fora and (t.pos_ == "ADJ" or not t.is_stop)
             ]
             if not content:
                 continue
@@ -551,6 +678,11 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
         txt = re.sub(r"^\*+\s*|\s*\*+$", "", etext.strip())
         txt = re.sub(r"\s*:+$", "", txt)
         txt = re.sub(r"^\d+\s*\.\s*", "", txt)
+        # Aspas e pontuação órfãs na borda. O manifesto do N3 as pegou em texto
+        # real (`" Definitivo`, `" mem0`) — aspas desbalanceadas no corpus, que
+        # nenhuma frase de teste isolada reproduz. Entidade não começa nem
+        # termina em pontuação.
+        txt = txt.strip(" \t\n\"'“”‘’«»(){}[]<>,;·—–-").strip()
         if not txt or len(txt) <= 2 or _has_artifacts(txt):
             continue
         if etype == "PROPER" and " " not in txt and txt.lower() in lex["generic_caps"]:
@@ -558,6 +690,13 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
         # `CONCLUÍDO`, `DECISÃO`, `REMOVIDO`: caixa alta de ÊNFASE virava PROPER
         # porque nada distinguia ênfase de sigla sem léxico da língua.
         if etype == "PROPER" and _e_enfase_em_caixa_alta(txt, lex):
+            continue
+        # `Fase 7`, `Item 3`: palavra genérica + número é RÓTULO DE SEÇÃO. A
+        # checagem de genérico só olhava span de UMA palavra, então bastava o
+        # número ao lado para escapar dela.
+        _p = txt.split()
+        if (etype == "PROPER" and len(_p) == 2 and _p[1].isdigit()
+                and _p[0].lower() in lex["generic_caps"]):
             continue
         if len(txt.split()) > MAX_ENTITY_TOKENS or len(txt) > MAX_ENTITY_CHARS:
             continue
@@ -581,10 +720,49 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     # would call the answer their only entity link. Suppression stays for
     # COMPOUND/NOUN/QUOTED, where a longer span really does subsume a fragment.
     all_lower = [e[1].lower() for e in deduped]
-    return [
+    sobreviventes = [
         (t, e)
         for t, e in deduped
         if t == "PROPER"
         or not any(e.lower() != o and re.search(rf"\b{re.escape(e.lower())}\b", o)
                    for o in all_lower)
     ]
+
+    # EMBRULHO: span que contém outro span JÁ EMITIDO e acrescenta só
+    # cola — preposição, conjunção ou uma palavra solta. `Northwind in São
+    # Paulo` sobre `Northwind` + `São Paulo`; `legacy_job_v2 falhava` sobre
+    # `legacy_job_v2`. O N1 provou que o span curto é o que as pessoas buscam;
+    # aqui o longo deixa de ser emitido junto, em vez de apagar o curto.
+    curtos = {e.lower() for t, e in sobreviventes}
+    cola = set(lex.get("trailing_function_words") or ()) | {"in", "of", "the",
+                                                            "at", "on", "for"}
+
+    def _e_embrulho(texto: str) -> bool:
+        baixo = texto.lower()
+        palavras = baixo.split()
+        if len(palavras) < 2:
+            return False
+        for outro in curtos:
+            if outro == baixo or " " not in texto and outro not in baixo:
+                continue
+            if not re.search(rf"\b{re.escape(outro)}\b", baixo):
+                continue
+            resto = re.sub(rf"\b{re.escape(outro)}\b", " ", baixo).split()
+            if resto and all(w in cola or w in curtos for w in resto):
+                return True
+            # `legacy_job_v2 falhava`: cabeça com FORMA de identificador mais uma
+            # palavra solta. O gate é a forma, não "qualquer PROPER" — foi a
+            # versão larga disso que comeu `Samsung phone`, compound legítimo.
+            if (len(resto) == 1 and _RE_IDENT.match(outro)
+                    and baixo.startswith(outro)):
+                return True
+        return False
+
+    # ⚠️ APENAS onde o POS é confiável, e NUNCA sobre QUOTED. A 1ª versão tinha
+    # uma cláusula "sobra exatamente 1 palavra" que comeu `Samsung phone` e
+    # `The Great Gatsby` — compound legítimo e citação verbatim do usuário. Só
+    # COLA (preposição, artigo, conjunção) autoriza descartar o span longo.
+    if not lex.get("trust_pos"):
+        return sobreviventes
+    return [(t, e) for t, e in sobreviventes
+            if t == "QUOTED" or not _e_embrulho(e)]
