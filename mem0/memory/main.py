@@ -57,6 +57,8 @@ from mem0.memory.notices import (
     get_temporal_feature_error_message_async,
 )
 from mem0.memory.utils import (
+    entity_point_id,
+    normalize_entity_key,
     extract_json,
     normalize_linked_memory_ids,
     parse_messages,
@@ -1595,20 +1597,68 @@ class Memory(MemoryBase):
             )
         return self._entity_store
 
+    def _entidade_por_chave(self, chave, search_filters):
+        """Linha de entidade com esta chave normalizada NESTE escopo, ou None.
+
+        Identidade EXATA, e é a diferença que importa: a identidade era a
+        SIMILARIDADE do vetor (>= 0.95), que é probabilística. O corpus mostrou o
+        preço — `FASE`/`Fase`, `docker compose`/`Docker Compose`,
+        `Hilbert transform`/`Hilbert Transform` viraram linhas SEPARADAS, cada uma
+        com sua fatia de vínculos, e qual delas recebe o boost passou a depender
+        da grafia que o usuário digitou.
+        """
+        try:
+            achados = self.entity_store.list(
+                filters={**search_filters, "data_normalized": chave}, top_k=1)
+        except Exception as exc:      # store sem suporte ao filtro: cai na sonda
+            logger.debug("lookup por chave normalizada indisponível: %s", exc)
+            return None
+        # VALIDAR A FORMA, não só a verdade. `list()` de um store que devolva
+        # outra coisa — ou de um duplo de teste — é truthy, e aceitar truthy como
+        # acerto fazia o caminho exato "encontrar" um registro inexistente e
+        # pular a sonda vetorial. Três testes existentes quebraram exatamente
+        # nisso, o que é o instrumento funcionando: um store real que mude o tipo
+        # de retorno produziria a mesma falha silenciosa em produção.
+        if isinstance(achados, tuple):
+            achados = achados[0] if achados else []
+        if not isinstance(achados, list) or not achados:
+            return None
+        if isinstance(achados[0], list):
+            achados = achados[0]
+            if not achados:
+                return None
+        linha = achados[0]
+        pl = getattr(linha, "payload", None)
+        if getattr(linha, "id", None) is None or not isinstance(pl, dict):
+            return None
+        # Escopo e chave têm que CASAR de fato: um filtro ignorado pelo store
+        # devolveria a primeira linha qualquer, e ela seria fundida com esta.
+        if pl.get("data_normalized") != chave:
+            return None
+        for k, v in search_filters.items():
+            if pl.get(k) != v:
+                return None
+        return linha
+
     def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
         """Upsert an entity into the entity store, linking it to a memory."""
         try:
             entity_embedding = self.embedding_model.embed(entity_text, "add")
             search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+            chave = normalize_entity_key(entity_text)
 
-            existing = self.entity_store.search(
+            # 1) identidade EXATA por chave normalizada
+            exata = self._entidade_por_chave(chave, search_filters)
+            # 2) só então a sonda vetorial, que ainda alcança linha LEGADA sem
+            #    `data_normalized` — e que ao ser tocada ganha o campo.
+            existing = [exata] if exata is not None else self.entity_store.search(
                 query=entity_text,
                 vectors=entity_embedding,
                 top_k=1,
                 filters=search_filters,
             )
 
-            if existing and existing[0].score >= 0.95:
+            if existing and (exata is not None or existing[0].score >= 0.95):
                 # Update existing entity's linked_memory_ids
                 match = existing[0]
                 payload = match.payload or {}
@@ -1619,18 +1669,29 @@ class Memory(MemoryBase):
                 # Write when the id is new OR when normalizing changed the value:
                 # that second case is how a row corrupted by some other writer
                 # heals on its next touch instead of staying broken forever.
-                if linked_ids != raw_linked:
+                # `data_normalized` também cura na primeira vez que a linha é
+                # tocada: sem isso a linha legada nunca entra no lookup exato e a
+                # duplicata por caixa continua nascendo ao lado dela.
+                precisa_chave = payload.get("data_normalized") != chave
+                if linked_ids != raw_linked or precisa_chave:
                     payload["linked_memory_ids"] = linked_ids
+                    payload["data_normalized"] = chave
                     self.entity_store.update(
                         vector_id=match.id,
                         vector=None,
                         payload=payload,
                     )
             else:
-                # Create new entity
-                entity_id = str(uuid.uuid4())
+                # Id DETERMINÍSTICO = f(escopo, chave). Era sonda-então-UUID-
+                # aleatório: o worker HTTP é serial, mas hooks e ingestão
+                # instanciam `Memory` próprios, então dois escritores que não
+                # acham nada geravam dois UUIDs e nasciam DUAS linhas para a
+                # mesma entidade. Agora o segundo escreve no MESMO ponto, e a
+                # corrida vira lost-update — reconciliado logo abaixo.
+                entity_id = entity_point_id(search_filters, chave)
                 entity_payload = {
                     "data": entity_text,
+                    "data_normalized": chave,
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
                     **{k: v for k, v in search_filters.items()},
@@ -1640,8 +1701,33 @@ class Memory(MemoryBase):
                     ids=[entity_id],
                     payloads=[entity_payload],
                 )
+                self._reconcilia_vinculo(entity_id, memory_id)
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}': {e}")
+
+    def _reconcilia_vinculo(self, entity_id, memory_id):
+        """Relê a linha e reanexa o vínculo se um escritor concorrente o perdeu.
+
+        Com id determinístico a corrida deixa de criar duplicata e passa a ser
+        lost-update: dois escritores inserem no mesmo ponto e o segundo sobrescreve
+        o payload do primeiro. Reler e reanexar custa uma leitura e fecha a
+        janela; falhar aqui não pode derrubar o add, então é best-effort e
+        registrado.
+        """
+        try:
+            atual = self.entity_store.get(vector_id=entity_id)
+            payload = (getattr(atual, "payload", None) or {}) if atual else {}
+            linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+            if memory_id not in linked:
+                linked.append(memory_id)
+                payload["linked_memory_ids"] = linked
+                self.entity_store.update(vector_id=entity_id, vector=None,
+                                         payload=payload)
+                logger.info("entity %s: vínculo %s reanexado após escrita "
+                            "concorrente", entity_id, memory_id)
+        except Exception as exc:
+            logger.debug("reconciliação de vínculo falhou para %s: %s",
+                         entity_id, exc)
 
     def _remove_memory_from_entity_store(self, memory_id, filters):
         """Strip `memory_id` from every entity record scoped to `filters`.

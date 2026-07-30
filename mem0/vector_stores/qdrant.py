@@ -189,7 +189,12 @@ class Qdrant(VectorStoreBase):
             logger.debug("Skipping payload index creation for local Qdrant (not supported)")
             return
 
-        common_fields = ["user_id", "agent_id", "run_id", "actor_id", "memory_scope"]
+        # `data_normalized` é a CHAVE DE IDENTIDADE da linha de entidade
+        # (DeepMem0): o escritor filtra por ela em todo upsert, então sem índice
+        # cada gravação de entidade vira varredura. Criação é online — collection
+        # existente ganha o índice na próxima subida, sem reindexar vetor.
+        common_fields = ["user_id", "agent_id", "run_id", "actor_id",
+                         "memory_scope", "data_normalized"]
 
         for field in common_fields:
             try:

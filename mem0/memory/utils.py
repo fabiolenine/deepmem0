@@ -2,6 +2,7 @@ import ast
 import hashlib
 import logging
 import re
+import uuid
 from typing import Any, Dict, List
 
 from mem0.configs.prompts import (
@@ -371,3 +372,41 @@ def remove_spaces_from_entities(
         cleaned.append(item)
     return cleaned
 
+# Namespace fixo para ids determinísticos de entidade. Não muda: mudá-lo faria a
+# mesma entidade nascer com id diferente e recriaria a duplicata que ele evita.
+ENTITY_ID_NAMESPACE = uuid.UUID("6f9d3a1e-0c4b-5d8a-9e7f-2b1c3d4e5f60")
+
+
+def normalize_entity_key(text) -> str:
+    """Chave de IDENTIDADE de uma entidade — o que decide se duas linhas são a
+    mesma.
+
+    POR QUE EXISTE: a identidade era a SIMILARIDADE do vetor (>= 0.95). Isso é
+    probabilístico, e o corpus mostrou o preço — `FASE` e `Fase`,
+    `docker compose` e `Docker Compose`, `Hilbert transform` e
+    `Hilbert Transform` viraram linhas SEPARADAS, cada uma com sua fatia de
+    vínculos. Qual delas ganha o boost passa a depender da grafia buscada.
+
+    Casefold + NFKC + espaço colapsado. Separador NÃO é colapsado de propósito:
+    `num_ctx` e `num ctx` são coisas diferentes num corpus técnico, e fundi-los
+    trocaria uma duplicata por uma colisão.
+    """
+    import unicodedata
+
+    bruto = unicodedata.normalize("NFKC", str(text or "")).strip()
+    return " ".join(bruto.split()).casefold()
+
+
+def entity_point_id(scope: dict, normalized_key: str) -> str:
+    """Id DETERMINÍSTICO da linha de entidade: f(escopo, chave normalizada).
+
+    O escritor fazia sonda-então-UUID-aleatório. O worker HTTP é serial, mas
+    hooks e ingestão instanciam `Memory` próprios, então existe corrida
+    check-then-insert: dois escritores não acham nada, cada um gera um UUID e
+    nascem duas linhas para a mesma entidade. Com o id derivado, o segundo
+    escreve NO MESMO ponto — a corrida deixa de criar duplicata e passa a ser um
+    lost-update, que o chamador reconcilia relendo.
+    """
+    partes = "|".join(
+        f"{k}={scope.get(k) or ''}" for k in ("user_id", "agent_id", "run_id"))
+    return str(uuid.uuid5(ENTITY_ID_NAMESPACE, f"{partes}|{normalized_key}"))

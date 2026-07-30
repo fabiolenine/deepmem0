@@ -1056,7 +1056,29 @@ class TestEntityLinkNormalization:
         assert store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["mem-1"]
 
     def test_upsert_entity_does_not_rewrite_a_clean_unchanged_row(self, mock_memory):
+        """Clean row = nothing new to link AND the identity key already present.
+
+        This test used to omit `data_normalized`, and a row without the key is
+        NOT clean: it can never be found by the exact identity lookup, so the
+        case-variant duplicate keeps being born next to it. Healing it on touch
+        is the intended write.
+        """
         store = Mock()
+        store.list.return_value = [self._entity_match(
+            {"data": "alice", "data_normalized": "alice", "user_id": "u",
+             "linked_memory_ids": ["mem-1"]})]
+        mock_memory._entity_store = store
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+
+        mock_memory._upsert_entity("alice", "PERSON", "mem-1", {"user_id": "u"})
+
+        store.update.assert_not_called()
+
+    def test_upsert_entity_heals_a_row_missing_the_identity_key(self, mock_memory):
+        """A legacy row without `data_normalized` gains it on the next touch."""
+        store = Mock()
+        store.list.return_value = []
         store.search.return_value = [self._entity_match(
             {"data": "alice", "linked_memory_ids": ["mem-1"]})]
         mock_memory._entity_store = store
@@ -1065,7 +1087,8 @@ class TestEntityLinkNormalization:
 
         mock_memory._upsert_entity("alice", "PERSON", "mem-1", {"user_id": "u"})
 
-        store.update.assert_not_called()
+        payload = store.update.call_args.kwargs["payload"]
+        assert payload["data_normalized"] == "alice"
 
     # ---- writers: unlink -------------------------------------------------
     def test_unlink_reaches_a_corrupt_row(self, mock_memory):
