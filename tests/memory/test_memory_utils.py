@@ -203,9 +203,10 @@ class TestNormalizeLinkedMemoryIds:
 
     def test_already_exploded_list_is_left_alone(self):
         """Once a row is char-exploded the damage is done; the helper must not
-        invent recovery. `Mastercard`'s real shape: shrapnel + one surviving id.
-        Stripping shrapnel is a deployment-specific decision (repair script), not
-        this helper's job — ids are opaque here."""
+        invent recovery. This is the shape a real corrupted row takes: character
+        shrapnel plus one id that survived whole. Stripping shrapnel is a
+        deployment-specific decision (repair script), not this helper's job —
+        ids are opaque here."""
         raw = ["'", "-", "0", "a1c4b2ad-727c-45f0-b71a-b30842c4dcd2", "a"]
         assert normalize_linked_memory_ids(raw) == raw
 
