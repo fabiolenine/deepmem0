@@ -690,7 +690,11 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
         # real (`" Definitivo`, `" mem0`) — aspas desbalanceadas no corpus, que
         # nenhuma frase de teste isolada reproduz. Entidade não começa nem
         # termina em pontuação.
-        txt = txt.strip(" \t\n\"'“”‘’«»(){}[]<>,;·—–-").strip()
+        # Setas, símbolos de lista e `=` órfão também são borda. Achados no
+        # rebuild da v2, em texto real: `→ apply_hann_window` e
+        # `mem0_custom_instructions=` viraram CHAVES DE IDENTIDADE distintas das
+        # suas próprias entidades, e a linha ficou com `data` e chave discordando.
+        txt = txt.strip(" \t\n\"'“”‘’«»(){}[]<>,;·—–-→←↔⇒⇐•▪◦*=+|/\\").strip()
         if not txt or len(txt) <= 2 or _has_artifacts(txt):
             continue
         if etype == "PROPER" and " " not in txt and txt.lower() in lex["generic_caps"]:
