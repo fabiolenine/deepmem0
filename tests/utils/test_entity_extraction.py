@@ -182,3 +182,43 @@ class TestSpanHygiene:
 
         spans = {t for _, t in extract_entities("He joined the Bank of America team.")}
         assert any("Bank of America" in s for s in spans), spans
+
+
+class TestAdjudicatedEnglishTransformations:
+    """The four English outputs that changed, pinned as assertions.
+
+    The span golden freezes English output to force inspection, and freezing is
+    re-done deliberately after adjudication. That leaves a hole: a later change
+    could quietly revert one of these and a fresh `--freeze-en` would bless it.
+    These assertions are the immutable record — the golden can be re-frozen, this
+    cannot be re-frozen.
+    """
+
+    def test_google_in_california_splits(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("John works at Google in California.")}
+        assert {"Google", "California"} <= spans, spans
+        assert "Google in California" not in spans
+
+    def test_quoted_title_also_yields_the_proper(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        got = extract_entities('She read "The Great Gatsby" last summer.')
+        assert ("QUOTED", "The Great Gatsby") in got, got
+        assert any(t == "PROPER" and "Great Gatsby" in e for t, e in got), got
+
+    def test_brand_survives_alongside_its_compound(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        got = extract_entities("Sam bought a Samsung phone.")
+        assert ("PROPER", "Samsung") in got, got
+        assert any(t == "COMPOUND" and "Samsung" in e for t, e in got), got
+
+    def test_employer_and_city_are_separate_entities(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in
+                 extract_entities("Alice worked at Northwind in Sao Paulo as a Data Lead.")}
+        assert {"Northwind", "Sao Paulo", "Data Lead"} <= spans, spans
+        assert not any("Northwind in" in s for s in spans), spans
