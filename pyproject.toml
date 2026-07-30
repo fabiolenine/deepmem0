@@ -32,6 +32,25 @@ Repository = "https://github.com/fabiolenine/deepmem0"
 nlp = [
     "spacy>=3.7.0",
 ]
+# Language models for entity extraction and lemmatisation.
+#
+# spaCy models are NOT on PyPI, so they cannot be plain requirements — they are
+# declared as PEP 508 direct references. Leaving them undeclared is what let a
+# Portuguese deployment run on the English pipeline: the model was installed by
+# hand on one machine and nothing recorded that the behaviour depended on it.
+# `entity_pipeline_status()` reports whether the configured language's model is
+# present, and a non-default language without its model fails readiness.
+#
+#   pip install "deepmem0[nlp-en]"      # English pipeline
+#   pip install "deepmem0[nlp-pt]"      # Portuguese pipeline
+nlp-en = [
+    "spacy>=3.7.0",
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+nlp-pt = [
+    "spacy>=3.7.0",
+    "pt_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.8.0/pt_core_news_sm-3.8.0-py3-none-any.whl",
+]
 vector-stores = [
     "vecs>=0.4.0",
     "chromadb>=0.4.24",

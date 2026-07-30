@@ -17,6 +17,7 @@ Internal:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import List, Tuple
 
@@ -473,7 +474,12 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     tokens = list(doc)
 
     # === TECHNICAL IDENTIFIERS ===
-    if lex.get("identifiers"):
+    # Kill switch para ATRIBUIÇÃO: N3 (modelo/NER/POS) e N4 (identificadores)
+    # entraram no mesmo commit, e sem isto o efeito de cada um não se separa —
+    # exigência explícita do plano. Também serve de escape hatch se a heurística
+    # de forma se mostrar ruidosa em algum corpus.
+    if lex.get("identifiers") and os.environ.get(
+            "MEM0_ENTITY_IDENTIFIERS", "").strip().lower() not in ("0", "off", "false"):
         entities.extend(_identificadores(doc))
 
     # === NAMED ENTITIES (doc.ents) ===
@@ -481,6 +487,7 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     # reconhecedor treinado do próprio modelo que ele já carregava. União em
     # nível de span, com precedência para o NER na sobreposição (a dedup por
     # tipo abaixo garante isso: PROPER vence COMPOUND para o mesmo texto).
+    faixas_ner: List[Tuple[int, int]] = []
     if lex.get("use_ner"):
         confia = lex.get("trust_pos")
         for ent in getattr(doc, "ents", ()):
@@ -493,6 +500,7 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
             if confia and any(t.pos_ in {"VERB", "AUX"} for t in ent):
                 continue
             entities.append((tipo, ent.text.strip()))
+            faixas_ner.append((ent.start_char, ent.end_char))
 
     # === PROPER NOUN SEQUENCES ===
     i = 0
@@ -764,5 +772,35 @@ def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     # COLA (preposição, artigo, conjunção) autoriza descartar o span longo.
     if not lex.get("trust_pos"):
         return sobreviventes
-    return [(t, e) for t, e in sobreviventes
-            if t == "QUOTED" or not _e_embrulho(e)]
+    sobreviventes = [(t, e) for t, e in sobreviventes
+                     if t == "QUOTED" or not _e_embrulho(e)]
+
+    # PRECEDÊNCIA DO RECONHECEDOR NA SOBREPOSIÇÃO PARCIAL.
+    # A dedup por tipo acima resolve texto IDÊNTICO, e o embrulho resolve
+    # contenção — sobreposição parcial ficava sem regra. `Sao Paulo Guarulhos`
+    # (ramo artesanal) contra `Sao Paulo` + `Guarulhos` (NER) só desaparecia por
+    # acidente, porque a sobra caía em outra regra. O critério pede união em
+    # nível de span com precedência do `doc.ents`, e precedência exige OFFSET.
+    if faixas_ner:
+        textos_ner = {t.lower() for _tp, t in entities[:len(faixas_ner)]}
+
+        def _cruza_parcialmente(txt: str) -> bool:
+            if txt.lower() in textos_ner:
+                return False                     # é o próprio span do NER
+            pos = text.find(txt)
+            while pos >= 0:
+                fim = pos + len(txt)
+                for ini_e, fim_e in faixas_ner:
+                    inter = min(fim, fim_e) - max(pos, ini_e)
+                    if inter <= 0:
+                        continue
+                    contido = pos >= ini_e and fim <= fim_e
+                    contem = ini_e >= pos and fim_e <= fim
+                    if not contido and not contem:
+                        return True              # cruza sem conter nem estar contido
+                pos = text.find(txt, pos + 1)
+            return False
+
+        sobreviventes = [(t, e) for t, e in sobreviventes
+                         if t == "QUOTED" or not _cruza_parcialmente(e)]
+    return sobreviventes
