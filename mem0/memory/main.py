@@ -1666,7 +1666,7 @@ class Memory(MemoryBase):
         existing `_upsert_entity` helper. Non-fatal on any failure.
         """
         try:
-            entities = extract_entities(text)
+            entities = extract_entities(text, language=self.config.language)
             if not entities:
                 return
             seen = set()
@@ -2147,7 +2147,8 @@ class Memory(MemoryBase):
         # Phase 7: Batch entity linking
         try:
             all_texts = [r[1] for r in records]
-            all_entities = extract_entities_batch(all_texts)
+            all_entities = extract_entities_batch(
+                all_texts, language=self.config.language)
 
             # 7a: Global dedup — collect unique entities across all memories
             global_entities = {}  # normalized_key -> (entity_type, entity_text, set of memory_ids)
@@ -2861,7 +2862,7 @@ class Memory(MemoryBase):
 
         # Step 1: Preprocess query
         query_lemmatized = lemmatize_for_bm25(query, language=self.config.language)
-        query_entities = extract_entities(query)
+        query_entities = extract_entities(query, language=self.config.language)
 
         # Step 2: Embed query
         embeddings = self.embedding_model.embed(query, "search")
@@ -3913,7 +3914,8 @@ class AsyncMemory(MemoryBase):
     async def _link_entities_for_memory(self, memory_id, text, filters):
         """Async variant of `Memory._link_entities_for_memory`."""
         try:
-            entities = await asyncio.to_thread(extract_entities, text)
+            entities = await asyncio.to_thread(
+                extract_entities, text, self.config.language)
             if not entities:
                 return
             seen = set()
@@ -4360,7 +4362,8 @@ class AsyncMemory(MemoryBase):
         # Phase 7: Batch entity linking
         try:
             all_texts = [r[1] for r in records]
-            all_entities = await asyncio.to_thread(extract_entities_batch, all_texts)
+            all_entities = await asyncio.to_thread(
+                extract_entities_batch, all_texts, 32, self.config.language)
 
             # 7a: Global dedup
             global_entities = {}
@@ -5073,7 +5076,8 @@ class AsyncMemory(MemoryBase):
 
         # Step 1: Preprocess query (CPU-bound)
         query_lemmatized = await asyncio.to_thread(lemmatize_for_bm25, query, self.config.language)
-        query_entities = await asyncio.to_thread(extract_entities, query)
+        query_entities = await asyncio.to_thread(
+            extract_entities, query, self.config.language)
 
         # Step 2: Embed query
         embeddings = await asyncio.to_thread(self.embedding_model.embed, query, "search")

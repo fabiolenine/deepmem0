@@ -79,6 +79,148 @@ _GENERIC_CAPS = {
     "introduction", "pros", "cons", "advantages", "disadvantages",
 }
 
+
+# ============================================================
+# LÉXICO POR IDIOMA (N2)
+# ============================================================
+# As listas acima são 100% inglesas e rodavam sobre texto português — o mesmo
+# erro que o fork já corrigiu para o BM25 (`lemmatization.py`: "o lematizador
+# inglês é ruído, ou pior, em texto não-inglês"), nunca corrigido para entidades.
+#
+# Medido no corpus PT: `Fase` e `Item` viravam PROPER porque `_GENERIC_CAPS` só
+# conhece `works`/`items`/`steps`; e `CONCLUÍDO`, `DECISÃO`, `REMOVIDO`,
+# `CRÍTICO` viravam PROPER porque uma palavra em CAIXA ALTA no meio da frase é
+# indistinguível de sigla para um pipeline sem léxico da língua.
+#
+# A LÓGICA DE POS NÃO MUDA. Só o vocabulário: com um parser PT (N3) o ramo C
+# passa a ter POS e noun_chunks confiáveis, e desligá-lo agora desperdiçaria
+# justamente o que o N3 traz.
+_PT_GENERIC_HEADS = {
+    "coisa", "jeito", "forma", "tempo", "experiência", "situação", "caso",
+    "fato", "questão", "ideia", "pensamento", "sentimento", "lugar", "área",
+    "parte", "tipo", "monte", "dia", "ano", "semana", "mês", "momento",
+    "instância", "exemplo", "técnica", "método", "abordagem", "processo",
+    "passo", "etapa", "fase", "ferramenta", "resultado", "objetivo", "meta",
+    "tarefa", "tópico", "escala", "tamanho", "nível", "grau", "quantidade",
+    "número", "estilo", "cor", "formato", "peça", "seção", "lado", "fim",
+    "borda", "superfície", "ponto", "item", "coisas", "detalhe",
+}
+
+_PT_CIRCUMSTANTIAL_MODS = {
+    "individual", "equipe", "grupo", "conjunto", "primeiro", "último",
+    "próximo", "anterior", "final", "inicial", "principal", "lateral",
+}
+
+_PT_NON_SPECIFIC_ADJ = {
+    "muitos", "muitas", "poucos", "poucas", "vários", "várias", "alguns",
+    "algumas", "qualquer", "todos", "todas", "maioria", "mais", "menos",
+    "bastante", "diversos", "diversas", "múltiplos", "grande", "bom", "boa",
+    "ruim", "ótimo", "péssimo", "excelente", "melhor", "pior", "novo", "nova",
+    "velho", "antigo", "recente", "passado", "futuro", "atual", "anterior",
+    "próximo", "último", "primeiro", "cedo", "tarde", "moderno", "pequeno",
+    "enorme", "longo", "curto", "alto", "baixo", "largo", "estreito",
+    "grosso", "fino", "profundo", "raso", "similar", "parecido", "diferente",
+    "mesmo", "mesma", "outro", "outra", "tal", "certo", "importante",
+    "principal", "maior", "menor", "chave", "primário", "real", "verdadeiro",
+    "inteiro", "completo", "total", "básico", "simples", "interessante",
+    "especial", "particular", "geral", "comum", "único", "raro", "típico",
+    "usual", "normal", "regular", "possível", "provável", "potencial",
+    "disponível", "necessário", "apenas", "só",
+}
+
+_PT_GENERIC_ENDINGS = {
+    "trabalho", "trabalhos", "tarefa", "tarefas", "coisas", "coisa", "info",
+    "informação", "informações", "detalhes", "dados", "conteúdo", "material",
+    "materiais", "atividades", "atividade", "esforços", "esforço", "opções",
+    "opção", "escolhas", "escolha", "resultados", "resultado", "saída",
+    "saídas", "produtos", "produto", "itens", "item",
+}
+
+_PT_GENERIC_CAPS = {
+    "fase", "fases", "item", "itens", "etapa", "etapas", "resumo", "visão",
+    "conclusão", "conclusões", "introdução", "observação", "observações",
+    "nota", "notas", "exemplo", "exemplos", "detalhes", "recomendações",
+    "sugestões", "vantagens", "desvantagens", "prós", "contras", "passos",
+    "métodos", "ferramentas", "opções", "ideias", "dicas", "recursos",
+    "resultado", "resultados", "decisão", "decisões", "objetivo", "objetivos",
+    "contexto", "motivo", "causa", "problema", "solução", "conteúdo",
+}
+
+_LEXICONS = {
+    "en": {
+        "generic_heads": _GENERIC_HEADS,
+        "circumstantial": _CIRCUMSTANTIAL_MODS,
+        "non_specific_adj": _NON_SPECIFIC_ADJ,
+        "generic_endings": _GENERIC_ENDINGS,
+        "generic_caps": _GENERIC_CAPS,
+        # Sufixos de ênfase ficam FORA do inglês: a coluna EN do golden é
+        # congelada e não há defeito medido lá.
+        "upper_emphasis_suffixes": (),
+    },
+    "pt": {
+        "generic_heads": _GENERIC_HEADS | _PT_GENERIC_HEADS,
+        "circumstantial": _CIRCUMSTANTIAL_MODS | _PT_CIRCUMSTANTIAL_MODS,
+        "non_specific_adj": _NON_SPECIFIC_ADJ | _PT_NON_SPECIFIC_ADJ,
+        "generic_endings": _GENERIC_ENDINGS | _PT_GENERIC_ENDINGS,
+        "generic_caps": _GENERIC_CAPS | _PT_GENERIC_CAPS,
+        # Sufixos verbais/nominais do português. Comprimento NÃO serve como
+        # critério — a 1ª versão usava `len >= 6` e matou `PYTHONPATH`, que é
+        # identificador legítimo. O que separa ênfase de sigla é MORFOLOGIA:
+        # `REMOVIDO`/`CONCLUÍDO` (-IDO), `APARECEM` (-EM), `DECISÃO` (-ÃO) são
+        # palavras flexionadas; `PYTHONPATH`, `FFT`, `HNSW` não têm flexão.
+        "upper_emphasis_suffixes": (
+            "ADO", "ADOS", "ADA", "ADAS", "IDO", "IDOS", "IDA", "IDAS",
+            "ÇÃO", "ÇÕES", "SÃO", "SÕES", "MENTE", "AGEM", "ANDO", "ENDO",
+            "INDO", "AVAM", "IAM", "AREM", "EREM", "IREM", "ECEM", "ARAM",
+        ),
+    },
+}
+
+
+def _lexicon(language):
+    """Léxico do idioma, com fallback EXPLÍCITO para inglês.
+
+    Idioma desconhecido cai em inglês e AVISA uma vez: silêncio aqui
+    reproduziria o defeito original — um pipeline inglês rodando sobre outra
+    língua sem ninguém saber.
+    """
+    code = (language or "en").split("-")[0].lower()
+    lex = _LEXICONS.get(code)
+    if lex is None:
+        if code not in _LEXICONS_AVISADOS:
+            _LEXICONS_AVISADOS.add(code)
+            logger.warning(
+                "entity extraction has no lexicon for language %r; falling back "
+                "to English. Spans from this text will be filtered by English "
+                "word lists.", code)
+        lex = _LEXICONS["en"]
+    return lex
+
+
+_LEXICONS_AVISADOS = set()
+
+# Uma palavra INTEIRA em caixa alta é sigla ou ênfase. Acento decide sozinho
+# (sigla não leva acento em nenhuma das duas línguas); comprimento decide o
+# resto, e o teto vem do léxico porque é escolha de idioma.
+_ACENTOS = "ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑ"
+
+
+def _e_enfase_em_caixa_alta(txt: str, lex) -> bool:
+    """CAIXA ALTA é sigla ou ênfase? Decidem acento e morfologia, não tamanho.
+
+    A 1ª versão usava `len >= 6` e o golden pegou o preço: `PYTHONPATH` sumiu.
+    Sigla não flexiona; palavra escrita em caixa alta para dar ênfase, sim.
+    """
+    if " " in txt or len(txt) < 4 or not txt.isupper():
+        return False
+    sufixos = lex.get("upper_emphasis_suffixes") or ()
+    if not sufixos:
+        return False                     # idioma sem regra declarada: não mexe
+    if any(c in _ACENTOS for c in txt):
+        return True                      # CONCLUÍDO, DECISÃO, CRÍTICO
+    return txt.endswith(sufixos)         # REMOVIDO, APARECEM, DESAPARECEM
+
+
 # Markdown/formatting markers to skip during extraction
 # Connectors allowed INSIDE a proper-noun sequence (branch A).
 #
@@ -116,12 +258,13 @@ def _is_sentence_start(tokens: list, idx: int) -> bool:
     return prev in ".!?:" or prev in _FORMATTING_MARKERS or "\n" in prev
 
 
-def _strip_generic_ending(toks: list) -> list:
+def _strip_generic_ending(toks: list, endings=None) -> list:
     """Remove generic trailing words from compound token sequences."""
     if len(toks) <= 1:
         return toks
+    endings = _GENERIC_ENDINGS if endings is None else endings
     last = toks[-1].lemma_.lower() if hasattr(toks[-1], "lemma_") else toks[-1].lower()
-    return toks[:-1] if last in _GENERIC_ENDINGS and len(toks) > 2 else toks
+    return toks[:-1] if last in endings and len(toks) > 2 else toks
 
 
 def _lemmatize_compound(toks: list) -> str:
@@ -142,7 +285,7 @@ def _has_artifacts(txt: str) -> bool:
     )
 
 
-def extract_entities(text: str) -> List[Tuple[str, str]]:
+def extract_entities(text: str, language: str = "en") -> List[Tuple[str, str]]:
     """Extract named entities, quoted text, and noun compounds from text.
 
     This is the public API that accepts a string. It loads the spaCy model
@@ -163,10 +306,11 @@ def extract_entities(text: str) -> List[Tuple[str, str]]:
         return []
 
     doc = nlp(text)
-    return _extract_entities_from_doc(doc)
+    return _extract_entities_from_doc(doc, _lexicon(language))
 
 
-def extract_entities_batch(texts: List[str], batch_size: int = 32) -> List[List[Tuple[str, str]]]:
+def extract_entities_batch(texts: List[str], batch_size: int = 32,
+                           language: str = "en") -> List[List[Tuple[str, str]]]:
     """Extract entities from multiple texts using spaCy's nlp.pipe() for batched NER.
 
     Uses spaCy's efficient batch processing pipeline instead of calling
@@ -175,6 +319,9 @@ def extract_entities_batch(texts: List[str], batch_size: int = 32) -> List[List[
     Args:
         texts: List of input texts to extract entities from.
         batch_size: Number of texts to process in each spaCy batch.
+        language: Lexicon to filter spans with. Unknown codes fall back to
+            English and log a warning — silence here would reproduce the very
+            defect this parameter exists to fix.
 
     Returns:
         List of entity lists, one per input text. Each entity list contains
@@ -190,17 +337,19 @@ def extract_entities_batch(texts: List[str], batch_size: int = 32) -> List[List[
     if nlp is None:
         return [[] for _ in texts]
 
+    lex = _lexicon(language)
     results = []
     for doc in nlp.pipe(texts, batch_size=batch_size):
-        results.append(_extract_entities_from_doc(doc))
+        results.append(_extract_entities_from_doc(doc, lex))
     return results
 
 
-def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
+def _extract_entities_from_doc(doc, lex=None) -> List[Tuple[str, str]]:
     """Extract entities from a spaCy Doc object.
 
     Ported from platform's shared.core.utils.entity_extraction.extract_entities().
     """
+    lex = lex or _LEXICONS["en"]
     entities: List[Tuple[str, str]] = []
     text = doc.text
     tokens = list(doc)
@@ -288,7 +437,7 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
             head = next((t for t in reversed(group) if t.pos_ in {"NOUN", "PROPN"}), None)
             if not head:
                 continue
-            head_generic = head.lemma_.lower() in _GENERIC_HEADS
+            head_generic = head.lemma_.lower() in lex["generic_heads"]
             content = [
                 t
                 for t in group
@@ -299,19 +448,24 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
 
             compound_toks = [t for t in content if t.dep_ == "compound"]
             adj_toks = [t for t in content if t.pos_ == "ADJ" or t.dep_ == "amod"]
-            has_spec_adj = any(t.lemma_.lower() not in _NON_SPECIFIC_ADJ for t in adj_toks)
+            has_spec_adj = any(t.lemma_.lower() not in lex["non_specific_adj"]
+                               for t in adj_toks)
             if head_generic and not has_spec_adj and not compound_toks:
                 continue
 
             if compound_toks:
-                is_circ = any(t.lemma_.lower() in _CIRCUMSTANTIAL_MODS for t in compound_toks)
+                is_circ = any(t.lemma_.lower() in lex["circumstantial"]
+                              for t in compound_toks)
                 if is_circ:
                     val = head.lemma_ if head.pos_ == "NOUN" else head.text
                     if len(val) > 2:
                         entities.append(("NOUN", val))
                 else:
                     filtered = _strip_generic_ending(
-                        [t for t in content if not (t.pos_ == "ADJ" and t.lemma_.lower() in _NON_SPECIFIC_ADJ)]
+                        [t for t in content
+                         if not (t.pos_ == "ADJ"
+                                 and t.lemma_.lower() in lex["non_specific_adj"])],
+                        lex["generic_endings"],
                     )
                     if filtered:
                         phrase = _lemmatize_compound(filtered)
@@ -319,7 +473,10 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
                             entities.append(("COMPOUND", phrase))
             elif len(content) > 1 and has_spec_adj:
                 filtered = _strip_generic_ending(
-                    [t for t in content if not ((t.pos_ == "ADJ" or t.dep_ == "amod") and t.lemma_.lower() in _NON_SPECIFIC_ADJ)]
+                    [t for t in content
+                     if not ((t.pos_ == "ADJ" or t.dep_ == "amod")
+                             and t.lemma_.lower() in lex["non_specific_adj"])],
+                    lex["generic_endings"],
                 )
                 if filtered:
                     phrase = _lemmatize_compound(filtered)
@@ -328,7 +485,8 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
 
     # === FALLBACK: Mis-tagged VERB heads ===
     processed = {e[1].lower() for e in entities if e[0] == "COMPOUND"}
-    generic_verb_heads = _GENERIC_HEADS | {"find", "buy", "purchase", "sale", "deal", "trip", "visit"}
+    generic_verb_heads = lex["generic_heads"] | {"find", "buy", "purchase",
+                                                 "sale", "deal", "trip", "visit"}
 
     def collect_compounds(head):
         return [t for t in doc if t.head == head and t.dep_ == "compound"]
@@ -364,7 +522,11 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
         txt = re.sub(r"^\d+\s*\.\s*", "", txt)
         if not txt or len(txt) <= 2 or _has_artifacts(txt):
             continue
-        if etype == "PROPER" and " " not in txt and txt.lower() in _GENERIC_CAPS:
+        if etype == "PROPER" and " " not in txt and txt.lower() in lex["generic_caps"]:
+            continue
+        # `CONCLUÍDO`, `DECISÃO`, `REMOVIDO`: caixa alta de ÊNFASE virava PROPER
+        # porque nada distinguia ênfase de sigla sem léxico da língua.
+        if etype == "PROPER" and _e_enfase_em_caixa_alta(txt, lex):
             continue
         if len(txt.split()) > MAX_ENTITY_TOKENS or len(txt) > MAX_ENTITY_CHARS:
             continue

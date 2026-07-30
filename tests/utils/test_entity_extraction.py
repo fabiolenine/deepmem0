@@ -222,3 +222,77 @@ class TestAdjudicatedEnglishTransformations:
                  extract_entities("Alice worked at Northwind in Sao Paulo as a Data Lead.")}
         assert {"Northwind", "Sao Paulo", "Data Lead"} <= spans, spans
         assert not any("Northwind in" in s for s in spans), spans
+
+
+class TestLanguageAwareLexicon:
+    """The lexicon is per-language (N2).
+
+    The word lists were 100% English and ran over Portuguese text — the same
+    mistake the fork already fixed for BM25 (`lemmatization.py`: "the English
+    lemmatizer is noise, or worse, on non-English text"), never fixed for
+    entities. Threading `language` through the batch path broke it on the first
+    try and only the pre-existing batch tests caught it; these cover the
+    parameter itself.
+    """
+
+    def test_generic_capitalized_word_survives_in_english(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("A Fase 7 do Mem0 terminou.")}
+        assert "Fase" in spans, "English lexicon must not know Portuguese words"
+
+    def test_generic_capitalized_word_is_dropped_in_portuguese(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("A Fase 7 do Mem0 terminou.",
+                                                language="pt")}
+        assert "Fase" not in spans, spans
+        assert "Mem0" in spans, "dropping generics must not drop real names"
+
+    def test_uppercase_emphasis_is_not_a_proper_noun(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        for palavra in ("CONCLUÍDO", "DECISÃO", "REMOVIDO"):
+            spans = {t for _, t in
+                     extract_entities(f"O item foi {palavra} ontem.", language="pt")}
+            assert palavra not in spans, f"{palavra} is emphasis, not an entity"
+
+    def test_uppercase_identifiers_and_acronyms_survive(self):
+        """The first rule keyed on LENGTH (>=6) and deleted `PYTHONPATH`. An
+        acronym or identifier does not inflect; an emphasised word does."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities(
+            "O carregamento usa PYTHONPATH, FFT, HNSW e MT5.", language="pt")}
+        for termo in ("PYTHONPATH", "FFT", "HNSW", "MT5"):
+            assert termo in spans, f"{termo} sumiu: {spans}"
+
+    def test_batch_honours_language(self):
+        from mem0.utils.entity_extraction import extract_entities_batch
+
+        texto = "A Fase 7 do Mem0 terminou."
+        en = {t for _, t in extract_entities_batch([texto])[0]}
+        pt = {t for _, t in extract_entities_batch([texto], language="pt")[0]}
+        assert "Fase" in en and "Fase" not in pt, (en, pt)
+
+    def test_batch_matches_single_for_the_same_language(self):
+        from mem0.utils.entity_extraction import extract_entities, extract_entities_batch
+
+        texto = "A Fase 7 do Mem0 terminou com DECISÃO tomada."
+        assert (set(extract_entities(texto, language="pt"))
+                == set(extract_entities_batch([texto], language="pt")[0]))
+
+    def test_unknown_language_falls_back_to_english_and_warns(self, caplog):
+        """Silence would reproduce the original defect: an English pipeline
+        running over another language with nobody aware."""
+        import logging
+
+        from mem0.utils import entity_extraction as ee
+
+        ee._LEXICONS_AVISADOS.discard("xx")
+        with caplog.at_level(logging.WARNING, logger=ee.__name__):
+            spans = {t for _, t in ee.extract_entities("A Fase 7 terminou.",
+                                                       language="xx")}
+        assert "Fase" in spans, "fallback must be the English behaviour"
+        assert any("no lexicon for language" in r.message for r in caplog.records), \
+            [r.message for r in caplog.records]
