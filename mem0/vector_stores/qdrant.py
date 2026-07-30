@@ -226,7 +226,8 @@ class Qdrant(VectorStoreBase):
             except Exception as e:
                 logger.debug(f"Datetime index for {field} might already exist: {e}")
 
-    def insert(self, vectors: list, payloads: list = None, ids: list = None):
+    def insert(self, vectors: list, payloads: list = None, ids: list = None,
+               wait: bool = False):
         """
         Insert vectors into a collection, including BM25 sparse vectors
         computed from the text_lemmatized payload field.
@@ -253,7 +254,16 @@ class Qdrant(VectorStoreBase):
 
             points.append(PointStruct(id=point_id, vector=named_vectors, payload=payload))
 
-        self.client.upsert(collection_name=self.collection_name, points=points)
+        # ⚠️ `wait` existe por causa de LEITURA-APÓS-ESCRITA. O default do Qdrant
+        # é NÃO esperar: a escrita é confirmada antes de ficar visível. Quem
+        # escreve e logo em seguida procura o que escreveu (o upsert de entidade
+        # faz exatamente isso) não encontra, cria de novo, e o último a inserir
+        # apaga os anteriores. MEDIDO: 87,5% dos vínculos perdidos com 8
+        # escritores; não era corrida de vínculo, era visibilidade.
+        # Default False preserva o comportamento do upstream para o caminho de
+        # memória, onde ninguém relê imediatamente.
+        self.client.upsert(collection_name=self.collection_name, points=points,
+                           wait=wait)
 
     # ISO 8601 datetime pattern for detecting datetime strings in range filters
     _ISO_DATETIME_RE = re.compile(

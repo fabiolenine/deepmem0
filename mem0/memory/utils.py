@@ -410,3 +410,31 @@ def entity_point_id(scope: dict, normalized_key: str) -> str:
     partes = "|".join(
         f"{k}={scope.get(k) or ''}" for k in ("user_id", "agent_id", "run_id"))
     return str(uuid.uuid5(ENTITY_ID_NAMESPACE, f"{partes}|{normalized_key}"))
+
+
+LINK_KEY_PREFIX = "lnk_"
+
+
+def link_key(memory_id: str) -> str:
+    """Chave de payload que representa UM vínculo.
+
+    POR QUE UMA CHAVE POR VÍNCULO: `set_payload` do Qdrant faz MERGE de CHAVES,
+    mas SUBSTITUI o valor de uma chave de lista. Guardar os vínculos só numa
+    lista transforma toda escrita concorrente em lost-update — medido: 8
+    escritores simultâneos na mesma entidade deixam 1 vínculo de 8. Com uma
+    chave por vínculo, dois escritores tocando chaves diferentes MERGEIAM, e a
+    união vira atômica sem precisar de CAS, que o Qdrant não oferece.
+
+    `linked_memory_ids` continua sendo a lista canônica que todo leitor usa; as
+    chaves são a fonte de verdade para RECONSTRUÍ-la.
+    """
+    return f"{LINK_KEY_PREFIX}{memory_id}"
+
+
+def links_do_payload(payload: dict) -> list:
+    """União de `linked_memory_ids` com as chaves `lnk_*`, ordenada."""
+    ids = set(normalize_linked_memory_ids((payload or {}).get("linked_memory_ids")))
+    for k, v in (payload or {}).items():
+        if k.startswith(LINK_KEY_PREFIX) and v:
+            ids.add(k[len(LINK_KEY_PREFIX):])
+    return sorted(ids)

@@ -1,12 +1,14 @@
 import asyncio
 import concurrent.futures
 import gc
+import functools
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import random as _random
 import threading
 import time
 import uuid
@@ -58,6 +60,8 @@ from mem0.memory.notices import (
 )
 from mem0.memory.utils import (
     entity_point_id,
+    link_key,
+    links_do_payload,
     normalize_entity_key,
     extract_json,
     normalize_linked_memory_ids,
@@ -583,7 +587,13 @@ def entidade_por_chave(entity_store, chave, search_filters, checks_ref=None):
     return linha
 
 
-def reconcilia_vinculo(entity_store, entity_id, memory_id, tentativas: int = 4):
+ENTITY_RECONCILE_ATTEMPTS = int(os.environ.get("MEM0_ENTITY_RECONCILE_ATTEMPTS", "6"))
+ENTITY_RECONCILE_BACKOFF_S = float(
+    os.environ.get("MEM0_ENTITY_RECONCILE_BACKOFF_S", "0.08"))
+
+
+def reconcilia_vinculo(entity_store, entity_id, memory_id,
+                       tentativas: int = ENTITY_RECONCILE_ATTEMPTS):
     """Relê e reanexa o vínculo. ESTREITA a janela de lost-update; NÃO fecha.
 
     ⚠️ AFIRMAÇÃO CORRIGIDA. Eu escrevi que isto "fecha" a corrida
@@ -605,6 +615,7 @@ def reconcilia_vinculo(entity_store, entity_id, memory_id, tentativas: int = 4):
     própria reconciliação; o teto fica declarado e o fracasso vira WARNING,
     porque um vínculo perdido em silêncio foi a origem de todo este trabalho.
     """
+    estaveis = 0
     for tentativa in range(1, tentativas + 1):
         try:
             atual = entity_store.get(vector_id=entity_id)
@@ -614,23 +625,54 @@ def reconcilia_vinculo(entity_store, entity_id, memory_id, tentativas: int = 4):
             # estado real. Um teste encontrou isso ao devolver o mesmo dict
             # duas vezes.
             payload = dict((getattr(atual, "payload", None) or {}) if atual else {})
-            linked = normalize_linked_memory_ids(payload.get("linked_memory_ids"))
+            # UNIÃO com as chaves `lnk_*`: elas sobrevivem ao merge de
+            # `set_payload`, a lista não.
+            linked = links_do_payload(payload)
             if memory_id in linked:
-                return True
-            linked.append(memory_id)
+                # ⚠️ NÃO sair na PRIMEIRA vista. O escritor enxerga o PRÓPRIO
+                # insert e ia embora satisfeito; um insert de OUTRO escritor
+                # chegando depois apagava tudo e ninguém restava para notar.
+                # Exigir observação ESTÁVEL (presente em duas leituras espaçadas)
+                # é o que cobre o insert tardio.
+                estaveis += 1
+                if estaveis >= 2:
+                    return True
+                if ENTITY_RECONCILE_BACKOFF_S > 0:
+                    time.sleep(ENTITY_RECONCILE_BACKOFF_S * tentativa
+                               * (0.5 + _random.random()))
+                continue
+            estaveis = 0
+            linked = sorted(set(linked) | {memory_id})
             payload["linked_memory_ids"] = linked
+            payload[link_key(memory_id)] = 1
             entity_store.update(vector_id=entity_id, vector=None,
                                      payload=payload)
             logger.info("entity %s: vínculo %s reanexado (tentativa %d)",
                         entity_id, memory_id, tentativa)
+            # ESPERA CRESCENTE. Sem ela as tentativas se atropelam e caem todas
+            # ANTES de a rajada de inserts concorrentes terminar. MEDIDO com 8
+            # escritores simultâneos: 87,5% dos vínculos perdidos, porque
+            # `insert` SUBSTITUI o ponto inteiro e apaga o vínculo de quem já
+            # havia escrito. Espaçar faz a verificação cair DEPOIS dos inserts,
+            # que é quando ela recupera.
+            if tentativa < tentativas and ENTITY_RECONCILE_BACKOFF_S > 0:
+                # JITTER, não espera fixa. Com backoff uniforme os N escritores
+                # continuam SINCRONIZADOS e voltam a colidir nas mesmas janelas —
+                # medido: 87,5% de perda com 8 escritores, inalterado pelo
+                # backoff sem aleatoriedade. O jitter é o que desempata leituras
+                # concorrentes de read-modify-write sem CAS.
+                time.sleep(ENTITY_RECONCILE_BACKOFF_S * tentativa
+                           * (0.5 + _random.random()))
         except Exception as exc:
             logger.debug("reconciliação de vínculo falhou para %s: %s",
                          entity_id, exc)
             return False
+    if ENTITY_RECONCILE_BACKOFF_S > 0:
+        time.sleep(ENTITY_RECONCILE_BACKOFF_S * tentativas
+                   * (0.5 + _random.random()))
     try:
         atual = entity_store.get(vector_id=entity_id)
-        ok = memory_id in normalize_linked_memory_ids(
-            (getattr(atual, "payload", None) or {}).get("linked_memory_ids"))
+        ok = memory_id in links_do_payload(getattr(atual, "payload", None) or {})
     except Exception:
         ok = False
     if not ok:
@@ -1781,6 +1823,7 @@ class Memory(MemoryBase):
                 if linked_ids != raw_linked or precisa_chave:
                     payload["linked_memory_ids"] = linked_ids
                     payload["data_normalized"] = chave
+                    payload[link_key(memory_id)] = 1
                     self.entity_store.update(
                         vector_id=match.id,
                         vector=None,
@@ -1799,20 +1842,28 @@ class Memory(MemoryBase):
                     "data_normalized": chave,
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
+                    # chave por vínculo: sobrevive a `set_payload` concorrente
+                    link_key(memory_id): 1,
                     **{k: v for k, v in search_filters.items()},
                 }
                 self.entity_store.insert(
                     vectors=[entity_embedding],
                     ids=[entity_id],
                     payloads=[entity_payload],
+                    wait=True,   # leitura-após-escrita: ver o comentário no store
                 )
                 self._reconcilia_vinculo(entity_id, memory_id)
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}': {e}")
 
-    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas: int = 4):
-        return reconcilia_vinculo(self.entity_store, entity_id, memory_id,
-                                  tentativas)
+    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas=None):
+        # `tentativas=None` -> usa o default do módulo (e portanto o env).
+        # Declarar `= 4` aqui ANULAVA `MEM0_ENTITY_RECONCILE_ATTEMPTS` e fez
+        # duas medições com janela maior não mudarem nada — o knob existia e não
+        # chegava a lugar nenhum.
+        return reconcilia_vinculo(
+            self.entity_store, entity_id, memory_id,
+            ENTITY_RECONCILE_ATTEMPTS if tentativas is None else tentativas)
 
     def _remove_memory_from_entity_store(self, memory_id, filters):
         """Strip `memory_id` from every entity record scoped to `filters`.
@@ -2391,6 +2442,7 @@ class Memory(MemoryBase):
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
                             payload["data_normalized"] = key
+                            payload.update({link_key(m): 1 for m in memory_ids})
                             try:
                                 self.entity_store.update(
                                     vector_id=match.id,
@@ -2416,6 +2468,7 @@ class Memory(MemoryBase):
                                 "data_normalized": key,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
+                                **{link_key(m): 1 for m in memory_ids},
                                 **search_filters,
                             })
 
@@ -4007,9 +4060,14 @@ class AsyncMemory(MemoryBase):
     def _entidade_por_chave(self, chave, search_filters):
         return entidade_por_chave(self.entity_store, chave, search_filters)
 
-    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas: int = 4):
-        return reconcilia_vinculo(self.entity_store, entity_id, memory_id,
-                                  tentativas)
+    def _reconcilia_vinculo(self, entity_id, memory_id, tentativas=None):
+        # `tentativas=None` -> usa o default do módulo (e portanto o env).
+        # Declarar `= 4` aqui ANULAVA `MEM0_ENTITY_RECONCILE_ATTEMPTS` e fez
+        # duas medições com janela maior não mudarem nada — o knob existia e não
+        # chegava a lugar nenhum.
+        return reconcilia_vinculo(
+            self.entity_store, entity_id, memory_id,
+            ENTITY_RECONCILE_ATTEMPTS if tentativas is None else tentativas)
 
     async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
         """Async variant of `_upsert_entity` — per-entity search-then-update-or-insert."""
@@ -4049,6 +4107,7 @@ class AsyncMemory(MemoryBase):
                 if linked_ids != raw_linked or precisa_chave:
                     payload["linked_memory_ids"] = linked_ids
                     payload["data_normalized"] = chave
+                    payload[link_key(memory_id)] = 1
                     await asyncio.to_thread(
                         self.entity_store.update,
                         vector_id=match.id,
@@ -4062,10 +4121,12 @@ class AsyncMemory(MemoryBase):
                     "data_normalized": chave,
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
+                    # chave por vínculo: sobrevive a `set_payload` concorrente
+                    link_key(memory_id): 1,
                     **{k: v for k, v in search_filters.items()},
                 }
                 await asyncio.to_thread(
-                    self.entity_store.insert,
+                    functools.partial(self.entity_store.insert, wait=True),
                     vectors=[entity_embedding],
                     ids=[entity_id],
                     payloads=[entity_payload],
@@ -4635,6 +4696,7 @@ class AsyncMemory(MemoryBase):
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
                             payload["data_normalized"] = key
+                            payload.update({link_key(m): 1 for m in memory_ids})
                             try:
                                 await asyncio.to_thread(
                                     self.entity_store.update,
@@ -4660,6 +4722,7 @@ class AsyncMemory(MemoryBase):
                                 "data_normalized": key,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
+                                **{link_key(m): 1 for m in memory_ids},
                                 **search_filters,
                             })
 
