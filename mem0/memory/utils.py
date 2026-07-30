@@ -230,9 +230,43 @@ def get_image_description(image_obj, llm, vision_details):
     return response
 
 
+def _image_part_url(part):
+    """Extract and validate the URL of one OpenAI-style ``image_url`` content part.
+
+    Single source of truth for BOTH content shapes ``parse_vision_messages``
+    accepts: the canonical OpenAI list part
+    ``{"type": "image_url", "image_url": {"url": ...}}`` and mem0's legacy
+    bare-dict message content.
+
+    Raises ``ValueError`` -- never ``KeyError``/``TypeError`` -- because callers
+    classify failures by exception class: a structurally broken payload must be
+    poison (fail once, permanently), not an infrastructure blip worth retrying.
+
+    This validates the *message structure* only. Transport encoding (data URI vs
+    raw base64 vs local path, size caps) belongs to the provider -- see
+    ``mem0/llms/ollama.py:_extract_ollama_image``.
+    """
+    image_url_obj = part.get("image_url") if isinstance(part, dict) else None
+    image_url = image_url_obj.get("url") if isinstance(image_url_obj, dict) else None
+    if not isinstance(image_url, str) or not image_url:
+        raise ValueError("image_url content part is missing image_url.url")
+    return image_url
+
+
 def parse_vision_messages(messages, llm=None, vision_details="auto"):
     """
     Parse the vision messages from the messages
+
+    Two regimes, deliberately asymmetric:
+
+    * ``llm is None`` (vision disabled) -- TOTAL for a well-formed message: it
+      does not raise. Image parts are dropped, but never silently: a dropped
+      image is a fact the caller sent and we did not store, so it is logged at
+      WARNING. A malformed *container* (a non-dict message) still raises
+      ``AttributeError``, which is correct -- consumers classify it as poison.
+    * ``llm`` provided (vision enabled) -- STRICT: every image part is validated
+      before an LLM call is spent, and any exception raised by the provider
+      propagates with its original type, message and traceback.
     """
     returned_messages = []
     for msg in messages:
@@ -250,25 +284,70 @@ def parse_vision_messages(messages, llm=None, vision_details="auto"):
         # Handle message content
         if isinstance(content, list):
             if llm is None:
-                text_parts = [
-                    part["text"] for part in msg["content"]
-                    if isinstance(part, dict) and part.get("type") == "text"
-                ]
+                text_parts = []
+                dropped_images = 0
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type == "text":
+                        text = part.get("text")
+                        # A non-string `text` would blow up the join below. An
+                        # EMPTY string is kept: upstream preserved it, and
+                        # dropping it here would silently discard a message that
+                        # used to survive -- out of scope for this change.
+                        if isinstance(text, str):
+                            text_parts.append(text)
+                    elif part_type == "image_url":
+                        dropped_images += 1
+                if dropped_images and text_parts:
+                    logger.warning(
+                        "parse_vision_messages: vision is disabled (enable_vision=False); "
+                        "dropped %d image part(s) from a %s message, keeping its text",
+                        dropped_images, role,
+                    )
+                elif dropped_images:
+                    logger.warning(
+                        "parse_vision_messages: vision is disabled (enable_vision=False); "
+                        "dropped %d image part(s) and discarded the whole %s message "
+                        "(it carried no text)",
+                        dropped_images, role,
+                    )
                 if not text_parts:
                     continue
                 returned_messages.append({"role": role, "content": " ".join(text_parts)})
             else:
+                # Validate EVERY image part before spending an LLM call. This is
+                # the canonical OpenAI multimodal shape -- and the very shape
+                # `get_image_description` builds -- so it deserves at least the
+                # guard the legacy dict shape gets. Validation only: the payload
+                # sent to the provider stays the whole `msg`.
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        _image_part_url(part)
                 description = get_image_description(msg, llm, vision_details)
                 returned_messages.append({"role": role, "content": description})
         elif isinstance(content, dict) and content.get("type") == "image_url":
             if llm is None:
+                logger.warning(
+                    "parse_vision_messages: vision is disabled (enable_vision=False); "
+                    "dropped 1 image part(s) and discarded the whole %s message "
+                    "(it carried no text)",
+                    role,
+                )
                 continue
-            image_url = content["image_url"]["url"]
-            try:
-                description = get_image_description(image_url, llm, vision_details)
-                returned_messages.append({"role": role, "content": description})
-            except Exception:
-                raise Exception(f"Error while downloading {image_url}.")
+            image_url = _image_part_url(content)
+            # NO try/except here, on purpose. The provider's own exception is the
+            # diagnosis: mem0/llms/ollama.py raises actionable ValueErrors ("only
+            # base64 data URIs are supported", "malformed base64 in data URI",
+            # "http(s) image URLs are not supported"). The removed wrapper raised
+            # a bare `Exception` claiming the download had failed, which did two
+            # harms: it lied (nothing is fetched for a data URI or a local path)
+            # and it erased the exception class that consumers use to tell a
+            # poison payload from sick infrastructure -- turning a permanent
+            # failure into N retried full re-adds.
+            description = get_image_description(image_url, llm, vision_details)
+            returned_messages.append({"role": role, "content": description})
         else:
             # Regular text content
             returned_messages.append(msg)
