@@ -1,5 +1,6 @@
 {
   "_note": "Assinaturas das falhas PRÉ-EXISTENTES do fork. Comparação por nome é insuficiente: um defeito novo pode substituir a causa antiga dentro do mesmo teste.",
+  "dirty_paths": [],
   "failures": {
     "::tests.embeddings.test_aws_bedrock_embeddings": {
       "message": "collection failure :: from mem0.embeddings.aws_bedrock import AWSBedrockEmbedding | mem0/embeddings/aws_bedrock.py:LINE: in <module> | raise ImportError(\"The 'boto3' library is required. Please install it using 'pip install boto3'.\") | E ImportError: The 'boto3' library is required. Please install it using 'pip install boto3'.",
@@ -521,6 +522,6 @@
     "skipped": 29,
     "tests": 1356
   },
-  "revision": "ae3e5c4-dirty",
-  "signature_version": "6785b1329e75"
+  "revision": "ae3e5c4",
+  "signature_version": "8c91290b9074"
 }
