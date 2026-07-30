@@ -80,6 +80,28 @@ _GENERIC_CAPS = {
 }
 
 # Markdown/formatting markers to skip during extraction
+# Connectors allowed INSIDE a proper-noun sequence (branch A).
+#
+# `in`, `at`, `for` and `is` were in this set and glued distinct entities into one
+# span: `Northwind in São Paulo` became a single PROPER, and the substring
+# cleanup below then DELETED `Northwind` for being contained in it. Measured on
+# the production corpus: the two memories a human would call the `Northwind`
+# answer had no entity link at all because of this.
+#
+# `is` is a verb — it was never defensible. `of`, `the`, `and` and `'s` stay:
+# they are internal to real names (`Bank of America`, `The Rolling Stones`).
+_CONNECTORS = {"'s", "of", "the", "and"}
+
+# Sanity caps. An entity is a NAME, not a clause: a span with six words is a
+# badly cut sentence. Measured (29/07/2026): 16 of the 81 spans the extractor
+# produced from the 37 golden queries were over 5 tokens, e.g.
+# 'definição de harness segundo o artigo de Martin Fowler sobre engenharia de'.
+# Garbage spans match garbage entity rows (`'que datas foi'` matched
+# `'idade e data de nascimento'` at 0.67), which is where the boost's fan-out —
+# a median of 250 memories boosted per query — comes from.
+MAX_ENTITY_TOKENS = 5
+MAX_ENTITY_CHARS = 60
+
 _FORMATTING_MARKERS = {"*", "-", "+", "\u2022", "\u2013", "\u2014", "#", "##", "###", "**", "__"}
 
 
@@ -198,21 +220,19 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
             j = i + 1
             while j < len(tokens):
                 t = tokens[j]
-                if (t.text and t.text[0].isupper()) or t.text.lower() in {
-                    "'s", "of", "the", "in", "and", "for", "at", "is",
-                }:
+                if (t.text and t.text[0].isupper()) or t.text.lower() in _CONNECTORS:
                     seq.append((t, j))
                     j += 1
                 else:
                     break
             # Strip trailing function words
-            while seq and seq[-1][0].text.lower() in {"of", "the", "in", "and", "for", "at", "is", "'s"}:
+            while seq and seq[-1][0].text.lower() in _CONNECTORS:
                 seq.pop()
             if seq:
                 has_mid_cap = any(
                     not _is_sentence_start(tokens, idx)
                     for (t, idx) in seq
-                    if t.text[0].isupper() and t.text.lower() not in {"'s", "of", "the", "in", "and", "for", "at", "is"}
+                    if t.text[0].isupper() and t.text.lower() not in _CONNECTORS
                 )
                 if has_mid_cap:
                     phrase = "".join(t.text_with_ws for (t, idx) in seq).strip()
@@ -317,7 +337,12 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
         if tok.pos_ == "VERB" and tok.dep_ in {"pobj", "dobj", "nsubj"}:
             comps = sorted(collect_compounds(tok), key=lambda t: t.i)
             if comps:
-                phrase_toks = comps if tok.lemma_.lower() in generic_verb_heads else comps + [tok]
+                # NEVER append the verb. `comps + [tok]` produced spans like
+                # `Meridian faz` and `Mem0 foi concluída` — a name plus a
+                # conjugated verb is not an entity under any reading. When
+                # `comps` is a single token the `" " in phrase` guard below
+                # drops it, which is the right outcome too.
+                phrase_toks = comps
                 phrase = " ".join(t.text for t in phrase_toks)
                 if phrase.lower() not in processed and len(phrase) > 3 and " " in phrase:
                     entities.append(("COMPOUND", phrase))
@@ -341,6 +366,8 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
             continue
         if etype == "PROPER" and " " not in txt and txt.lower() in _GENERIC_CAPS:
             continue
+        if len(txt.split()) > MAX_ENTITY_TOKENS or len(txt) > MAX_ENTITY_CHARS:
+            continue
         cleaned.append((etype, txt))
 
     # Keep best type per entity (PROPER > COMPOUND > QUOTED > NOUN)
@@ -355,9 +382,16 @@ def _extract_entities_from_doc(doc) -> List[Tuple[str, str]]:
     # Remove entities that are whole-word substrings of longer entities.
     # Word-boundary anchoring avoids dropping distinct entities that only share a
     # leading substring (e.g. "Sam" must survive alongside "Samsung").
+    # A PROPER is never suppressed. `Northwind` was deleted because
+    # `Northwind in São Paulo` contained it — the short span is the one that
+    # matches how anyone searches, and losing it cost the two memories a human
+    # would call the answer their only entity link. Suppression stays for
+    # COMPOUND/NOUN/QUOTED, where a longer span really does subsume a fragment.
     all_lower = [e[1].lower() for e in deduped]
     return [
         (t, e)
         for t, e in deduped
-        if not any(e.lower() != o and re.search(rf"\b{re.escape(e.lower())}\b", o) for o in all_lower)
+        if t == "PROPER"
+        or not any(e.lower() != o and re.search(rf"\b{re.escape(e.lower())}\b", o)
+                   for o in all_lower)
     ]

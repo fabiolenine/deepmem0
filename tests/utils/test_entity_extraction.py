@@ -109,3 +109,76 @@ class TestExtractEntitiesBatch:
         assert len(batch) == 1
         # Both should extract the same entities
         assert set(t for _, t in single) == set(t for _, t in batch[0])
+
+
+class TestSpanHygiene:
+    """Span hygiene rules (N1).
+
+    These four rules changed the output of four English cases and the existing
+    eleven tests in this file stayed green — the behaviour they cover simply was
+    not covered. A change in extractor output with no test in the repo where the
+    extractor lives is how the `Northwind` regression survived in production:
+    the two memories a human would call the answer had no entity link, and
+    nothing failed.
+    """
+
+    def test_preposition_does_not_glue_two_entities(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("Alice worked at Northwind in Sao Paulo.")}
+        assert "Northwind" in spans
+        assert "Sao Paulo" in spans
+        assert not any("Northwind in" in s for s in spans), (
+            "`in` back in the connector whitelist re-glues distinct entities")
+
+    def test_proper_survives_a_longer_span_containing_it(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("Sam bought a Samsung phone.")}
+        assert "Samsung" in spans, (
+            "substring suppression deleted a PROPER — the short span is the one "
+            "people search for")
+
+    def test_mis_tagged_verb_head_no_longer_ends_a_span(self):
+        """The fallback branch used to emit `compounds + [verb]`, producing
+        `Meridian faz`. It now emits the compounds only."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = [t for _, t in extract_entities("The Meridian project faz a FFT.")]
+        assert "Meridian" in spans
+        assert not any(s.endswith(" faz") for s in spans), spans
+
+    @pytest.mark.xfail(
+        reason="Needs a Portuguese model (N3). The English pipeline tags the "
+               "Portuguese auxiliary `foi` as NOUN, so it survives the "
+               "noun-chunk content filter — every POS-keyed hygiene rule is "
+               "inert on Portuguese text. Measured: 'Ontem eu viajei para "
+               "Recife' tags ALL five tokens PROPN, including the pronoun and "
+               "the verb.",
+        strict=True,
+    )
+    def test_portuguese_verb_inside_noun_chunk_span(self):
+        from mem0.utils.entity_extraction import extract_entities
+
+        for _, span in extract_entities("Mem0 foi concluída ontem."):
+            assert " foi " not in span, span
+
+    def test_caps_reject_clause_length_spans(self):
+        from mem0.utils.entity_extraction import (
+            MAX_ENTITY_CHARS,
+            MAX_ENTITY_TOKENS,
+            extract_entities,
+        )
+
+        long_text = ("A definição de harness segundo o artigo de Martin Fowler "
+                     "sobre engenharia de software moderna")
+        for _, span in extract_entities(long_text):
+            assert len(span.split()) <= MAX_ENTITY_TOKENS, span
+            assert len(span) <= MAX_ENTITY_CHARS, span
+
+    def test_internal_name_words_are_kept(self):
+        """`of`/`the`/`and` are internal to real names and must stay."""
+        from mem0.utils.entity_extraction import extract_entities
+
+        spans = {t for _, t in extract_entities("He joined the Bank of America team.")}
+        assert any("Bank of America" in s for s in spans), spans
