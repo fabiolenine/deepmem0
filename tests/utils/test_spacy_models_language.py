@@ -95,9 +95,35 @@ class TestStatusDoPipeline:
         monkeypatch.setattr(sm, "model_available", lambda language=None: False)
         assert sm.entity_pipeline_status("pt")["degraded"] is True
 
-    def test_default_ausente_nao_marca_degraded(self, monkeypatch):
+    def test_fallback_sem_idioma_configurado_nao_marca_degraded(self, monkeypatch):
+        """Quem NÃO configurou idioma não pediu pipeline nenhum.
+
+        A isenção é para o FALLBACK (`language=None`), não para o idioma default:
+        reprovar a readiness de quem nunca escolheu a dependência transformaria
+        uma dependência opcional em obrigatória para todo mundo.
+        """
         monkeypatch.setattr(sm, "model_available", lambda language=None: False)
-        assert sm.entity_pipeline_status("en")["degraded"] is False
+        assert sm.entity_pipeline_status()["degraded"] is False
+        assert sm.entity_pipeline_status(None)["degraded"] is False
+
+    def test_ingles_EXPLICITO_e_ausente_marca_degraded(self, monkeypatch):
+        """A isenção anterior era `code != DEFAULT_LANGUAGE`, então inglês
+        configurado SEM o modelo dele reportava `degraded=False` e a readiness
+        respondia 200 com a extração inerte — o mesmo silêncio, deslocado do
+        português para o inglês."""
+        monkeypatch.setattr(sm, "model_available", lambda language=None: False)
+        assert sm.entity_pipeline_status("en")["degraded"] is True
+        assert sm.entity_pipeline_status("en")["explicitly_configured"] is True
+
+    def test_instalado_mas_que_nao_carrega_marca_degraded(self, monkeypatch):
+        """Modelo instalado que falha ao carregar é tão inerte quanto ausente,
+        e era o único dos três estados que passava batido pela readiness."""
+        monkeypatch.setattr(sm, "model_available", lambda language=None: True)
+        monkeypatch.setattr(sm, "_load_failed_full", {"pt"})
+        st = sm.entity_pipeline_status("pt")
+        assert st["installed"] is True
+        assert st["load_failed"] is True
+        assert st["degraded"] is True
 
     def test_idioma_nao_suportado_e_degraded(self):
         """`model_name` cai em inglês para código desconhecido, então perguntar

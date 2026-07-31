@@ -72,22 +72,36 @@ def entity_pipeline_status(language=None) -> dict:
     auxiliar volta NOUN), não apenas "um pouco pior".
     """
     code = _code(language)
+    # PEDIDO EXPLICITAMENTE vs. caído no default. É esta a distinção que importa,
+    # não "é o idioma default?": a isenção anterior era `code != DEFAULT_LANGUAGE`,
+    # então configurar inglês SEM `en_core_web_sm` reportava `degraded=False` e a
+    # readiness respondia 200 com a extração de entidade inerte — o mesmo silêncio
+    # que esta função existe para acabar, só deslocado para o inglês.
+    # A isenção legítima é outra: quem NÃO configurou idioma nenhum não pediu
+    # pipeline nenhum, e não deve ter a readiness reprovada por uma dependência
+    # que nunca escolheu.
+    explicito = language is not None
     suportado = code in MODEL_BY_LANGUAGE
     nome = model_name(code)
     instalado = model_available(code)
+    # `load_failed` TAMBÉM degrada: modelo instalado que não carrega é tão inerte
+    # quanto modelo ausente, e era o único dos três estados que passava batido.
+    falhou_ao_carregar = code in _load_failed_full
     # Idioma NÃO SUPORTADO conta como degradado. `model_name` cai em inglês para
     # código desconhecido, então perguntar só "o modelo está instalado?" devolvia
     # `True` para uma língua sem pipeline nenhum — o mesmo silêncio que este
     # trabalho existe para eliminar, só deslocado do português para as outras.
+    indisponivel = (not suportado) or (not instalado) or falhou_ao_carregar
     return {
         "language": code,
         "supported": suportado,
         "model": nome if suportado else None,
         "installed": instalado if suportado else False,
         "is_default_language": code == DEFAULT_LANGUAGE,
-        "degraded": (not suportado or not instalado) and code != DEFAULT_LANGUAGE,
+        "explicitly_configured": explicito,
+        "degraded": indisponivel and (explicito or code != DEFAULT_LANGUAGE),
         "strict": _strict(code),
-        "load_failed": code in _load_failed_full,
+        "load_failed": falhou_ao_carregar,
     }
 
 
