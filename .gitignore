@@ -5,8 +5,6 @@ eval/baselines/
 .venv/
 .DS_Store
 
-# Claude Code loop state (efêmero)
-.claude/loop/
 .claude/settings.local.json
 
 # Diretório de sessão de ferramenta local — nunca deve chegar ao repo público
