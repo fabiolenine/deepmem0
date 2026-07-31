@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from unittest.mock import Mock
 
@@ -96,6 +98,176 @@ class TestParseVisionMessages:
         ]
         result = parse_vision_messages(messages, llm=None)
         assert result == messages
+
+    # ------------------------------------------------------------------
+    # Structural guards on image parts (vision ENABLED).
+    #
+    # Two regimes, deliberately asymmetric:
+    #   llm is None -> TOTAL for a well-formed message: never raises, drops
+    #                  image parts but says so.
+    #   llm given   -> STRICT: a structurally invalid image part raises
+    #                  ValueError BEFORE an LLM call is spent, and a provider
+    #                  exception propagates with its original type and chain.
+    #
+    # ValueError (not KeyError/TypeError by accident) because consumers class-
+    # ify failures by exception type: a broken payload must be poison, failing
+    # once and permanently, never an infra blip worth retrying.
+    # ------------------------------------------------------------------
+
+    def test_malformed_image_dict_raises_value_error(self):
+        # A malformed image part (missing the nested url) used to raise an
+        # uncaught KeyError that aborted add(); it should raise a clear ValueError.
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": {"type": "image_url", "image_url": {}}}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_none_image_url_raises_value_error(self):
+        # image_url present but None (or any non-dict) must also raise the clear
+        # ValueError, not an AttributeError from calling .get() on None.
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": {"type": "image_url", "image_url": None}}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_bare_string_image_url_raises_value_error(self):
+        # `image_url` as a bare string is not the canonical OpenAI shape; it used
+        # to raise `TypeError: string indices must be integers`.
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": {
+            "type": "image_url", "image_url": "data:image/png;base64,AAA"}}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_malformed_image_part_in_list_raises_value_error(self):
+        # The LIST branch is the canonical OpenAI multimodal shape -- and the very
+        # shape `get_image_description` builds -- yet it had no guard at all: a
+        # malformed part sailed through to the provider.
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {}},
+        ]}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_missing_image_url_key_in_list_part_raises_value_error(self):
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": [{"type": "image_url"}]}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_second_image_part_is_also_prevalidated(self):
+        # Proves EVERY image part is validated, not just the first one: a valid
+        # image followed by a malformed one must still raise before any LLM call.
+        mock_llm = Mock()
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/ok.png"}},
+            {"type": "image_url", "image_url": {"url": ""}},
+        ]}]
+        with pytest.raises(ValueError, match=r"missing image_url\.url"):
+            parse_vision_messages(messages, llm=mock_llm)
+        mock_llm.generate_response.assert_not_called()
+
+    def test_provider_valueerror_propagates_unchanged(self):
+        # The provider's own exception IS the diagnosis: mem0/llms/ollama.py
+        # raises actionable ValueErrors ("only base64 data URIs are supported",
+        # "http(s) image URLs are not supported"). Wrapping them in
+        # `Exception(f"Error while downloading {image_url}.")` did two harms: it
+        # lied (nothing is downloaded for a data URI or a local path) and it
+        # erased the exception class consumers use to tell a poison payload from
+        # sick infrastructure -- turning a permanent failure into N retried adds.
+        # Identity implies type, message and traceback in one assertion.
+        mock_llm = Mock()
+        boom = ValueError("ollama vision: http(s) image URLs are not supported")
+        mock_llm.generate_response.side_effect = boom
+        messages = [{"role": "user", "content": {
+            "type": "image_url", "image_url": {"url": "https://example.com/img.png"}}}]
+        with pytest.raises(ValueError) as excinfo:
+            parse_vision_messages(messages, llm=mock_llm, vision_details="auto")
+        assert excinfo.value is boom
+
+    def test_infrastructure_error_keeps_its_class(self):
+        # Mirror of the test above, and the reason the fix is "stop interfering"
+        # rather than "convert everything to ValueError": a transient infra error
+        # must NOT be laundered into a poison-classified one either.
+        class _ConnError(Exception):
+            pass
+
+        mock_llm = Mock()
+        mock_llm.generate_response.side_effect = _ConnError("connection refused")
+        messages = [{"role": "user", "content": {
+            "type": "image_url", "image_url": {"url": "https://example.com/img.png"}}}]
+        with pytest.raises(_ConnError):
+            parse_vision_messages(messages, llm=mock_llm)
+
+    # ------------------------------------------------------------------
+    # Vision DISABLED: dropping an image is a fact the caller sent and we did
+    # not store, so it is never silent.
+    # ------------------------------------------------------------------
+
+    def test_image_dict_without_llm_warns_about_the_discard(self, caplog):
+        messages = [{"role": "user", "content": {
+            "type": "image_url", "image_url": {"url": "https://example.com/img.png"}}}]
+        with caplog.at_level(logging.WARNING, logger="mem0.memory.utils"):
+            result = parse_vision_messages(messages, llm=None)
+        assert result == []
+        assert "vision is disabled" in caplog.text
+
+    def test_image_only_list_without_llm_warns_the_message_is_gone(self, caplog):
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}]}]
+        with caplog.at_level(logging.WARNING, logger="mem0.memory.utils"):
+            result = parse_vision_messages(messages, llm=None)
+        assert result == []
+        assert "discarded the whole" in caplog.text
+
+    def test_multimodal_list_without_llm_warns_but_keeps_text(self, caplog):
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+        ]}]
+        with caplog.at_level(logging.WARNING, logger="mem0.memory.utils"):
+            result = parse_vision_messages(messages, llm=None)
+        assert result[0]["content"] == "What is this?"
+        assert "dropped 1 image part(s)" in caplog.text
+
+    # ------------------------------------------------------------------
+    # Hostile input: the "never raises" invariant holds for WELL-FORMED
+    # messages only. A malformed container still surfaces as AttributeError/
+    # TypeError -- and that is correct, both are poison-classified.
+    # ------------------------------------------------------------------
+
+    def test_non_string_text_part_does_not_crash_the_join(self):
+        # `" ".join()` over a non-string text part used to raise TypeError.
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": 42},
+            {"type": "text", "text": "real text"},
+        ]}]
+        result = parse_vision_messages(messages, llm=None)
+        assert result[0]["content"] == "real text"
+
+    def test_empty_text_part_is_preserved_like_upstream(self):
+        # Guards the boundary of the isinstance(text, str) filter: it exists to
+        # stop a non-string from blowing up the join, NOT to prune empty strings.
+        # Upstream kept them, so a message made only of an empty text part still
+        # survives; dropping it would be a silent behavior change beyond scope.
+        messages = [{"role": "user", "content": [{"type": "text", "text": ""}]}]
+        result = parse_vision_messages(messages, llm=None)
+        assert result == [{"role": "user", "content": ""}]
+
+    def test_non_dict_message_surfaces_as_poison_classified_error(self):
+        # Documents the boundary of the invariant: a non-dict message is a
+        # malformed CONTAINER, not a malformed image part. It raises
+        # AttributeError, which consumers classify as poison -- fail once,
+        # permanently -- which is the right outcome. Never silently skipped.
+        with pytest.raises(AttributeError):
+            parse_vision_messages(["not a dict"], llm=None)
 
 
 class TestRemoveSpacesFromEntities:

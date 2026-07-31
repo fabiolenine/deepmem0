@@ -52,6 +52,71 @@ cannot see one of them being dropped. Success cases assert the filter actually
 handed to the store, rejection cases assert the exception type, the message and
 the parameter named in it, and each of the eleven guards was falsified by
 reverting its own hunk alone and requiring the expected failure.
+## v0.11.1
+
+Four defects in `parse_vision_messages`, which was byte-identical to upstream
+mem0 2.0.7. Upstream PR #5631 fixes one of them, in the branch that matters
+least. Nothing here changes production behaviour on a vision-disabled server
+beyond a warning it should always have emitted.
+
+## The wrapper that turned a permanent failure into four retries
+
+`except Exception: raise Exception(f"Error while downloading {image_url}.")`
+did three things wrong. It erased the exception chain. It stated a falsehood —
+nothing is downloaded for a data URI or a local path. And it raised a bare
+`Exception`, whose MRO matches nothing in a consumer's poison list, so a
+classifier that distinguishes *bad payload* from *sick infrastructure* by
+exception class sees an unknown type and calls it retryable. A payload that can
+never succeed was re-added four times, each one a full LLM extraction.
+
+The wrapper is removed, not replaced. A wrapper of any class would still change
+the type consumers inspect; only the provider knows whether its own failure is
+permanent, so the provider's exception now propagates untouched. This is what
+lets `mem0/llms/ollama.py`'s actionable `ValueError`s — "only base64 data URIs
+are supported", "http(s) image URLs are not supported" — reach the caller at
+all. They were being thrown away.
+
+## The guarded branch was the wrong one
+
+Upstream hardened `content` as a bare dict, which is not a valid OpenAI shape —
+it is a mem0-ism. The LIST branch is the canonical multimodal shape *and* the
+shape `get_image_description` itself builds, and it had no guard whatsoever. A
+single `_image_part_url` now validates both branches, and in the list branch it
+validates **every** part before an LLM call is spent, not just the first.
+
+The error string is upstream's, word for word, so a future rebase reconciles
+trivially and upstream's own test regex matches.
+
+## Dropping an image is no longer silent
+
+With vision disabled the parser discarded image parts, and a message carrying
+only an image vanished whole — the caller was told nothing. It now logs at
+WARNING, distinguishing "dropped N images, kept the text" from "dropped N images
+and discarded the whole message". This is the only change visible on a
+vision-disabled server, which is every server that does not opt in.
+
+The invariant is stated honestly: **not** "never raises", but "does not raise
+for a well-formed message". A non-dict message still raises `AttributeError`
+and a non-string text part is filtered rather than crashing the join — both
+correct, because consumers classify those as poison.
+
+## What the tests prove
+
+Thirteen new cases, twelve of which fail against the previous code; the
+thirteenth is declared characterization, not falsification. The six pre-existing
+`TestParseVisionMessages` cases pass unedited — 163 additions, 0 deletions.
+
+The gated live smoke now traverses `parse_vision_messages` instead of entering at
+`get_image_description`, so the strict list branch has real coverage against a
+real `qwen3-vl:4b-instruct`. It asserts on what went **on the wire** — the
+base64 submitted to Ollama decodes to the exact PNG the test generated, and the
+call routed to `vision_model` — because a VLM can name a colour it was never
+shown. A malformed part is proven refused *before* any provider call by spying
+on `client.chat` and asserting it was never invoked; the error message alone
+would not prove ordering, since the Ollama adapter rejects the same part locally.
+
+Full suite: failure identity sets compared before and after are byte-identical,
+100 signatures each side, +14 passed.
 
 ## v0.11.0
 
