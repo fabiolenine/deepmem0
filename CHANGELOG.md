@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### `entity_pipeline_status`: degraded now means unusable
+
+Two states of an unusable entity pipeline were reported as healthy, so a
+readiness probe built on this field answered 200 while extraction ran inert.
+
+**Explicitly configured English with a missing model.** The exemption was
+written as `code != DEFAULT_LANGUAGE`. It protects a real case — a deployment
+that configured NO language never asked for a pipeline, and failing its
+readiness would turn an optional dependency into a mandatory one — but that case
+is *fell back to the default*, not *is the default language*. Choosing English on
+purpose and lacking `en_core_web_sm` leaves extraction exactly as inert as it
+would be in Portuguese. The condition is now `explicito or code !=
+DEFAULT_LANGUAGE`, and `explicitly_configured` is published beside it so a reader
+can tell which branch applied.
+
+**`load_failed` did not contribute at all.** A model that is installed but will
+not load is as inert as one that is absent, and it was the only one of the three
+unavailability states that passed readiness.
+
 ### `AsyncMemory.delete_all` crashed on an empty scope
 
 `hit_page_cap` was assigned only at the end of the pagination loop body, so the
