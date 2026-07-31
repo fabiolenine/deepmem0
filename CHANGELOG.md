@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.12.0
+
+A minor version, not a patch: `normalize_scope_id` is a new PUBLIC function and
+`entity_pipeline_status` gained a field. Everything else here is a fix.
+
+The theme is one failure mode, found three times: a value that is wrong in a way
+that produces **no error**. A padded scope matches nothing and the delete reports
+success; a pipeline that cannot load reports healthy; a readiness field that was
+documented but never existed. None of these crash. All of them are read as
+working.
 
 ### `entity_pipeline_status`: degraded now means unusable
 
