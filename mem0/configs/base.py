@@ -12,14 +12,22 @@ from mem0.vector_stores.configs import VectorStoreConfig
 home_dir = os.path.expanduser("~")
 mem0_dir = os.environ.get("MEM0_DIR") or os.path.join(home_dir, ".mem0")
 
-# Post-rerank near-tie width in sigmoid(logit) space, shared by every post-rerank
-# tie-breaker (ACT-R activation v0.2, event proximity v0.6). It is a property of
-# the RERANKER's score space, not of any one signal, so there is a single source
-# of truth: candidates whose relevance falls within this band are a genuine tie
-# and may be reordered by a secondary signal; outside it the reranker's order is
-# preserved. Calibrated 2026-07-21 from the golden (real near-ties ~0.0002 vs
-# decisive gaps ~0.038). Re-calibrate if the cross-encoder changes.
-RERANK_TIE_BAND = 0.002
+# Post-rerank near-tie width in RELEVANCE space ([0, 1], the BaseReranker score
+# contract), shared by every post-rerank tie-breaker (ACT-R activation v0.2,
+# event proximity v0.6). It is a property of the RERANKER's score space, not of
+# any one signal, so there is a single source of truth: candidates whose
+# relevance falls within this band are a genuine tie and may be reordered by a
+# secondary signal; outside it the reranker's order is preserved.
+#
+# Calibrated 2026-07-21 from the golden as 0.002 against a DOUBLY-sigmoided axis
+# (real near-ties ~0.0002 vs decisive gaps ~0.038 in that space). The second
+# sigmoid was removed on 2026-07-31; 0.008 is that same calibration converted to
+# the real axis, NOT a re-fit: the old band compared d(sigma(r)) = sigma'(r)*dr,
+# and sigma' is 0.2500 at r=0 / 0.2497 at the measured production median
+# r=0.064, so the factor is 4.00 across effectively the whole pool. Near the top
+# of the range (r->1, sigma'=0.1966) the window is ~21% tighter than before —
+# the conservative direction. Re-calibrate if the cross-encoder changes.
+RERANK_TIE_BAND = 0.008
 
 
 class MemoryItem(BaseModel):
@@ -61,12 +69,14 @@ class MemoryDynamicsConfig(BaseModel):
         default=0.15,
     )
     tie_band: float = Field(
-        description="Post-rerank near-tie width in SIGMOID(logit) space. Activation only"
+        description="Post-rerank near-tie width in RELEVANCE space ([0, 1]). Activation only"
         " reorders candidates whose relevance scores fall within this band of each other"
         " (a genuine reranker tie); outside it, the reranker's order is preserved. Calibrated"
-        " 2026-07-21 from the golden: real near-ties ~0.0002 vs decisive gaps ~0.038 (a 190x"
-        " separation), so 0.002 breaks ties without overturning decisions. Reranker-dependent:"
-        " re-calibrate if the cross-encoder changes. 0 = pure reranker order (no tie-break).",
+        " 2026-07-21 from the golden (near-ties ~0.0002 vs decisive gaps ~0.038, a 190x"
+        " separation) against a doubly-sigmoided axis; 0.008 is that calibration converted"
+        " to the real axis after the second sigmoid was removed, not a re-fit. The 190x"
+        " separation is preserved by the conversion. Reranker-dependent: re-calibrate if the"
+        " cross-encoder changes. 0 = pure reranker order (no tie-break).",
         default=RERANK_TIE_BAND,
     )
     reinforcement_window: int = Field(
@@ -172,17 +182,20 @@ class MemoryTemporalityConfig(BaseModel):
         ge=1,
     )
     event_tie_band: float = Field(
-        description="Post-rerank near-tie width (sigmoid space) for the EVENT-proximity tie-break,"
-        " applied ONLY on queries that name a date. Defaults to the shared RERANK_TIE_BAND (0.002)"
+        description="Post-rerank near-tie width (relevance space, [0, 1]) for the EVENT-proximity"
+        " tie-break, applied ONLY on queries that name a date. Defaults to the shared"
+        " RERANK_TIE_BAND (0.008)"
         " — the conservative, no-new-magic-number choice: event proximity breaks the SAME genuine"
         " reranker near-ties ACT-R does, no wider. It is a SEPARATE knob (not shared) so it can be"
         " widened AFTER held-out calibration: the event tie-break is decoupled from the activation"
         " tie-break (each reorders only within its own band), so widening this never widens the"
         " ACT-R window. Bounded — a decisive reranker margin (>> this band) is never overturned."
-        " 0 = event proximity cannot reorder post-rerank. NOTE: raising this above 0.002 without"
+        " 0 = event proximity cannot reorder post-rerank. NOTE: raising this above 0.008 without"
         " calibration data is not validated (measured 2026-07-23: real near-duplicate twins sit at"
-        " ~0.0021, right at the ACT-R threshold; a wider band risks promoting date-matching but"
-        " topically-wrong candidates on close topical negatives — see roadmap follow-up).",
+        " ~0.0021 on the old doubly-sigmoided axis = ~0.0084 in relevance space, i.e. still just"
+        " OUTSIDE the band, exactly as before the conversion; a wider band risks promoting"
+        " date-matching but topically-wrong candidates on close topical negatives — see roadmap"
+        " follow-up).",
         default=RERANK_TIE_BAND,
         ge=0,
     )

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deepmem0"
-version = "0.12.0"
+version = "0.13.0"
 description = "DeepMem0: memory for AI agents with first-class Portuguese and human-like memory dynamics (ACT-R). Fork of mem0 v2.0.7."
 authors = [
     { name = "Alpha Quant AI" }
@@ -109,6 +109,10 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = [
+    "live_model: loads a real model from the HF cache (slow, environment-dependent). Deselected by default; run with -m live_model.",
+]
+addopts = "-m 'not live_model'"
 
 [tool.hatch.build]
 include = [

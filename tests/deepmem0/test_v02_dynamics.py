@@ -175,12 +175,18 @@ class TestActivationPostRerank:
         def real_hours_ago(h):
             return (datetime.now(timezone.utc) - timedelta(hours=h)).isoformat()
 
-        # ⚠️ REALISTIC rerank logits. The bge-reranker-v2-m3 emits logits near
-        # ZERO on this corpus (measured 2026-07-21: golden logits 0.01–0.25),
-        # where sigmoid slope is steepest and gaps compress hardest. The old
-        # fixture used logits 2.0–8.0 (sigmoid ~0.88–1.0), a region the reranker
-        # NEVER reaches — so its "decisive gap" test validated a fantasy and the
-        # real overturning bug went uncaught. cold≈hot here is a TRUE near-tie.
+        # ⚠️ REALISTIC rerank scores. The bge-reranker-v2-m3 scores most of this
+        # corpus near ZERO (measured 2026-07-21: golden 0.01–0.25; the full
+        # production distribution is min 4.7e-05 / median 0.064 / max 0.9999).
+        # An earlier fixture used 2.0–8.0, a region the reranker can NEVER reach
+        # — rerank_score is an absolute relevance in [0, 1], not a logit — so its
+        # "decisive gap" test validated a fantasy and the real overturning bug
+        # went uncaught. cold≈hot here is a TRUE near-tie.
+        #
+        # HISTORY: the 2026-07-21 note called these values "logits" and blamed
+        # the compression on the reranker's operating point. They were already
+        # sigmoid outputs; the compression came from main.py sigmoiding them a
+        # SECOND time. Fixed 2026-07-31 — the instrument, not the system.
         return [
             {
                 "id": "cold",
@@ -193,7 +199,7 @@ class TestActivationPostRerank:
                 "id": "hot",
                 "memory": "atlas_ingest retries thrice",
                 "created_at": real_hours_ago(500),
-                "rerank_score": 0.019,  # sigmoid gap ~0.00025 < tie_band 0.002
+                "rerank_score": 0.019,  # gap 0.001 < tie_band 0.008
                 "metadata": {
                     "reinforced_at": [real_hours_ago(30), real_hours_ago(4)],
                     "access_count": 6,
@@ -202,7 +208,7 @@ class TestActivationPostRerank:
         ]
 
     def test_reinforced_memory_wins_near_tie(self):
-        # genuine tie (gap 0.00025 < tie_band): activation decides → hot wins
+        # genuine tie (gap 0.001 < tie_band 0.008): activation decides → hot wins
         dyn = MemoryDynamicsConfig()
         ordered = _apply_activation_post_rerank(self.make_docs(), dyn)
         assert ordered[0]["id"] == "hot"
@@ -210,11 +216,11 @@ class TestActivationPostRerank:
 
     def test_decisive_rerank_gap_is_not_overturned(self):
         # REAL operating point (regression for the 2026-07-21 overturn bug): the
-        # reranker prefers cold by a decisive 0.25-logit margin (sigmoid gap
-        # ~0.06 >> tie_band). Reinforcement must NOT flip it. The additive form
+        # reranker prefers cold by a decisive 0.25 relevance margin (>> tie_band
+        # 0.008). Reinforcement must NOT flip it. The additive form
         # (base + 0.15*activation) DID flip exactly this, on the live golden.
         docs = self.make_docs()
-        docs[0]["rerank_score"] = 0.27  # vs hot 0.019: sigmoid gap ~0.062
+        docs[0]["rerank_score"] = 0.27  # vs hot 0.019: gap 0.251 >> 0.008
         dyn = MemoryDynamicsConfig()
         ordered = _apply_activation_post_rerank(docs, dyn)
         assert ordered[0]["id"] == "cold"
@@ -859,14 +865,14 @@ class TestSupersededEligibility:
         from mem0.memory.main import _apply_post_rerank_adjustments
         from mem0.configs.base import MemoryTemporalityConfig
 
-        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        dyn = MemoryDynamicsConfig()
         temp = MemoryTemporalityConfig()
         timeline = {"reinforced_at": [hours_ago(48), hours_ago(24)], "access_count": 2}
         docs = [
-            {"id": "old", "rerank_score": 2.0, "created_at": hours_ago(72),
+            {"id": "old", "rerank_score": 0.9, "created_at": hours_ago(72),
              "metadata": {**timeline, "superseded_by": "new",
                           "superseded_at": hours_ago(1)}},
-            {"id": "new", "rerank_score": 2.0, "created_at": hours_ago(1),
+            {"id": "new", "rerank_score": 0.9, "created_at": hours_ago(1),
              "metadata": dict(timeline)},
         ]
         out = _apply_post_rerank_adjustments(docs, dyn=dyn, temp=temp)
@@ -884,9 +890,9 @@ class TestSupersededEligibility:
         from mem0.memory.main import _apply_post_rerank_adjustments
         from mem0.configs.base import MemoryTemporalityConfig
 
-        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        dyn = MemoryDynamicsConfig()
         temp = MemoryTemporalityConfig()
-        docs = [{"id": "old", "rerank_score": 2.0, "created_at": hours_ago(72),
+        docs = [{"id": "old", "rerank_score": 0.9, "created_at": hours_ago(72),
                  "metadata": {"reinforced_at": [hours_ago(48)], "access_count": 1,
                               "superseded_by": "new", "superseded_at": hours_ago(1)}}]
         anchor = NOW - timedelta(hours=24)  # antes da supersedência (1h atrás)
@@ -912,11 +918,11 @@ class TestSupersededEligibility:
         def ago(days):
             return (real_now - timedelta(days=days)).isoformat()
 
-        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        dyn = MemoryDynamicsConfig()
         base_meta = {"reinforced_at": [ago(3), ago(1)], "access_count": 30}
-        with_anchor = [{"id": "a", "rerank_score": 2.0, "created_at": ago(0.001),
+        with_anchor = [{"id": "a", "rerank_score": 0.9, "created_at": ago(0.001),
                         "metadata": {**base_meta, "first_seen_at": ago(365)}}]
-        without = [{"id": "a", "rerank_score": 2.0, "created_at": ago(0.001),
+        without = [{"id": "a", "rerank_score": 0.9, "created_at": ago(0.001),
                     "metadata": dict(base_meta)}]
         got_anchor = _apply_post_rerank_adjustments(with_anchor, dyn=dyn)[0]["activation"]
         got_plain = _apply_post_rerank_adjustments(without, dyn=dyn)[0]["activation"]

@@ -40,6 +40,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+from mem0.configs.base import RERANK_TIE_BAND
+
 os.environ.setdefault("MEM0_TELEMETRY", "False")
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
@@ -48,7 +50,7 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
 LANGUAGE = os.environ.get("MEM0_LANGUAGE", "pt")
 # Event tie-break band (roadmap item 16) + fusion weight, both optional config
-# overrides. None => use the fork default (event_tie_band=0.002, weight=0.15).
+# overrides. None => use the fork default (event_tie_band=0.008, weight=0.15).
 # CLI --event-tie-band wins over the env; resolved in main() after argparse.
 EVENT_TIE_BAND = (float(os.environ["MEM0_EVENT_TIE_BAND"])
                   if os.environ.get("MEM0_EVENT_TIE_BAND") else None)
@@ -119,7 +121,7 @@ def build_memory(rerank: bool, event_ranking: bool = True, temporality_enabled: 
 
     # v0.6 / roadmap item 16: the post-rerank event tie-break band is a config
     # knob (event_tie_band), NOT a search param — build_memory used to hardcode
-    # the temporality dict and silently pin the fork default (0.002), so
+    # the temporality dict and silently pin the fork default (0.008), so
     # `--rerank` could never test a candidate band. Pass it through explicitly
     # (CLI --event-tie-band or MEM0_EVENT_TIE_BAND) and echo the effective value.
     temporality = {"enabled": temporality_enabled, "event_ranking": event_ranking}
@@ -239,7 +241,7 @@ def main() -> int:
     parser.add_argument("--rerank", action="store_true")
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--event-tie-band", type=float, default=None,
-                        help="post-rerank event tie-break band (default: fork 0.002). "
+                        help="post-rerank event tie-break band (default: fork 0.008). "
                              "Overrides MEM0_EVENT_TIE_BAND. Roadmap item 16 calibration.")
     parser.add_argument("--event-weight", type=float, default=None,
                         help="fusion event_ranking_weight (default: fork 0.15). Overrides MEM0_EVENT_WEIGHT.")
@@ -249,7 +251,7 @@ def main() -> int:
     if ARGS.event_weight is not None:
         EVENT_WEIGHT = ARGS.event_weight
 
-    eff_band = EVENT_TIE_BAND if EVENT_TIE_BAND is not None else "0.002(fork default)"
+    eff_band = EVENT_TIE_BAND if EVENT_TIE_BAND is not None else "0.008(fork default)"
     eff_weight = EVENT_WEIGHT if EVENT_WEIGHT is not None else "0.15(fork default)"
     print(f"collection={ARGS.collection} rerank={ARGS.rerank} embed={EMBED_MODEL} qdrant={QDRANT_URL} "
           f"event_tie_band={eff_band} event_weight={eff_weight}")
@@ -263,9 +265,10 @@ def main() -> int:
         # --- A. Anchored ranking: right-dated twin above wrong-dated ----------
         # HARD gate on the FUSION path (the event boost is the primary lever and
         # directly promotes the right-dated twin). On the RERANK path this is
-        # INFORMATIONAL: at the conservative default event_tie_band (0.002) the
+        # INFORMATIONAL: at the conservative default event_tie_band (0.008) the
         # post-rerank tie-break only fires on genuine reranker ties, and real
-        # near-duplicate twins sit at ~0.0021 (measured) — just over the near-tie
+        # near-duplicate twins sit at ~0.0084 in relevance space (measured 0.0021 on
+        # the old doubly-sigmoided axis) — just over the near-tie
         # threshold — so the reranker's (noise) preference stands. Strengthening
         # this needs held-out band calibration (roadmap follow-up); it is NOT a
         # failure of the mechanism, which the fusion path proves.
@@ -279,14 +282,84 @@ def main() -> int:
             elif ARGS.trace:
                 trace(memory_on, pair["query"], ids, f"A-miss right_rank={rr} wrong_rank={wr}")
         gate = "informational" if ARGS.rerank else "HARD"
-        band_note = f" band={EVENT_TIE_BAND if EVENT_TIE_BAND is not None else 0.002}" if ARGS.rerank else ""
+        band_note = f" band={EVENT_TIE_BAND if EVENT_TIE_BAND is not None else 0.008}" if ARGS.rerank else ""
         print(f"[A] correctly-dated twin outranks wrong-dated ({'rerank' if ARGS.rerank else 'fusion'}, "
               f"{gate}{band_note}): {a_wins}/{len(PAIRS)}")
         if not ARGS.rerank and a_wins < len(PAIRS):
             failures.append("A")
 
-        # --- B. No-anchor no-op: ON == OFF on a date-free query ---------------
+        # --- F. HARD rerank-path gate: the tie-break obeys its OWN spec -------
+        # [A] cannot fail on the rerank path without widening the band, which is
+        # the held-out calibration this project has blocked. But the band VALUE
+        # is not the only thing worth gating — the MECHANISM is, and that can be
+        # judged without choosing a value: measure each twin pair's actual
+        # relevance gap at runtime, then require the two halves of the spec.
+        #
+        #   gap <  band  ->  a genuine tie: the dated twin MUST be promoted
+        #   gap >= band  ->  a decision with margin: the reranker's order STANDS
+        #
+        # Band-value-agnostic by construction: re-calibrating the band moves
+        # which branch each pair lands in, never whether the assertion holds.
+        # This is what the critic's "cases bracketing the band" asks for, without
+        # the overfit of hand-picking a pair to sit just inside it.
         memory_off = build_memory(ARGS.rerank, event_ranking=False)
+        if ARGS.rerank:
+            band = EVENT_TIE_BAND if EVENT_TIE_BAND is not None else RERANK_TIE_BAND
+            f_ok, f_total, f_detail, f_branch = 0, 0, [], {"tie": 0, "margin": 0}
+            for pair in PAIRS:
+                resp = search(memory_on, pair["query"], USER_ID, k=6)
+                by_id = {r["id"]: r for r in resp["results"]}
+                right, wrong = by_id.get(ids[pair["right"]]), by_id.get(ids[pair["wrong"]])
+                if not right or not wrong:
+                    continue  # out of pool: [A]/[E] own that, not this gate
+                rs, ws = right.get("rerank_score"), wrong.get("rerank_score")
+                if rs is None or ws is None:
+                    continue
+                f_total += 1
+                gap = abs(rs - ws)
+                order = [r["id"] for r in resp["results"]]
+                right_first = order.index(right["id"]) < order.index(wrong["id"])
+                if gap < band:
+                    f_branch["tie"] += 1
+                    ok = right_first          # genuine tie -> date decides
+                    why = "tie -> dated twin must win"
+                else:
+                    f_branch["margin"] += 1
+                    # Compared against an INDEPENDENTLY captured reference (the
+                    # same query with event_ranking OFF), NOT against this
+                    # pipeline's own scores: `base` is monotonic in rerank_score,
+                    # so `right_first == (rs > ws)` is true by construction
+                    # whenever no tie-break fires — it would pass vacuously
+                    # exactly when there is nothing to check.
+                    off_order = ranked_ids(memory_off, pair["query"], k=6)
+                    if right["id"] not in off_order or wrong["id"] not in off_order:
+                        f_detail.append("margin: par fora do pool com event_ranking OFF")
+                        ok = False
+                    else:
+                        ok = right_first == (off_order.index(right["id"])
+                                             < off_order.index(wrong["id"]))
+                    why = "margin -> order must equal the event_ranking=OFF reference"
+                f_ok += ok
+                if not ok:
+                    f_detail.append(f"gap={gap:.6f} band={band} {why}")
+            print(f"[F] rerank tie-break obeys its own spec (HARD, band={band}): {f_ok}/{f_total}"
+                  f"  [ramos: tie={f_branch['tie']} margin={f_branch['margin']}]")
+            for d in f_detail:
+                print(f"    [F-miss] {d}")
+            if f_total == 0:
+                print("    [F] INCONCLUSIVO: nenhum par com rerank_score em ambos os gêmeos")
+                failures.append("F")
+            elif not (f_branch["tie"] and f_branch["margin"]):
+                # A gate whose coverage depends on where the corpus happened to
+                # fall is not a gate. With event_tie_band=0 (a legal config)
+                # EVERY pair lands in `margin` and the tie half is never tested.
+                print(f"    [F] INCONCLUSIVO: os dois ramos precisam de casos "
+                      f"(tie={f_branch['tie']} margin={f_branch['margin']})")
+                failures.append("F")
+            elif f_ok < f_total:
+                failures.append("F")
+
+        # --- B. No-anchor no-op: ON == OFF on a date-free query ---------------
         b_ok = 0
         no_date_queries = ["fale sobre o deploy do faturamento", "o que houve com o gateway de pagamentos"]
         for q in no_date_queries:

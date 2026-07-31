@@ -1,5 +1,136 @@
 # Changelog
 
+## v0.13.0
+
+A minor version because ranking constants change value, not because anything new
+is exposed. The theme is the one from v0.12.0 seen from the other side: there,
+values that were wrong in a way that produced no error. Here, a transform that
+was wrong in a way that produced no *reordering* — and so survived nine months
+of measurement.
+
+### `rerank_score` was sigmoided twice
+
+`_apply_post_rerank_adjustments` computed `1 / (1 + e^-rerank_score)`, treating
+the reranker's output as a raw cross-encoder logit. It is not one. Every
+provider already emits an absolute [0, 1] relevance: sentence-transformers
+applies `nn.Sigmoid` for a `num_labels=1` cross-encoder (which
+`BAAI/bge-reranker-v2-m3` is), Cohere and ZeroEntropy return `relevance_score`,
+the LLM reranker scores 0-1, and HuggingFace normalizes.
+
+Measured over 370 recorded production scores: min 4.7e-05, median 0.064, max
+0.999884, **zero negative, zero above 1**. A logit spans roughly [-10, +10] and
+goes negative for an irrelevant pair.
+
+The proof needs no measurement, though. In the same `if/else`, `base` was a
+cosine in [0, 1] on one branch and a doubly-sigmoided value in [0.5, 0.731] on
+the other, and both had the same `superseded_penalty` subtracted and the same
+tie band applied.
+
+**The UNADJUSTED order never moved**, which is why it lasted: a sigmoid is
+monotonic, so with no penalty and no tie-break the primary sort is exactly the
+reranker's own order in either space. That invariance does not extend to the
+ADJUSTED order — subtracting a constant and grouping by a fixed band are not
+scale-free, and that is precisely what broke. What was distorted:
+
+* **the superseded penalty.** 0.2, documented as a "[0, 1] scale" constant,
+  against an axis whose real width was 0.231 — 86% of the reachable range
+  instead of 20%. It stopped being a demotion and became an override; no
+  in-contract pair could ever clear it.
+* **the tie bands.** Calibrated *in* the compressed space, so they were
+  self-consistent and no measurement caught them — but the constant no longer
+  meant what its name said.
+
+A provider that breaks the contract is now CLAMPED and warned once, not
+sigmoided: guessing that an out-of-range value "must be a logit" would re-enter
+the bug for anything merely miscalibrated. Clamping is monotonic and the sort is
+stable, so ranking order survives; the penalty and bands do not, and the warning
+says so.
+
+### `RERANK_TIE_BAND` 0.002 → 0.008 is a unit conversion
+
+Not a re-fit. The band compared `d(sigma(r)) = sigma'(r) * dr` and now compares
+`dr`; `sigma'` is 0.2500 at r=0 and 0.2497 at the measured production median
+r=0.064, so the factor is 4.00 across effectively the whole pool. The 190x
+separation the 2026-07-21 calibration found between near-ties and decisive gaps
+is preserved.
+
+Replayed over 407 recorded production candidate pools (3663 adjacent pairs),
+reproducing the real leader-anchored grouping: **11 pools differ, from 2 distinct
+pairs**, both at the top of the range where `sigma'` is smallest (0.1966), both
+`tie -> decisive`. **Zero** went the other way. The window only ever narrows,
+which is the conservative direction.
+
+### HuggingFace reranker: min-max → sigmoid (upstream PR #5715)
+
+Ported, not rebased. Min-max produced *set-relative* scores: the lowest-ranked
+document was pinned to 0.0, and a single document or an all-tied set collapsed to
+0.0 — reporting a relevant result as completely irrelevant.
+
+Computed in the numerically stable form. Upstream's `1 / (1 + np.exp(-arr))`
+overflows for large negative logits; numpy returns the right number with a
+RuntimeWarning, so it is right for the wrong reason, once per such document.
+
+`normalize=False` still emits raw logits and now warns at construction that it
+breaks the contract, rather than letting the downstream clamp look like it
+worked.
+
+### Tests
+
+Eleven of thirteen synthetic `rerank_score` values in the suite were ≥ 2.0 —
+including the supersedence fixture (2.10 vs 2.00), where the clamp would have
+collapsed both to 1.0 and dissolved the "slightly more similar" premise the test
+exists to check. All converted; out-of-range values now appear only in the
+dedicated clamp test. Fixtures were converted to preserve each test's gap-to-band
+RATIO, not its number — converting by `sigma()` would have reproduced the old
+`base` exactly while the band moved 4x underneath it.
+
+Seven targeted mutations, one per property (double sigmoid at the call site; at
+the helper; clamp removed; warning dedup removed; band reverted; min-max
+restored; naive sigmoid), each failing in the test that covers it. Full fork
+suite: 128 known signatures, 0 new, 0 changed.
+
+The premise itself is pinned, because nothing in this repo enforces it: a
+sentence-transformers upgrade that changed the `num_labels=1` default would
+silently push every score out of contract and quietly flatten the penalty and
+the bands. `tests/rerankers/test_sentence_transformer_score_space.py` asserts the
+default-selection rule against a stub (with the `num_labels>1 -> Identity`
+counterfactual, so it is not vacuous) and that `predict` actually APPLIES the
+activation rather than merely holding it. The real `bge-reranker-v2-m3` probe
+lives behind a new `live_model` marker, deselected by default — it costs ~19s and
+needs the HF cache, which would make the normal suite environment-dependent. It
+asserts both that scores land in [0, 1] and that they still DISCRIMINATE, since
+bounded-but-constant would pass a range check while proving nothing.
+
+`eval/eval_event_date.py` gained criterion **[F]**, a HARD gate on the rerank
+path — the path the band change actually touches, and the one where [A] is
+declared informational because strengthening it would need the held-out band
+calibration this project has deferred. [F] sidesteps that: it measures each twin
+pair's real relevance gap at runtime and asserts the mechanism's own
+specification, `gap < band -> the dated twin must be promoted` and
+`gap >= band -> the reranker's order stands`. Band-value-agnostic by
+construction — re-calibrating moves which branch a pair lands in, never whether
+the assertion holds — so it gates the mechanism without hand-picking a pair to
+sit just inside the band.
+
+Two things make it a gate rather than a formality. The `margin` half compares
+against an INDEPENDENTLY captured reference (the same query with
+`event_ranking=OFF`), not against the pipeline's own scores: `base` is monotonic
+in `rerank_score`, so "the order agrees with the scores" is true by construction
+whenever no tie-break fires — it would pass vacuously exactly when there is
+nothing to check. And **both branches are required**: with `event_tie_band=0`, a
+legal config, every pair lands in `margin` and the tie half is never exercised,
+so that case now reports INCONCLUSIVE and fails instead of passing 3/3.
+
+Measured 3/3 with both branches populated (tie=1 at a real gap of 0.002066,
+margin=2), and each half falsified separately: inverting the event tie-break key
+fails the tie half, an unbounded band fails the margin half, and
+`--event-tie-band 0` fails on coverage.
+
+`TestProductionConfigIsInert` covers the DEPLOYED configuration
+(`MEM0_DYNAMICS_WEIGHT=0`, `MEM0_DYNAMICS_TIE_BAND=0`), which `eval_temporal.py`
+does not: that eval builds `{"dynamics": {"enabled": ...}}` and inherits the fork
+defaults, so it never exercised the zeros production actually runs.
+
 ## v0.12.0
 
 A minor version, not a patch: `normalize_scope_id` is a new PUBLIC function and

@@ -156,12 +156,16 @@ class TestPostRerankAdjustments:
         def real_days_ago(d):
             return (datetime.now(timezone.utc) - timedelta(days=d)).isoformat()
 
+        # rerank_score is an absolute relevance in [0, 1] (BaseReranker contract).
+        # `old` is SLIGHTLY more relevant (gap 0.01, well inside the 0.2 penalty)
+        # — that is the premise: the penalty must demote it anyway, and waiving
+        # the penalty under as_of must hand the top back to it.
         return [
             {
                 "id": "old",
                 "memory": "orion backups run weekly",
                 "created_at": real_days_ago(60),
-                "rerank_score": 2.10,
+                "rerank_score": 0.91,
                 "metadata": {
                     "superseded_by": "new",
                     "superseded_at": real_days_ago(5),
@@ -171,7 +175,7 @@ class TestPostRerankAdjustments:
                 "id": "new",
                 "memory": "orion backups run daily",
                 "created_at": real_days_ago(5),
-                "rerank_score": 2.00,
+                "rerank_score": 0.90,
                 "metadata": {},
             },
         ]

@@ -72,14 +72,14 @@ class TestHistoricalMasksActivation:
     def _docs(self):
         timeline = {"reinforced_at": [hours_ago(48), hours_ago(24)], "access_count": 2}
         return [
-            {"id": "a", "rerank_score": 2.0, "created_at": hours_ago(72),
+            {"id": "a", "rerank_score": 0.9, "created_at": hours_ago(72),
              "metadata": dict(timeline)},
-            {"id": "b", "rerank_score": 2.0, "created_at": hours_ago(72),
+            {"id": "b", "rerank_score": 0.9, "created_at": hours_ago(72),
              "metadata": {}},
         ]
 
     def test_post_rerank_activation_inert_under_historical(self):
-        dyn = MemoryDynamicsConfig(tie_band=0.002)
+        dyn = MemoryDynamicsConfig()
         normal = _apply_post_rerank_adjustments(self._docs(), dyn=dyn)
         hist = _apply_post_rerank_adjustments(self._docs(), dyn=dyn, historical=True)
         assert any("activation" in d for d in normal), "controle: no default a ativação existe"
@@ -90,7 +90,7 @@ class TestHistoricalMasksActivation:
         # a máscara do modo é SÓ sobre ativação — penalidade de supersedido e
         # event-proximity continuam (são relevância da época, não uso de hoje)
         temp = MemoryTemporalityConfig()
-        docs = [{"id": "old", "rerank_score": 2.0, "created_at": hours_ago(72),
+        docs = [{"id": "old", "rerank_score": 0.9, "created_at": hours_ago(72),
                  "metadata": {"superseded_by": "new", "superseded_at": hours_ago(1)}}]
         out = _apply_post_rerank_adjustments(docs, temp=temp, historical=True)
         assert out[0].get("superseded_penalty") == temp.superseded_penalty

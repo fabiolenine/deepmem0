@@ -1520,22 +1520,70 @@ def _reinforce_hits_in_background(vector_store, dyn, targets) -> None:
                                   {"search_id": t.search_id, "rank": t.rank})
 
 
+_rerank_contract_warned = False
+
+
+def _relevance_from_rerank_score(rerank_score) -> float:
+    """Read a reranker score as RELEVANCE, per the ``BaseReranker`` contract.
+
+    ``rerank_score`` is already an absolute relevance in [0, 1] — every provider
+    emits one (sentence-transformers applies ``nn.Sigmoid`` for ``num_labels=1``
+    cross-encoders; Cohere and ZeroEntropy return ``relevance_score``; the LLM
+    reranker scores 0-1; HuggingFace sigmoids its logits). This used to apply a
+    sigmoid here, which was a SECOND sigmoid: it squeezed [0, 1] into
+    [0.5, 0.731], so the superseded penalty (0.2, documented as a [0, 1]-scale
+    constant) consumed 86% of the available range instead of 20%, and the tie
+    bands measured a compressed axis.
+
+    It went unnoticed because the UNADJUSTED order is invariant: a sigmoid is
+    monotonic, so with no penalty and no tie-break the primary sort is exactly
+    the reranker's own order either way. That invariance does NOT extend to the
+    adjusted order — subtracting a constant and grouping by a fixed band are not
+    scale-free, which is the whole reason this mattered. Measured over 407
+    recorded production pools, 11 group differently under the two spaces.
+
+    A provider that breaks the contract (e.g. ``HuggingFaceReranker`` with
+    ``normalize=False``, which emits raw logits) is CLAMPED, not sigmoided:
+    guessing that an out-of-range value must be a logit would silently re-enter
+    the bug for anything that is merely miscalibrated. Clamping is monotonic and
+    the sort below is stable over the reranker's own ordering, so ranking ORDER
+    survives; the penalty and the tie bands do not. Warned once per process —
+    this fires per document, and a per-call warning would bury the log.
+    """
+    global _rerank_contract_warned
+    value = float(rerank_score)
+    if 0.0 <= value <= 1.0:
+        return value
+    if not _rerank_contract_warned:
+        _rerank_contract_warned = True
+        logger.warning(
+            "rerank_score %r is outside the [0, 1] contract (see BaseReranker); "
+            "clamping. Ranking order is preserved, but the superseded penalty and "
+            "the post-rerank tie bands are degraded. A reranker configured to emit "
+            "raw logits (e.g. normalize=False) is the usual cause.",
+            value,
+        )
+    # NaN fails every comparison, so max() returns 0.0 — fail low, not through.
+    return min(1.0, max(0.0, value))
+
+
 def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, event_anchor=None, historical=False) -> List[Dict[str, Any]]:
     """Blend ACT-R activation (v0.2), the superseded penalty (v0.3) and event-time
     proximity (v0.6) into the reranked order.
 
-    RELEVANCE is the sigmoid of the cross-encoder logit; the superseded penalty
-    (v0.3) is subtracted from it — deliberately strong enough that a superseded
-    fact loses to its current replacement even when slightly more similar, waived
-    for memories superseded only after an ``as_of`` anchor.
+    RELEVANCE is the reranker's score, an absolute [0, 1] relevance (see
+    ``_relevance_from_rerank_score``); the superseded penalty (v0.3) is
+    subtracted from it — deliberately strong enough that a superseded fact loses
+    to its current replacement even when slightly more similar, waived for
+    memories superseded only after an ``as_of`` anchor.
 
     ACT-R activation (v0.2) and event proximity (v0.6) are BOUNDED TIE-BREAKERS,
     never additive terms. Measured 2026-07-21: the additive form
-    (``base + weight*activation``) overturned DECISIVE reranker gaps because the
-    sigmoid compresses small logits into a narrow band around 0.5 — a 0.15-logit
-    reranker preference became a 0.06 sigmoid gap that a reinforced 0.08 boost
-    flipped. The factorial ablation over the golden showed the additive form was
-    net-negative (hit@1 0.914 vs 0.943 without it). So these signals only reorder
+    (``base + weight*activation``) overturned DECISIVE reranker gaps, because the
+    reranker's real operating range on this corpus is narrow — a 0.15 relevance
+    preference was flipped by a reinforced 0.08 boost. The factorial ablation
+    over the golden showed the additive form was net-negative (hit@1 0.914 vs
+    0.943 without it). So these signals only reorder
     candidates that are within the shared reranker tie band of each other — a
     genuine reranker tie — and never touch a decision the reranker made with
     margin. Within a tie, the secondary key is ``(event_proximity, activation)``:
@@ -1573,7 +1621,7 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
         if rerank_score is None:
             base = doc.get("score") or 0.0
         else:
-            base = 1.0 / (1.0 + math.exp(-rerank_score))
+            base = _relevance_from_rerank_score(rerank_score)
         # v0.9: the superseded decision comes FIRST — it both applies the
         # penalty (as before) and MASKS activation: with the timeline copied to
         # the successor, boosting the old version too would double-dip. Same
@@ -1610,7 +1658,7 @@ def _apply_post_rerank_adjustments(memories, dyn=None, temp=None, as_of=None, ev
             base -= temp.superseded_penalty
         enriched.append({"doc": doc, "base": base, "boost": boost, "eprox": eprox})
 
-    # Primary order: relevance (reranker sigmoid minus superseded penalty).
+    # Primary order: relevance (reranker score minus superseded penalty).
     enriched.sort(key=lambda e: e["base"], reverse=True)
     if not dyn_active and not event_active:
         return [e["doc"] for e in enriched]

@@ -249,15 +249,16 @@ class TestScoreAndRankEvent:
 class TestEventPostRerank:
     """The tie-break must never overturn a decision the reranker made with margin."""
 
-    def _doc(self, i, logit, event_date=None):
+    def _doc(self, i, score, event_date=None):
+        """score is an absolute relevance in [0, 1] (BaseReranker contract)."""
         meta = {"event_date": event_date} if event_date else {}
-        return {"id": i, "rerank_score": logit, "metadata": meta}
+        return {"id": i, "rerank_score": score, "metadata": meta}
 
     ANCHOR = ("2023-10-17", "2023-10-17")
 
     def test_within_band_proximity_wins(self):
         temp = MemoryTemporalityConfig()
-        docs = [self._doc("x", 2.0, "2020-01-01"), self._doc("y", 2.0, "2023-10-17")]
+        docs = [self._doc("x", 0.88, "2020-01-01"), self._doc("y", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert [d["id"] for d in out] == ["y", "x"]
 
@@ -265,13 +266,13 @@ class TestEventPostRerank:
         # x is decisively higher on the reranker (>> tie band); y matches the
         # anchor exactly. y must NOT be promoted. This is the whole point.
         temp = MemoryTemporalityConfig()
-        docs = [self._doc("x", 5.0, "2020-01-01"), self._doc("y", 1.0, "2023-10-17")]
+        docs = [self._doc("x", 0.9933, "2020-01-01"), self._doc("y", 0.7311, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "x"
 
     def test_no_anchor_preserves_order(self):
         temp = MemoryTemporalityConfig()
-        docs = [self._doc("x", 2.0, "2020-01-01"), self._doc("y", 2.0, "2023-10-17")]
+        docs = [self._doc("x", 0.88, "2020-01-01"), self._doc("y", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=None)
         assert [d["id"] for d in out] == ["x", "y"]
 
@@ -280,8 +281,8 @@ class TestEventPostRerank:
         dyn = MemoryDynamicsConfig()
         # both match the anchor equally; the reinforced one should win on activation
         docs = [
-            self._doc("x", 2.0, "2023-10-17"),
-            self._doc("y", 2.0, "2023-10-17"),
+            self._doc("x", 0.88, "2023-10-17"),
+            self._doc("y", 0.88, "2023-10-17"),
         ]
         docs[1]["metadata"]["reinforced_at"] = ["2099-01-01T00:00:00+00:00"] * 3
         docs[1]["metadata"]["access_count"] = 3
@@ -291,13 +292,13 @@ class TestEventPostRerank:
     def test_weight_zero_tie_break_still_active(self):
         # escape hatch: fusion off (weight=0) but tie-break still reorders ties
         temp = MemoryTemporalityConfig(event_ranking_weight=0)
-        docs = [self._doc("x", 2.0, "2020-01-01"), self._doc("y", 2.0, "2023-10-17")]
+        docs = [self._doc("x", 0.88, "2020-01-01"), self._doc("y", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "y"
 
     def test_dyn_none_uses_shared_tie_band(self):
         temp = MemoryTemporalityConfig()
-        docs = [self._doc("x", 2.0, "2020-01-01"), self._doc("y", 2.0, "2023-10-17")]
+        docs = [self._doc("x", 0.88, "2020-01-01"), self._doc("y", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, dyn=None, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "y"
 
@@ -305,7 +306,7 @@ class TestEventPostRerank:
         # dyn.tie_band=0 disables the ACT-R tie-break (no event anchor here, so the
         # event band is not in play). A reinforced twin must NOT be promoted.
         dyn = MemoryDynamicsConfig(tie_band=0)
-        docs = [self._doc("x", 2.0, None), self._doc("y", 2.0, None)]
+        docs = [self._doc("x", 0.88, None), self._doc("y", 0.88, None)]
         docs[1]["metadata"]["reinforced_at"] = ["2099-01-01T00:00:00+00:00"] * 3
         docs[1]["metadata"]["access_count"] = 3
         out = _apply_post_rerank_adjustments(docs, dyn=dyn, event_anchor=None)
@@ -313,42 +314,42 @@ class TestEventPostRerank:
 
     def test_event_ranking_off_no_effect(self):
         temp = MemoryTemporalityConfig(event_ranking=False)
-        docs = [self._doc("x", 2.0, "2020-01-01"), self._doc("y", 2.0, "2023-10-17")]
+        docs = [self._doc("x", 0.88, "2020-01-01"), self._doc("y", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert [d["id"] for d in out] == ["x", "y"]
 
     def test_default_band_is_conservative(self):
-        # At the DEFAULT band (0.002 = ACT-R), a pair the reranker separates by
-        # ~0.005 sigmoid is NOT reordered — the conservative, no-overfit default.
+        # At the DEFAULT band (0.008 = ACT-R), a pair the reranker separates by
+        # 0.02 relevance is NOT reordered — the conservative, no-overfit default.
         temp = MemoryTemporalityConfig()  # event_tie_band == RERANK_TIE_BAND
-        docs = [self._doc("wrong", 2.05, "2020-01-01"), self._doc("right", 2.0, "2023-10-17")]
+        docs = [self._doc("wrong", 0.90, "2020-01-01"), self._doc("right", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "wrong"
 
     def test_widened_event_band_reorders_near_ties(self):
         # An explicitly WIDENED event band (post-calibration use) reorders a pair
-        # the reranker separated by ~0.005 (< the widened band) toward the date.
+        # the reranker separated by 0.02 (< the widened band) toward the date.
         temp = MemoryTemporalityConfig(event_tie_band=0.05)
-        docs = [self._doc("wrong", 2.05, "2020-01-01"), self._doc("right", 2.0, "2023-10-17")]
+        docs = [self._doc("wrong", 0.90, "2020-01-01"), self._doc("right", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "right"
 
     def test_widened_event_band_still_bounded(self):
         # Even a widened event band never overturns a decisive reranker margin.
         temp = MemoryTemporalityConfig(event_tie_band=0.05)
-        docs = [self._doc("wrong", 3.5, "2020-01-01"), self._doc("right", 1.0, "2023-10-17")]
+        docs = [self._doc("wrong", 0.9707, "2020-01-01"), self._doc("right", 0.7311, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "wrong"
 
     def test_widened_event_band_does_not_contaminate_activation(self):
         # REGRESSION (measured bug 2026-07-23): a widened EVENT band must NOT widen
         # the ACT-R activation window. Two UNDATED candidates on a DATED query,
-        # reranker gap ~0.003 (> ACT-R 0.002, < event 0.05), the lower one heavily
-        # reinforced: activation must NOT promote it (its window stays 0.002), even
+        # reranker gap 0.012 (> ACT-R 0.008, < event 0.05), the lower one heavily
+        # reinforced: activation must NOT promote it (its window stays 0.008), even
         # though the event band is wide — the two tie-breaks are decoupled.
         temp = MemoryTemporalityConfig(event_tie_band=0.05)
         dyn = MemoryDynamicsConfig()
-        docs = [self._doc("x", 2.03, None), self._doc("y", 2.0, None)]
+        docs = [self._doc("x", 0.892, None), self._doc("y", 0.880, None)]
         docs[1]["metadata"]["reinforced_at"] = ["2099-01-01T00:00:00+00:00"] * 5
         docs[1]["metadata"]["access_count"] = 5
         out = _apply_post_rerank_adjustments(docs, dyn=dyn, temp=temp, event_anchor=self.ANCHOR)
@@ -356,13 +357,13 @@ class TestEventPostRerank:
 
     def test_event_tie_band_zero_disables_event_reorder(self):
         temp = MemoryTemporalityConfig(event_tie_band=0)
-        docs = [self._doc("wrong", 2.0, "2020-01-01"), self._doc("right", 2.0, "2023-10-17")]
+        docs = [self._doc("wrong", 0.88, "2020-01-01"), self._doc("right", 0.88, "2023-10-17")]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         assert out[0]["id"] == "wrong"  # band 0 → reranker order stands even on an exact tie
 
     def test_event_proximity_annotated_on_matching_doc(self):
         temp = MemoryTemporalityConfig()
-        docs = [self._doc("y", 2.0, "2023-10-17"), self._doc("x", 2.0, None)]
+        docs = [self._doc("y", 0.88, "2023-10-17"), self._doc("x", 0.88, None)]
         out = _apply_post_rerank_adjustments(docs, temp=temp, event_anchor=self.ANCHOR)
         by_id = {d["id"]: d for d in out}
         assert by_id["y"]["event_proximity"] == 1.0
@@ -376,8 +377,9 @@ class TestEventPostRerank:
         # lower-base item to the front, the event group's leader base DROPS, so a
         # dated candidate enters the event tie group at a NARROWER band than it
         # would from the original base leader.
-        #   bases: A=sig(0.006)=.50150  B=sig(0)=.5000  C=sig(-0.020)=.4950
-        #   A-B=.0015 (< ACT-R 0.002 -> B promoted)  B-C=.0050  A-C=.0065
+        #   bases: A=.5015  B=.5000  C=.4950 (the relevances the old doubly-
+        #   sigmoided fixture produced, carried over verbatim)
+        #   A-B=.0015 (< ACT-R 0.008 -> B promoted)  B-C=.0050  A-C=.0065
         # With ACT-R OFF the event leader is A: C rises only at band > A-C (.0065).
         # With ACT-R ON, B (reinforced) leads: C rises at band > B-C (.0050). At
         # band 0.006 the two diverge — proof the interaction is real (so an
@@ -386,11 +388,11 @@ class TestEventPostRerank:
         recent = ["2099-01-01T00:00:00+00:00"] * 3
 
         def pool():
-            a = self._doc("A", 0.006, None)
-            b = self._doc("B", 0.000, None)
+            a = self._doc("A", 0.5015, None)
+            b = self._doc("B", 0.5000, None)
             b["metadata"]["reinforced_at"] = recent
             b["metadata"]["access_count"] = 3
-            c = self._doc("C", -0.020, "2023-10-17")
+            c = self._doc("C", 0.4950, "2023-10-17")
             return [a, b, c]
 
         temp = MemoryTemporalityConfig(event_tie_band=band)
@@ -438,7 +440,7 @@ class TestConfigBounds:
         assert t.event_ranking is True
         assert t.event_ranking_weight == 0.15
         assert t.event_window_days == 30
-        assert t.event_tie_band == RERANK_TIE_BAND  # conservative default (0.002)
+        assert t.event_tie_band == RERANK_TIE_BAND  # conservative default (0.008)
 
     def test_event_tie_band_negative_rejected(self):
         with pytest.raises(Exception):
