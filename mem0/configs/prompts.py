@@ -1060,6 +1060,54 @@ def build_temporality_suffix(include_event_date: bool = True) -> str:
     return suffix
 
 
+# DeepMem0 v0.15: appended ONLY when the conversation actually needs the model to
+# decide a speaker — two or more named speakers, or a mix of named and anonymous
+# turns. A conversation where every extractable turn carries the SAME speaker is
+# resolved in code, and a conversation with no speaker at all is today's traffic:
+# neither pays a single token for this block.
+#
+# That gating is not an optimization, it is the num_ctx budget. The extraction
+# prompt floor is already ~8.6k tokens of 20480, and this system has MEASURED a
+# silent total loss of facts when the prompt approached the ceiling (the model
+# returns {"memory": []} — valid JSON, no error, nothing in the log).
+SPEAKER_ATTRIBUTION_SUFFIX_TEMPLATE = """
+
+## Speaker Attribution
+
+New Messages are rendered one turn per line as `role: text`, or
+`role (Speaker): text` when that turn's speaker is known. This conversation has
+more than one speaker, or mixes known and unknown speakers.
+
+### Additional output field
+
+- **actor_id** (string): the speaker who STATED the fact. Copy the label EXACTLY
+  as written inside the parentheses of the source turn.
+  The ONLY permitted values are: {rotulos}
+- REQUIRED whenever the source turn shows a speaker in parentheses. Emit it for
+  EVERY such fact, however many facts you produce.
+- OMIT it only when the fact comes from a turn with NO speaker in parentheses,
+  or when it merges what two different speakers said. Never guess, and never
+  invent a label that is not in the list above.
+- `actor_id` is WHO SPOKE, and is independent of `attributed_to`. A speaker may
+  state a fact about someone else: in that case `actor_id` is still the speaker.
+
+Mapping, for the turn `assistant (Bruno): ...` ->
+{{"id": "0", "text": "...", "attributed_to": "assistant", "actor_id": "Bruno"}}
+"""
+
+
+def build_speaker_attribution_suffix(rotulos) -> str:
+    """DeepMem0 v0.15: extraction-prompt suffix for per-fact speaker attribution.
+
+    `rotulos` is the CLOSED SET of speaker labels that actually reached the
+    rendered prompt. Enumerating it in the prompt and validating against the same
+    set in code is what makes a hallucinated speaker inert rather than stored.
+    """
+    return SPEAKER_ATTRIBUTION_SUFFIX_TEMPLATE.format(
+        rotulos=", ".join(f'"{r}"' for r in sorted(rotulos))
+    )
+
+
 # ---------------------------------------------------------------------------
 # V3 Prompt Builder — constructs the user-side prompt for additive extraction
 # Ported from platform/backend/shared/core/utils/prompt_builder.py

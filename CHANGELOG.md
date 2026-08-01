@@ -1,5 +1,135 @@
 # Changelog
 
+## v0.15.0
+
+Speaker attribution: **who said this**, per extracted fact. A minor version
+because it changes what reads return and what writes store, not because the
+shape of the API moved.
+
+### `attributed_to` was a write-only dead value
+
+The field was written on every `add` with `infer=True` and returned by no
+reader. It sat in `core_and_promoted_keys` — which EXCLUDES it from the
+`metadata` bucket — and was absent from `promoted_payload_keys`, which is what
+actually copies to the result. It fell through the gap between the two.
+
+Measured in a production corpus before the fix: **1079 of 1218 memories (88.6%)**
+carried it and none of them showed it. It is now promoted at all six read sites
+(get/get_all/search × sync/async), guarded by `if key in payload`.
+
+The documented vocabulary said `user | assistant`. Production also holds
+`document`, emitted under the document-ingestion prompt. The real vocabulary has
+three values and is now written down as such; nothing is validated
+retroactively, because rejecting `document` would invalidate 171 legitimate
+memories.
+
+### The extractor could not see the speaker
+
+`parse_messages` rendered `role: content` and dropped the OpenAI-style `name`
+field, so the prompt's own instruction to attribute facts "to the speaker by
+name" could not be followed — the input never carried the name. Turns with a
+speaker now render as `role (Speaker): content`; turns without one render
+byte-identically to before.
+
+`parse_vision_messages` rebuilds a message from scratch in its three multimodal
+branches, and the speaker evaporated there. Attribution would have worked on
+plain text and silently vanished on a message with an image.
+
+### The speaker label is sanitized before it reaches the prompt
+
+The label is caller text entering a prompt whose grammar is one turn per line. A
+`name` containing a newline forges entire turns in the conversation the
+extractor reads — prompt injection through a structured field, not through free
+content. Labels are NFKC-normalized, whitespace-collapsed, and rejected outright
+on control characters or excess length. Rejection is total: the turn becomes
+anonymous rather than half-sanitized, because a half-sanitized label is one the
+caller never wrote and no one can query later.
+
+Deliberately NOT casefolded, for the same reason `user_id` is not: it would
+merge distinct people. The declared cost is the inverse — `Maria` and `maria`
+are different speakers.
+
+### The model proposes, the code decides
+
+A conversation where every extractable turn carries the SAME speaker is resolved
+in code, with no model involvement. That is not "one distinct name": a
+conversation of `[user name=Maria, assistant unnamed]` has exactly one distinct
+name, and attributing everything to Maria would hand her the facts the assistant
+produced. Uniformity across all extractable turns is the condition.
+
+Otherwise a conditional prompt suffix enumerates the CLOSED SET of speakers that
+actually reached the rendered prompt, and the emitted value is stored only if it
+is a `str` that canonicalizes into that set. Wrong type, invented name, or a
+label from a turn the model never saw: the field is omitted. Absence is exactly
+the previous behaviour and is safe; a wrong label is corruption nothing detects
+by looking at the result.
+
+The suffix exists ONLY on the path that needs it. Conversations with no speaker
+— all of today's traffic — and uniform conversations pay zero tokens. That is
+the `num_ctx` budget, not an optimization: the extraction prompt floor is
+already ~42% of the window, and this system has measured a silent total loss of
+facts when the prompt approached the ceiling.
+
+### Ownership scope was immutable in one update path and forgeable in the other
+
+`_build_version_metadata` (versioned update) already imposed the head's exact
+ownership scope *including its absence*. The legacy in-place update only knew how
+to PRESERVE an existing value, so `update(id, data, metadata={"actor_id": "X"})`
+stamped authorship onto a memory that had none — and "none" is the state of every
+legacy memory. The guard protected a written value and accepted writing one from
+scratch, which stops authorship from being rewritten but not from being forged.
+The same asymmetry applied to `user_id`/`agent_id`/`run_id`, i.e. scope
+escalation.
+
+Both paths now call one function, because it was the divergence between them
+that opened the hole. The rule the module's own comment already declared —
+*"a caller can neither change nor ADD a scope the head does not have"* — now
+holds on both.
+
+### Reading by speaker
+
+`actor_id` was already promoted and indexed; only the write was missing. Read
+filters now canonicalize `actor_id` with the SAME function as the write, because
+Qdrant matches exactly and a filter that diverges by one space returns nothing
+without erroring. An unusable label raises instead of being dropped from the
+filter: dropping it would widen the query to the whole scope and return every
+speaker's memories as if they were one speaker's.
+
+`attributed_to` gains a payload index, created online on existing collections at
+the next startup.
+
+### Config
+
+`MEM0_SPEAKER_ATTRIBUTION` (default on) disables the suffix, the write, and the
+scope rule together. Read per call, so a service restart is enough. An
+unrecognized value falls back to ON: a typo must not silently disable a feature
+the operator believes is running.
+
+### Measured
+
+`eval/eval_speaker_attribution.py` — hard-gates the MECHANISM (uniform path is
+deterministic and costs zero tokens; mixed named/anonymous does not take the fast
+path; nothing outside the closed set is ever stored; the kill switch really
+kills; prompt budget). Attribution QUALITY is reported but does not gate, because
+its oracle is judgement over a 9B model's output and a gate that oscillates is
+not a gate.
+
+On a reference deployment with a local 9B extractor: suffix costs 271 tokens;
+worst-case prompt 50.9% of `num_ctx`; uniform path delta ZERO tokens. Attribution
+coverage and accuracy 6/6 and 6/6 over 3 repetitions of a two-speaker
+conversation with existing memories in the prompt — one conversation shape, not a
+survey.
+
+The first measurement of that eval found the opposite: with the suffix phrased as
+an "optional" field the model emitted it on an empty collection and OMITTED it
+once the prompt also carried existing memories. What fixed it was an explicit
+mapping example plus making the field required-when-a-speaker-is-shown. Worth
+recording because the mechanism was already correct at that point — only the
+model's compliance was not, and a suffix the extractor ignores delivers nothing.
+
+⚠️ Existing memories are NOT back-filled. Retroactive attribution would need the
+original messages, which are not kept.
+
 ## v0.14.0
 
 A minor version because entity identity changes behaviour, not because anything

@@ -193,8 +193,13 @@ class Qdrant(VectorStoreBase):
         # (DeepMem0): o escritor filtra por ela em todo upsert, então sem índice
         # cada gravação de entidade vira varredura. Criação é online — collection
         # existente ganha o índice na próxima subida, sem reindexar vetor.
+        # `attributed_to` (v0.15): papel de proveniência do fato — filtrar por ele
+        # ("só o que o assistente trouxe", "só o que veio de documento") é consulta
+        # de primeira classe agora que o campo chega ao chamador. `actor_id` já
+        # estava aqui desde sempre, com ZERO ponto indexado, porque ninguém o
+        # escrevia; a v0.15 é que passa a preenchê-lo.
         common_fields = ["user_id", "agent_id", "run_id", "actor_id",
-                         "memory_scope", "data_normalized"]
+                         "attributed_to", "memory_scope", "data_normalized"]
 
         for field in common_fields:
             try:

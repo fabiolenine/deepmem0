@@ -27,6 +27,7 @@ from mem0.configs.prompts import (
     AGENT_CONTEXT_SUFFIX,
     DOCUMENT_TEMPORAL_OVERRIDE,
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+    build_speaker_attribution_suffix,
     build_temporality_suffix,
     generate_additive_extraction_prompt,
 )
@@ -59,17 +60,23 @@ from mem0.memory.notices import (
     get_temporal_feature_error_message_async,
 )
 from mem0.memory.utils import (
+    MAX_SPEAKER_LABEL,
     entity_point_id,
     link_key,
     links_do_payload,
+    locutores_das_mensagens,
     normalize_entity_key,
     normalize_scope_id,
+    normalize_speaker_label,
     extract_json,
     normalize_linked_memory_ids,
     parse_messages,
     parse_vision_messages,
+    precisa_de_atribuicao_por_llm,
     process_telemetry_filters,
     remove_code_blocks,
+    resolver_locutor_do_fato,
+    speaker_attribution_enabled,
 )
 from mem0.utils.entity_extraction import extract_entities, extract_entities_batch
 from mem0.utils.factory import (
@@ -1271,6 +1278,60 @@ _IMMUTABLE_SCOPE = ("user_id", "agent_id", "run_id", "actor_id")
 _LINEAGE_SCOPE_KEYS = ("user_id", "agent_id", "run_id")
 
 
+def _canonizar_filtro_de_locutor(effective_filters):
+    """Canoniza `actor_id` no filtro de LEITURA, com a mesma função da escrita.
+
+    O Qdrant casa por igualdade exata. Se a escrita canoniza (`"  Maria  "` vira
+    `"Maria"`) e a consulta não, o filtro erra em SILÊNCIO: zero resultado, sem
+    erro, sem log — e o chamador conclui que a memória não existe. Um filtro que
+    devolve vazio por diferença de espaço é pior que um que recusa.
+
+    Rótulo inválido LEVANTA em vez de ser removido do filtro: remover alargaria a
+    consulta para o escopo inteiro e devolveria memórias de TODOS os locutores
+    como se fossem de um só — resposta errada apresentada como resposta. A
+    exceção é o único desfecho que não mente.
+    """
+    if "actor_id" not in effective_filters:
+        return effective_filters
+    bruto = effective_filters["actor_id"]
+    rotulo = normalize_speaker_label(bruto)
+    if rotulo is None:
+        raise ValueError(
+            f"actor_id inválido para filtro: {bruto!r}. Um rótulo de locutor é "
+            "texto não-vazio, sem quebra de linha nem caractere de controle, com "
+            f"até {MAX_SPEAKER_LABEL} caracteres."
+        )
+    effective_filters["actor_id"] = rotulo
+    return effective_filters
+
+
+def aplicar_escopo_imutavel(meta, head_payload):
+    """Impõe o escopo de posse EXATO do head — **inclusive a ausência dele**.
+
+    FONTE ÚNICA da regra, usada pelos dois caminhos de `update()`: o versionado
+    (v0.7) e o legado in-place. Eles DIVERGIAM, e a divergência era o buraco: o
+    versionado já removia a chave e só a restaurava `if k in head_payload`,
+    enquanto o legado só sabia PRESERVAR um valor existente
+    (`if "actor_id" in existing_memory.payload`) e deixava passar um valor NOVO
+    vindo do `metadata` do chamador.
+
+    A assimetria é o defeito: uma guarda que protege o valor JÁ GRAVADO mas
+    aceita gravar um do zero não impede forjar autoria — só impede reescrevê-la.
+    E o comentário de `_IMMUTABLE_SCOPE` já declarava a regra certa desde a v0.7:
+    *"a caller can neither change nor ADD a scope the head does not have"*. O
+    legado contradizia o contrato do próprio módulo.
+
+    Materializa quando `actor_id` começa a ser escrito (v0.15): as memórias
+    legadas não têm o campo, então era exatamente nelas — o corpus inteiro — que
+    um cliente poderia carimbar um locutor que nunca falou.
+    """
+    for k in _IMMUTABLE_SCOPE:
+        meta.pop(k, None)
+        if k in head_payload:
+            meta[k] = head_payload[k]
+    return meta
+
+
 def _lineage_scope(payload) -> Tuple:
     """The owner-scope tuple used to fence version-lineage traversal to one owner."""
     p = payload or {}
@@ -1316,10 +1377,7 @@ def _build_version_metadata(head_payload, data, caller_metadata, operation_ts,
         if k not in caller_blocked:
             meta[k] = v
     # exact immutable scope from the head (including absence)
-    for k in _IMMUTABLE_SCOPE:
-        meta.pop(k, None)
-        if k in head_payload:
-            meta[k] = head_payload[k]
+    aplicar_escopo_imutavel(meta, head_payload)
     meta["created_at"] = operation_ts
     meta[FIELD_VERSION_PREV] = [head_id]
     meta[FIELD_LINEAGE_SCHEMA] = LINEAGE_SCHEMA_VERSION
@@ -2561,6 +2619,17 @@ class Memory(MemoryBase):
             # resolution so a year-less date is never filled with the current year.
             system_prompt += DOCUMENT_TEMPORAL_OVERRIDE
 
+        # DeepMem0 v0.15: per-fact speaker. `rotulos` comes from the messages that
+        # actually REACH the prompt (parse_vision_messages already ran, so `name`
+        # survived the multimodal branches) — a label the model never saw rendered
+        # must never be a value the validator accepts.
+        rotulos_locutor, locutor_uniforme = (
+            locutores_das_mensagens(messages) if speaker_attribution_enabled()
+            else (set(), False)
+        )
+        if precisa_de_atribuicao_por_llm(rotulos_locutor, locutor_uniforme):
+            system_prompt += build_speaker_attribution_suffix(rotulos_locutor)
+
         custom_instr = prompt or self.custom_instructions
 
         user_prompt = generate_additive_extraction_prompt(
@@ -2672,6 +2741,15 @@ class Memory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            # DeepMem0 v0.15: WHO SPOKE. Uniform conversation resolves in code;
+            # otherwise the model's proposal only survives if it is a `str` that
+            # canonicalizes into the closed set enumerated in the prompt.
+            # Anything else omits the field — which is exactly today's behaviour,
+            # and the only failure direction that cannot corrupt attribution.
+            locutor = resolver_locutor_do_fato(
+                mem.get("actor_id"), rotulos_locutor, locutor_uniforme)
+            if locutor:
+                mem_metadata["actor_id"] = locutor
             # DeepMem0 v0.2 (option B): creation does NOT put the memory on the
             # timeline — it stays neutral until its first reinforcement (T1/T2/T3).
             if temp is not None:
@@ -3023,6 +3101,7 @@ class Memory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -3094,6 +3173,7 @@ class Memory(MemoryBase):
             effective_filters["run_id"] = _validate_and_trim_entity_id(
                 effective_filters["run_id"], "run_id"
             )
+        _canonizar_filtro_de_locutor(effective_filters)
 
         # Validate filters contains at least one entity ID
         if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
@@ -3139,6 +3219,7 @@ class Memory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -3290,6 +3371,7 @@ class Memory(MemoryBase):
             effective_filters["run_id"] = _validate_and_trim_entity_id(
                 effective_filters["run_id"], "run_id"
             )
+        _canonizar_filtro_de_locutor(effective_filters)
         if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
             raise ValueError(
                 "filters must contain at least one of: user_id, agent_id, run_id. "
@@ -3708,6 +3790,7 @@ class Memory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -4245,9 +4328,12 @@ class Memory(MemoryBase):
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        # actor_id is immutable after creation (issue #4490)
-        if "actor_id" in existing_memory.payload:
-            new_metadata["actor_id"] = existing_memory.payload["actor_id"]
+        # Ownership scope is immutable after creation (issue #4490 for actor_id).
+        # MESMA regra do caminho versionado, e a ausência conta: o guard antigo
+        # só preservava um valor JÁ existente, então um `metadata={"actor_id": ...}`
+        # do chamador carimbava autoria em memória que não tinha nenhuma — e
+        # nenhuma é o estado de todo o corpus legado.
+        aplicar_escopo_imutavel(new_metadata, existing_memory.payload)
 
         # DeepMem0 v0.2 (T2): an updated fact is alive — reinforce its timeline.
         # Inside the reinforcement window the content update still applies; only
@@ -4922,6 +5008,17 @@ class AsyncMemory(MemoryBase):
             # resolution so a year-less date is never filled with the current year.
             system_prompt += DOCUMENT_TEMPORAL_OVERRIDE
 
+        # DeepMem0 v0.15: per-fact speaker. `rotulos` comes from the messages that
+        # actually REACH the prompt (parse_vision_messages already ran, so `name`
+        # survived the multimodal branches) — a label the model never saw rendered
+        # must never be a value the validator accepts.
+        rotulos_locutor, locutor_uniforme = (
+            locutores_das_mensagens(messages) if speaker_attribution_enabled()
+            else (set(), False)
+        )
+        if precisa_de_atribuicao_por_llm(rotulos_locutor, locutor_uniforme):
+            system_prompt += build_speaker_attribution_suffix(rotulos_locutor)
+
         custom_instr = prompt or self.custom_instructions
 
         user_prompt = generate_additive_extraction_prompt(
@@ -5027,6 +5124,15 @@ class AsyncMemory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            # DeepMem0 v0.15: WHO SPOKE. Uniform conversation resolves in code;
+            # otherwise the model's proposal only survives if it is a `str` that
+            # canonicalizes into the closed set enumerated in the prompt.
+            # Anything else omits the field — which is exactly today's behaviour,
+            # and the only failure direction that cannot corrupt attribution.
+            locutor = resolver_locutor_do_fato(
+                mem.get("actor_id"), rotulos_locutor, locutor_uniforme)
+            if locutor:
+                mem_metadata["actor_id"] = locutor
             # DeepMem0 v0.2 (option B): creation stays neutral until the first reinforcement.
             if temp is not None:
                 # DeepMem0 v0.3: resolve LLM-referenced indices via uuid_mapping.
@@ -5347,6 +5453,7 @@ class AsyncMemory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -5418,6 +5525,7 @@ class AsyncMemory(MemoryBase):
             effective_filters["run_id"] = _validate_and_trim_entity_id(
                 effective_filters["run_id"], "run_id"
             )
+        _canonizar_filtro_de_locutor(effective_filters)
 
         # Validate filters contains at least one entity ID
         if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
@@ -5463,6 +5571,7 @@ class AsyncMemory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -5616,6 +5725,7 @@ class AsyncMemory(MemoryBase):
             effective_filters["run_id"] = _validate_and_trim_entity_id(
                 effective_filters["run_id"], "run_id"
             )
+        _canonizar_filtro_de_locutor(effective_filters)
 
         # Validate filters contains at least one entity ID
         if not any(key in effective_filters for key in ("user_id", "agent_id", "run_id")):
@@ -6032,6 +6142,7 @@ class AsyncMemory(MemoryBase):
             "agent_id",
             "run_id",
             "actor_id",
+            "attributed_to",
             "role",
             "memory_scope",
         ]
@@ -6588,9 +6699,12 @@ class AsyncMemory(MemoryBase):
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-        # actor_id is immutable after creation (issue #4490)
-        if "actor_id" in existing_memory.payload:
-            new_metadata["actor_id"] = existing_memory.payload["actor_id"]
+        # Ownership scope is immutable after creation (issue #4490 for actor_id).
+        # MESMA regra do caminho versionado, e a ausência conta: o guard antigo
+        # só preservava um valor JÁ existente, então um `metadata={"actor_id": ...}`
+        # do chamador carimbava autoria em memória que não tinha nenhuma — e
+        # nenhuma é o estado de todo o corpus legado.
+        aplicar_escopo_imutavel(new_metadata, existing_memory.payload)
 
         # DeepMem0 v0.2 (T2): an updated fact is alive — reinforce its timeline.
         dyn = _dynamics_config(self.config)

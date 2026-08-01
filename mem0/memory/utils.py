@@ -2,6 +2,7 @@ import ast
 import hashlib
 import logging
 import re
+import unicodedata
 import uuid
 from typing import Any, Dict, List
 
@@ -12,6 +13,169 @@ from mem0.configs.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Comprimento máximo de um rótulo de locutor. Rótulo maior é REJEITADO, nunca
+#: truncado: truncar fundiria "Maria Silva Sant..." e "Maria Silva Sanc..." num
+#: mesmo locutor, em silêncio. Rejeitar deixa a mensagem anônima, que é o estado
+#: seguro.
+MAX_SPEAKER_LABEL = 64
+
+#: Papéis que `parse_messages` sabe renderizar. Papel fora daqui é DESCARTADO —
+#: comportamento pré-existente, e o motivo pelo qual o conjunto fechado de
+#: locutores tem que ser derivado daqui e não das mensagens cruas: um nome numa
+#: mensagem que o modelo nunca vê seria um valor que o validador ACEITA e o
+#: modelo só poderia ter inventado.
+_PAPEIS_RENDERIZAVEIS = ("system", "user", "assistant")
+
+
+def normalize_speaker_label(value):
+    """Rótulo canônico de locutor, ou ``None`` se não for utilizável.
+
+    FONTE ÚNICA: usada nos três pontos onde um rótulo aparece — saneamento da
+    entrada (`name` da mensagem), validação da saída do LLM, e filtro na
+    leitura. Escrita e consulta canonizando diferente é filtro exato que erra em
+    silêncio, e o Qdrant casa por igualdade.
+
+    ⚠️ NÃO faz casefold, de propósito. Casefoldar fundiria `Maria` e `maria` em
+    um locutor só — a mesma razão pela qual `user_id` não é casefoldado
+    (fundiria usuários distintos). O custo declarado é o inverso: `Maria` e
+    `maria` são locutores DIFERENTES. Limitação conhecida, não descuido.
+
+    ⚠️ Rejeita quebra de linha e caractere de controle porque o rótulo entra num
+    prompt cuja gramática é uma linha por turno: um `name` com ``\\n`` forjaria
+    turnos inteiros na conversa que o extrator lê. Rejeição é TOTAL — o rótulo
+    inteiro cai e a mensagem vira anônima. Sanitizar pela metade guardaria um
+    rótulo que o chamador não escreveu e que ninguém consegue consultar depois.
+    """
+    if not isinstance(value, str):
+        # bool/int/dict/lista: um rótulo de locutor é texto. Coagir
+        # `42` -> `"42"` dividiria escopo em silêncio se o chamador às vezes
+        # mandasse int e às vezes str.
+        return None
+    rotulo = unicodedata.normalize("NFKC", value)
+    if any(unicodedata.category(c) == "Cc" for c in rotulo):
+        return None
+    rotulo = re.sub(r"\s+", " ", rotulo).strip()
+    if not rotulo or len(rotulo) > MAX_SPEAKER_LABEL:
+        return None
+    return rotulo
+
+
+def mensagens_renderizaveis(messages):
+    """``(papel, conteúdo, locutor)`` das mensagens que CHEGAM ao prompt.
+
+    Fonte única do filtro de papel e da resolução de locutor. `parse_messages`
+    renderiza a partir daqui e `locutores_das_mensagens` coleta daqui, então as
+    duas não podem divergir sobre o que o modelo enxerga.
+
+    ⚠️ Mensagem que não é dict LEVANTA (`AttributeError`), como o `parse_messages`
+    original — um container malformado é payload envenenado, e os consumidores
+    classificam a exceção como permanente. Engolir aqui transformaria perda total
+    em resultado parcial mudo.
+    """
+    for msg in messages or []:
+        role = msg.get("role")
+        content = msg.get("content")
+        # Sem conteúdo textual (ex.: mensagem de tool-call que só traz
+        # `tool_calls`) não vira turno.
+        if content is None or role not in _PAPEIS_RENDERIZAVEIS:
+            continue
+        yield role, content, normalize_speaker_label(msg.get("name"))
+
+
+def locutores_das_mensagens(messages):
+    """``(conjunto de locutores, uniforme)`` sobre as mensagens EXTRAÍVEIS.
+
+    Extraível = renderizável e não-`system`: `system` é instrução, não
+    participante, e um fato nunca lhe é atribuído.
+
+    ``uniforme`` é ``True`` só quando existe pelo menos uma mensagem extraível e
+    **TODAS** carregam o MESMO rótulo válido. Não é "há um nome distinto": uma
+    conversa ``[user name=Maria, assistant sem nome]`` tem exatamente um nome
+    distinto e atribuir tudo à Maria daria a ela os fatos que o assistente
+    produziu. Uniformidade é a condição que de fato autoriza a atribuição
+    determinística sem perguntar ao modelo.
+    """
+    rotulos, anonima, extraiveis = set(), False, 0
+    for role, _content, locutor in mensagens_renderizaveis(messages):
+        if role == "system":
+            continue
+        extraiveis += 1
+        if locutor is None:
+            anonima = True
+        else:
+            rotulos.add(locutor)
+    uniforme = bool(extraiveis) and not anonima and len(rotulos) == 1
+    return rotulos, uniforme
+
+
+def speaker_attribution_enabled() -> bool:
+    """Kill switch da atribuição a locutor. `MEM0_SPEAKER_ATTRIBUTION`, default ON.
+
+    Desligado: nenhum sufixo entra no prompt, nenhum `actor_id` é gravado, e o
+    UPDATE volta a ignorar locutor — o comportamento exato de antes desta versão.
+
+    Lido do ambiente A CADA CHAMADA, e não uma vez no import, pelo mesmo motivo
+    de `MEM0_EMBED_MAX_BATCH`: num incidente o operador precisa de um lever que
+    funcione com um restart do serviço, sem editar config nem tocar no cliente
+    MCP. É também o que torna o contrafactual do gate executável — sem uma forma
+    de desligar, "com a funcionalidade off o campo não aparece" não é
+    verificável, e uma guarda que não pode ser desligada não pode ser comparada
+    contra nada.
+
+    Valor não reconhecido cai no DEFAULT (ligado) em vez de desligar: um typo não
+    pode virar desativação silenciosa de uma funcionalidade que o operador
+    acredita estar no ar.
+    """
+    import os
+    return (os.environ.get("MEM0_SPEAKER_ATTRIBUTION", "").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+def precisa_de_atribuicao_por_llm(rotulos, uniforme) -> bool:
+    """Há locutor a decidir que o código sozinho não decide?
+
+    Só então o sufixo entra no prompt. Sem locutor nenhum (100% do tráfego de
+    hoje) e com locutor uniforme, o custo em token é ZERO — e isso é orçamento de
+    `num_ctx`, não economia: o piso do prompt de extração já é ~42% da janela, e
+    este sistema já MEDIU perda total e silenciosa de fatos ao encostar no teto.
+    """
+    return bool(rotulos) and not uniforme
+
+
+def resolver_locutor_do_fato(bruto, rotulos, uniforme):
+    """Rótulo de locutor a GRAVAR para um fato extraído, ou ``None``.
+
+    O contrato inteiro em uma frase: **o LLM propõe, este código decide** —
+    mesma forma de `parse_supersedes_ids`, que resolve índices contra o
+    `uuid_mapping` em vez de confiar na saída crua.
+
+    Três caminhos:
+
+    * **uniforme** — todo turno extraível tem o mesmo locutor, então o fato só
+      pode ser dele. Determinístico, o modelo nem é consultado.
+    * **sem locutor** — nada a atribuir.
+    * **decidido pelo modelo** — o valor precisa ser `str`, canonizar, e
+      PERTENCER ao conjunto fechado que foi enumerado no prompt.
+
+    ⚠️ A checagem de TIPO vem antes da pertinência, e não é zelo: a saída do LLM
+    é lida com `json.loads` cru, então `actor_id` pode chegar como dict ou lista,
+    e `{"a": 1} in conjunto` levanta `TypeError: unhashable type` — no meio do
+    `add`, derrubando fatos que não tinham nada a ver com atribuição.
+    `normalize_speaker_label` recusa qualquer não-`str` antes disso.
+
+    ⚠️ A direção do fracasso é sempre OMITIR, nunca chutar. Campo ausente é
+    exatamente o comportamento de hoje e é seguro; rótulo errado é corrupção que
+    ninguém detecta olhando o resultado.
+    """
+    if uniforme:
+        return next(iter(rotulos))
+    if not rotulos:
+        return None
+    rotulo = normalize_speaker_label(bruto)
+    if rotulo is None or rotulo not in rotulos:
+        return None
+    return rotulo
 
 
 def get_fact_retrieval_messages(message, is_agent_memory=False):
@@ -61,20 +225,22 @@ def ensure_json_instruction(system_prompt, user_prompt):
 
 
 def parse_messages(messages):
+    """Renderiza a conversa para o extrator, um turno por linha.
+
+    Gramática: ``papel: conteúdo``, ou ``papel (Locutor): conteúdo`` quando a
+    mensagem traz um `name` utilizável. Sem `name` a linha é BYTE-IDÊNTICA à de
+    antes — o corpus inteiro foi extraído com o formato antigo, e mudá-lo para
+    quem não usa locutor seria mexer no que 100% do tráfego de hoje já produz.
+
+    O locutor entra por um marcador próprio, e não colado ao conteúdo, porque o
+    prompt já ensina o padrão `Nome: texto` DENTRO do conteúdo (Example 12) —
+    duas convenções na mesma posição seriam ambíguas justamente onde a
+    atribuição precisa ser exata.
+    """
     response = ""
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-        # Skip messages without textual content (e.g. assistant tool-call
-        # messages that carry `tool_calls` but no `content` key).
-        if content is None:
-            continue
-        if role == "system":
-            response += f"system: {content}\n"
-        elif role == "user":
-            response += f"user: {content}\n"
-        elif role == "assistant":
-            response += f"assistant: {content}\n"
+    for role, content, locutor in mensagens_renderizaveis(messages):
+        prefixo = f"{role} ({locutor})" if locutor else role
+        response += f"{prefixo}: {content}\n"
     return response
 
 
@@ -253,6 +419,24 @@ def _image_part_url(part):
     return image_url
 
 
+def _sem_perder_locutor(msg, role, content):
+    """Mensagem reconstruída que PRESERVA o `name` do original.
+
+    Os ramos multimodais de `parse_vision_messages` remontam a mensagem do zero
+    (`{"role", "content"}`) porque o conteúdo muda — texto extraído de partes, ou
+    a transcrição do VLM. O `name` evaporava junto, e o resultado era atribuição
+    que funcionava em mensagem de texto puro e sumia em mensagem com imagem: uma
+    assimetria que ninguém pediu e que só apareceria em produção.
+
+    Repassa o valor CRU, sem canonizar — canonização é do render (`parse_messages`)
+    e da validação. Aqui o contrato é não perder o que o chamador mandou.
+    """
+    nova = {"role": role, "content": content}
+    if msg.get("name") is not None:
+        nova["name"] = msg["name"]
+    return nova
+
+
 def parse_vision_messages(messages, llm=None, vision_details="auto"):
     """
     Parse the vision messages from the messages
@@ -315,7 +499,8 @@ def parse_vision_messages(messages, llm=None, vision_details="auto"):
                     )
                 if not text_parts:
                     continue
-                returned_messages.append({"role": role, "content": " ".join(text_parts)})
+                returned_messages.append(
+                    _sem_perder_locutor(msg, role, " ".join(text_parts)))
             else:
                 # Validate EVERY image part before spending an LLM call. This is
                 # the canonical OpenAI multimodal shape -- and the very shape
@@ -326,7 +511,7 @@ def parse_vision_messages(messages, llm=None, vision_details="auto"):
                     if isinstance(part, dict) and part.get("type") == "image_url":
                         _image_part_url(part)
                 description = get_image_description(msg, llm, vision_details)
-                returned_messages.append({"role": role, "content": description})
+                returned_messages.append(_sem_perder_locutor(msg, role, description))
         elif isinstance(content, dict) and content.get("type") == "image_url":
             if llm is None:
                 logger.warning(
@@ -347,7 +532,7 @@ def parse_vision_messages(messages, llm=None, vision_details="auto"):
             # poison payload from sick infrastructure -- turning a permanent
             # failure into N retried full re-adds.
             description = get_image_description(image_url, llm, vision_details)
-            returned_messages.append({"role": role, "content": description})
+            returned_messages.append(_sem_perder_locutor(msg, role, description))
         else:
             # Regular text content
             returned_messages.append(msg)
