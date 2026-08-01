@@ -121,7 +121,17 @@ class TestWriterUsesTheKeyFirst:
         legado = MagicMock()
         legado.id = "id-legado"
         legado.score = 0.99
-        legado.payload = {"data": "Fase", "linked_memory_ids": ["m1"]}
+        # "Legada" quer dizer SEM `data_normalized` — não sem escopo. O escopo
+        # está aqui pela mesma razão já anotada em
+        # `test_exact_hit_skips_the_vector_probe`: o payload de produção carrega
+        # `**search_filters` desde o insert, e uma sonda filtrada por
+        # `{user_id: u}` não pode devolver linha que não tenha esse campo.
+        # MEDIDO em 31/07/2026: 0 das 6155 linhas do entity store estão sem
+        # chave de escopo. Omiti-lo aqui pedia ao escritor que aceitasse uma
+        # resposta que o store não dá — e passava a aceitar linha de OUTRO
+        # escopo junto (ver test_entity_scope_exactness.py).
+        legado.payload = {"data": "Fase", "user_id": "u",
+                          "linked_memory_ids": ["m1"]}
         mem.entity_store.search.return_value = [legado]
 
         Memory._upsert_entity(mem, "Fase", "PROPER", "m1", {"user_id": "u"})

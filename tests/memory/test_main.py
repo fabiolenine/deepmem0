@@ -1029,7 +1029,8 @@ class TestEntityLinkNormalization:
     def test_upsert_entity_heals_a_corrupt_row(self, mock_memory):
         store = Mock()
         store.search.return_value = [self._entity_match(
-            {"data": "alice", "linked_memory_ids": self.CORRUPT})]
+            {"data": "alice", "user_id": "u",
+             "linked_memory_ids": self.CORRUPT})]
         mock_memory._entity_store = store
         mock_memory.embedding_model = Mock()
         mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
@@ -1045,7 +1046,8 @@ class TestEntityLinkNormalization:
         `"mem-1" in "['mem-1']"` is True, so the row would never be repaired."""
         store = Mock()
         store.search.return_value = [self._entity_match(
-            {"data": "alice", "linked_memory_ids": "['mem-1']"})]
+            {"data": "alice", "user_id": "u",
+             "linked_memory_ids": "['mem-1']"})]
         mock_memory._entity_store = store
         mock_memory.embedding_model = Mock()
         mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
@@ -1079,8 +1081,11 @@ class TestEntityLinkNormalization:
         """A legacy row without `data_normalized` gains it on the next touch."""
         store = Mock()
         store.list.return_value = []
+        # `user_id`: a linha é legada por não ter `data_normalized`, não por
+        # não ter escopo — ver TestEscopoAusenteNaoEAcerto no arquivo
+        # test_entity_scope_exactness.py.
         store.search.return_value = [self._entity_match(
-            {"data": "alice", "linked_memory_ids": ["mem-1"]})]
+            {"data": "alice", "user_id": "u", "linked_memory_ids": ["mem-1"]})]
         mock_memory._entity_store = store
         mock_memory.embedding_model = Mock()
         mock_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
@@ -1188,7 +1193,8 @@ class TestEntityLinkNormalization:
         store = Mock()
         store.list.return_value = []
         store.search.return_value = [self._entity_match(
-            {"data": "alice", "linked_memory_ids": self.CORRUPT})]
+            {"data": "alice", "user_id": "u",
+             "linked_memory_ids": self.CORRUPT})]
         mock_async_memory._entity_store = store
         mock_async_memory.embedding_model = Mock()
         mock_async_memory.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])

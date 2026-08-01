@@ -541,6 +541,379 @@ def _scan_entity_rows(store, search_filters):
 # de entidade do caminho assíncrono falharia em silêncio. Como função de módulo o
 # gêmeo não tem como divergir de novo.
 
+SCOPE_KEYS = ("user_id", "agent_id", "run_id")
+
+
+def escopo_exato(payload, search_filters) -> bool:
+    """A linha pertence EXATAMENTE a este escopo — não a um mais estreito.
+
+    ⚠️ Filtro do Qdrant casa por SUBCONJUNTO: `{user_id: X}` casa qualquer linha
+    com esse `user_id`, INCLUSIVE as que também carregam `run_id`. Conferir só as
+    chaves BUSCADAS (o que este código fazia) aceita a linha estreita; o que
+    decide é a AUSÊNCIA das outras.
+
+    MEDIDO em produção (31/07/2026): a linha `DeepMem0` do escopo de teste
+    `{user_id: U, run_id: R}` acumulou 12 vínculos de
+    memórias do escopo largo `{user_id: U}` gravadas pelo worker, enquanto
+    a linha certa — escopo largo, 108 vínculos — ficava de fora. `check_corpus`
+    acusou `entity_cross_scope_rows=1`.
+
+    Isto realinha o LOOKUP com o ID: `entity_point_id` já deriva do escopo
+    inteiro, então uma linha de escopo diferente nunca tem o id que este
+    escritor usaria — casá-la era garantir divergência entre achar e escrever.
+    """
+    if not isinstance(payload, dict):
+        return False
+    for k in SCOPE_KEYS:
+        if (payload.get(k) or None) != (search_filters.get(k) or None):
+            return False
+    return True
+
+
+def _linhas_de_list(achados):
+    """Desembrulha o retorno de `entity_store.list`, VALIDANDO A FORMA.
+
+    O Qdrant devolve o tuple cru do `scroll` (`(pontos, next_page)`); outros
+    stores e duplos de teste devolvem outras coisas — e qualquer uma delas é
+    truthy. Aceitar truthy como acerto fazia o caminho exato "encontrar" um
+    registro inexistente e pular a sonda vetorial.
+    """
+    if isinstance(achados, tuple):
+        achados = achados[0] if achados else []
+    if not isinstance(achados, list) or not achados:
+        return []
+    if isinstance(achados[0], list):
+        achados = achados[0]
+        if not isinstance(achados, list):
+            return []
+    return [l for l in achados
+            if getattr(l, "id", None) is not None
+            and isinstance(getattr(l, "payload", None), dict)]
+
+
+def entidades_por_chaves(entity_store, chaves, search_filters):
+    """Lookup exato EM LOTE: `({chave: linha}, {chaves ambíguas})`.
+
+    Uma chamada de `list()` para todas as chaves, via `MatchAny` em
+    `data_normalized` — que é indexado. Filtro de PAYLOAD, não `retrieve` por id
+    determinístico: `data_normalized` é independente do id, e depender do id
+    seria depender de um invariante que nada enforça.
+
+    ⚠️ LEVANTA em erro do store. Quem chama decide, e a decisão nunca pode ser
+    "trata tudo como novo" — isso converte falha de infraestrutura em escrita
+    destrutiva, porque o insert no id determinístico SUBSTITUI o payload alheio.
+
+    `ambiguas` = chaves com mais de uma linha no mesmo escopo exato. É o
+    invariante de duplicata disparando; escolher uma em silêncio é o que o
+    `top_k=1` sobre filtro que casa 2 linhas fazia.
+    """
+    chaves = [c for c in dict.fromkeys(chaves or []) if c]
+    if not chaves:
+        return {}, set()
+
+    def _busca(filtros, limite):
+        """Devolve (linhas válidas, saturou).
+
+        ⚠️ `top_k` é consumido pelo store ANTES da validação de escopo em
+        Python — e o filtro do Qdrant traz também as linhas de escopo
+        SUBCONJUNTO. Com o corte cheio, a linha EXATA pode ter ficado de fora,
+        e lê-la como ausente leva a inserir no id determinístico, ou seja, a
+        apagar payload alheio: a mesma corrupção por outra porta. Saturou =
+        não sei responder, e não saber tem de FECHAR.
+        """
+        brutas = entity_store.list(filters=filtros, top_k=limite)
+        vistas = brutas[0] if isinstance(brutas, tuple) and brutas else brutas
+        n = len(vistas) if isinstance(vistas, list) else 0
+        return _linhas_de_list(brutas), n >= limite
+
+    def _um(chave):
+        """Igualdade simples: a forma que TODO backend suporta."""
+        return _busca({**search_filters, "data_normalized": chave}, 8)
+
+    truncado = False
+    if len(chaves) == 1:
+        linhas, truncado = _um(chaves[0])
+    else:
+        limite = max(2 * len(chaves), len(chaves) + 8)
+        try:
+            linhas, truncado = _busca(
+                {**search_filters, "data_normalized": {"in": chaves}}, limite)
+        except Exception as exc:
+            # `{"in": ...}` é sintaxe estendida; um backend sem ela não pode
+            # degradar para "nada existe" — isso faria o insert no id
+            # determinístico substituir payload alheio. Cai para N lookups por
+            # igualdade, que é lento e correto, em vez de rápido e destrutivo.
+            logger.debug("MatchAny indisponível (%s); lookup por chave", exc)
+            linhas = []
+            for c in chaves:
+                ls, tr = _um(c)
+                linhas.extend(ls)
+                truncado = truncado or tr
+
+    if truncado:
+        raise RuntimeError(
+            f"lookup de entidade saturou o limite para {len(chaves)} chave(s): "
+            "não é possível afirmar ausência, e afirmar ausência aqui insere "
+            "sobre payload alheio")
+
+    alvo = set(chaves)
+    encontradas, ambiguas = {}, set()
+    for linha in linhas:
+        pl = linha.payload
+        ch = pl.get("data_normalized")
+        if ch not in alvo or not escopo_exato(pl, search_filters):
+            continue
+        if ch in encontradas:
+            ambiguas.add(ch)
+            continue
+        encontradas[ch] = linha
+    for ch in ambiguas:
+        encontradas.pop(ch, None)
+    if ambiguas:
+        logger.warning(
+            "entity store: %d chave(s) com linha duplicada no mesmo escopo — "
+            "não escolho em silêncio: %s", len(ambiguas), sorted(ambiguas))
+    return encontradas, ambiguas
+
+
+def _mensagens_validas_para_add(messages):
+    """Mensagens que o caminho `infer=False` de fato grava, NA ORDEM.
+
+    Separado do laço de escrita para que o embed possa sair dali sem que os
+    dois critérios de descarte — formato inválido e `role == "system"` —
+    mudem de lugar ou de ordem junto.
+    """
+    validas = []
+    for message_dict in messages:
+        if (
+            not isinstance(message_dict, dict)
+            or message_dict.get("role") is None
+            or message_dict.get("content") is None
+        ):
+            logger.warning(f"Skipping invalid message format: {message_dict}")
+            continue
+        if message_dict["role"] == "system":
+            continue
+        validas.append(message_dict)
+    return validas
+
+
+def _embed_map_de(embedding_model, conteudos):
+    """`{texto: vetor}` para os textos que embedaram com sucesso.
+
+    ⚠️ Chave por CONTEÚDO é o contrato que `_create_memory` já espera. Textos
+    repetidos colapsam numa entrada — o que é correto, porque o vetor de um
+    texto é o mesmo —, mas a CONTAGEM devolvida pelo lote tem de bater com a
+    dos textos ANTES do zip: `zip` trunca em silêncio, e truncar aqui colaria o
+    vetor de um fato em outro.
+
+    Um embed que falha derruba UMA mensagem, não o lote — que era o
+    comportamento do laço item a item e não pode piorar por causa do hoist.
+    """
+    unicos = list(dict.fromkeys(c for c in conteudos if c is not None))
+    if not unicos:
+        return {}
+    try:
+        vetores = embedding_model.embed_batch(unicos, "add")
+        if len(vetores) != len(unicos):
+            raise ValueError(
+                f"embed_batch devolveu {len(vetores)} vetores para "
+                f"{len(unicos)} textos")
+        return dict(zip(unicos, vetores))
+    except Exception as exc:
+        logger.warning("embed_batch falhou (%s); caindo para item a item", exc)
+
+    mapa = {}
+    for texto in unicos:
+        try:
+            mapa[texto] = embedding_model.embed(texto, "add")
+        except Exception as exc:
+            logger.warning("Failed to embed message content: %s", exc)
+    return mapa
+
+
+def vincular_entidades_em_lote(entity_store, embedding_model, memory_id,
+                               entidades, search_filters):
+    """Vincula N entidades a UMA memória com um embed e um lookup, não N de cada.
+
+    MEDIDO no ramo de UPDATE (bge-m3, Qdrant real, collection isolada, 7
+    repetições por ponto): o embed é **95-96% do wall** e as idas ao Qdrant
+    somam ~18 ms por entidade — `ms/entidade` fica plano em ~450-520 ms de N=1 a
+    N=16, ou seja o custo é do OVERHEAD POR CHAMADA. Um lote troca N×~455 ms por
+    1×(~500 + 12N) ms.
+
+    ⚠️ Não é o mesmo que o ramo de INSERT, que paga `wait=True` mais
+    reconciliação e é muito mais caro — medir aquele e concluir sobre este foi
+    erro de uma medição anterior.
+
+    Devolve `True` se tratou o lote; `False` quando o chamador deve cair no
+    caminho serial (`_upsert_entity`), que é o comportamento seguro de sempre.
+
+    As REGRAS de identidade não vivem aqui: escopo exato, multiplicidade,
+    truncamento e forma de resposta vêm de `entidades_por_chaves` e
+    `escopo_exato`, os mesmos que a Fase 7 e o `_upsert_entity` usam. Só a
+    orquestração é nova — é o que impede este caminho de virar uma terceira
+    regra de identidade.
+    """
+    por_chave = {}
+    for entity_type, entity_text in entidades:
+        chave = normalize_entity_key(entity_text)
+        if not chave or chave in por_chave:
+            continue
+        por_chave[chave] = (entity_type, entity_text)
+    if not por_chave:
+        return True
+
+    chaves = list(por_chave)
+    textos = [por_chave[k][1] for k in chaves]
+
+    try:
+        vetores = embedding_model.embed_batch(textos, "add")
+        if len(vetores) != len(textos):
+            raise ValueError(
+                f"embed_batch devolveu {len(vetores)} vetores para "
+                f"{len(textos)} entidades")
+    except Exception as exc:
+        # Embed é o ÚNICO passo cujo fracasso pode cair no serial sem risco: o
+        # serial refaz o lookup por conta própria e mantém a mesma regra.
+        logger.warning("embed_batch de entidade falhou (%s); caminho serial", exc)
+        return False
+
+    try:
+        achadas, ambiguas = entidades_por_chaves(entity_store, chaves, search_filters)
+    except Exception as exc:
+        # FAIL-CLOSED: cair no serial aqui repetiria o mesmo lookup quebrado e
+        # acabaria inserindo no id determinístico sobre payload alheio.
+        logger.warning(
+            "lookup exato de entidade falhou (%s) — vínculo de %s pulado",
+            exc, memory_id)
+        return True
+    if ambiguas:
+        logger.warning("chave(s) ambígua(s) puladas em %s — %s",
+                       memory_id, sorted(ambiguas))
+
+    processar = [i for i, k in enumerate(chaves) if k not in ambiguas]
+    faltantes = [i for i in processar if chaves[i] not in achadas]
+    sondados_por_indice = {}
+    if faltantes:
+        sondados = entity_store.search_batch(
+            queries=[textos[i] for i in faltantes],
+            vectors_list=[vetores[i] for i in faltantes],
+            top_k=1,
+            filters=search_filters,
+        )
+        if (not isinstance(sondados, list)
+                or len(sondados) != len(faltantes)
+                or not all(isinstance(x, list) for x in sondados)):
+            logger.warning(
+                "search_batch de entidade devolveu forma inesperada — vínculo "
+                "de %s pulado", memory_id)
+            return True
+        for pos, i in enumerate(faltantes):
+            sondados_por_indice[i] = sondados[pos]
+
+    to_insert_vectors, to_insert_ids, to_insert_payloads = [], [], []
+    for i in processar:
+        chave = chaves[i]
+        entity_type, entity_text = por_chave[chave]
+        alvo = achadas.get(chave)
+        if alvo is None:
+            candidatas = [m for m in sondados_por_indice.get(i, [])
+                          if escopo_exato(getattr(m, "payload", None) or {},
+                                          search_filters)]
+            if candidatas and candidatas[0].score >= 0.95:
+                alvo = candidatas[0]
+
+        if alvo is not None:
+            payload = alvo.payload or {}
+            raw_linked = payload.get("linked_memory_ids")
+            linked_ids = normalize_linked_memory_ids(raw_linked)
+            if memory_id not in linked_ids:
+                linked_ids.append(memory_id)
+            precisa_chave = payload.get("data_normalized") != chave
+            if linked_ids != raw_linked or precisa_chave:
+                payload["linked_memory_ids"] = linked_ids
+                payload["data_normalized"] = chave
+                payload[link_key(memory_id)] = 1
+                try:
+                    entity_store.update(vector_id=alvo.id, vector=None,
+                                        payload=payload)
+                except Exception as exc:
+                    logger.debug("Entity update failed for '%s': %s",
+                                 entity_text, exc)
+        else:
+            to_insert_vectors.append(vetores[i])
+            to_insert_ids.append(entity_point_id(search_filters, chave))
+            to_insert_payloads.append({
+                "data": entity_text,
+                "data_normalized": chave,
+                "entity_type": entity_type,
+                "linked_memory_ids": [memory_id],
+                link_key(memory_id): 1,
+                **search_filters,
+            })
+
+    if to_insert_vectors:
+        try:
+            entity_store.insert(vectors=to_insert_vectors, ids=to_insert_ids,
+                                payloads=to_insert_payloads, wait=True)
+        except Exception as exc:
+            logger.warning("Batch entity insert failed: %s", exc)
+            return True
+        for eid in to_insert_ids:
+            reconcilia_vinculo(entity_store, eid, memory_id,
+                               ENTITY_RECONCILE_ATTEMPTS)
+    return True
+
+
+def resolver_linha_de_entidade(entity_store, entity_text, chave,
+                               entity_embedding, search_filters):
+    """Decide o destino desta entidade, sem escrever nada.
+
+    Devolve `("update", linha)`, `("insert", None)` ou `("skip", motivo)`.
+
+    Função de MÓDULO de propósito. Os gêmeos sync/async já divergiram nesta
+    decisão exata — o assíncrono ficou sem a identidade normalizada quando o
+    síncrono ganhou —, e gêmeo que diverge é pior que nenhum: o mesmo corpus
+    passa a ter duas regras de identidade conforme o caminho que escreveu.
+    Concentrar a decisão aqui é o que impede a terceira ocorrência.
+
+    Toda saída duvidosa é `skip`, nunca `insert`: o insert usa o id
+    determinístico e SUBSTITUI o payload alheio, então "não sei" que vira
+    escrita é perda de dado.
+    """
+    try:
+        achadas, ambiguas = entidades_por_chaves(
+            entity_store, [chave], search_filters)
+    except Exception as exc:
+        return "skip", f"lookup exato falhou ({exc})"
+    if chave in ambiguas:
+        return "skip", ("chave duplicada neste escopo "
+                        "(resolver com scripts/repair_entity_links.py)")
+    exata = achadas.get(chave)
+    if exata is not None:
+        return "update", exata
+
+    # Sonda vetorial: só alcança a linha LEGADA, sem `data_normalized`
+    # (medido: 10 dessas no corpus — a sonda é carga real, não vestígio).
+    sondadas = entity_store.search(
+        query=entity_text, vectors=entity_embedding, top_k=1,
+        filters=search_filters)
+    if not isinstance(sondadas, list):
+        # Iterar cegamente converteria resposta malformada em "nenhum
+        # resultado", e nenhum resultado leva a inserir sobre estado
+        # desconhecido.
+        return "skip", f"sonda devolveu {type(sondadas).__name__}, não lista"
+    # A sonda herda o filtro por SUBCONJUNTO do store: com escopo largo ela
+    # devolve a linha estreita, e com texto idêntico o score é 1.0.
+    candidatas = [l for l in sondadas
+                  if escopo_exato(getattr(l, "payload", None) or {},
+                                  search_filters)]
+    if candidatas and candidatas[0].score >= 0.95:
+        return "update", candidatas[0]
+    return "insert", None
+
+
 def entidade_por_chave(entity_store, chave, search_filters, checks_ref=None):
     """Linha de entidade com esta chave normalizada NESTE escopo, ou None.
 
@@ -550,39 +923,16 @@ def entidade_por_chave(entity_store, chave, search_filters, checks_ref=None):
     `Hilbert transform`/`Hilbert Transform` viraram linhas SEPARADAS, cada uma
     com sua fatia de vínculos, e qual delas recebe o boost passou a depender
     da grafia que o usuário digitou.
+
+    Fino de `entidades_por_chaves`: mesma regra de escopo e de multiplicidade.
     """
     try:
-        achados = entity_store.list(
-            filters={**search_filters, "data_normalized": chave}, top_k=1)
+        encontradas, _amb = entidades_por_chaves(
+            entity_store, [chave], search_filters)
     except Exception as exc:      # store sem suporte ao filtro: cai na sonda
         logger.debug("lookup por chave normalizada indisponível: %s", exc)
         return None
-    # VALIDAR A FORMA, não só a verdade. `list()` de um store que devolva
-    # outra coisa — ou de um duplo de teste — é truthy, e aceitar truthy como
-    # acerto fazia o caminho exato "encontrar" um registro inexistente e
-    # pular a sonda vetorial. Três testes existentes quebraram exatamente
-    # nisso, o que é o instrumento funcionando: um store real que mude o tipo
-    # de retorno produziria a mesma falha silenciosa em produção.
-    if isinstance(achados, tuple):
-        achados = achados[0] if achados else []
-    if not isinstance(achados, list) or not achados:
-        return None
-    if isinstance(achados[0], list):
-        achados = achados[0]
-        if not achados:
-            return None
-    linha = achados[0]
-    pl = getattr(linha, "payload", None)
-    if getattr(linha, "id", None) is None or not isinstance(pl, dict):
-        return None
-    # Escopo e chave têm que CASAR de fato: um filtro ignorado pelo store
-    # devolveria a primeira linha qualquer, e ela seria fundida com esta.
-    if pl.get("data_normalized") != chave:
-        return None
-    for k, v in search_filters.items():
-        if pl.get(k) != v:
-            return None
-    return linha
+    return encontradas.get(chave)
 
 
 ENTITY_RECONCILE_ATTEMPTS = int(os.environ.get("MEM0_ENTITY_RECONCILE_ATTEMPTS", "6"))
@@ -1862,20 +2212,17 @@ class Memory(MemoryBase):
             search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
             chave = normalize_entity_key(entity_text)
 
-            # 1) identidade EXATA por chave normalizada
-            exata = self._entidade_por_chave(chave, search_filters)
-            # 2) só então a sonda vetorial, que ainda alcança linha LEGADA sem
-            #    `data_normalized` — e que ao ser tocada ganha o campo.
-            existing = [exata] if exata is not None else self.entity_store.search(
-                query=entity_text,
-                vectors=entity_embedding,
-                top_k=1,
-                filters=search_filters,
-            )
+            acao, alvo = resolver_linha_de_entidade(
+                self.entity_store, entity_text, chave, entity_embedding,
+                search_filters)
+            if acao == "skip":
+                logger.warning("entidade %r: upsert pulado — %s",
+                               entity_text, alvo)
+                return
 
-            if existing and (exata is not None or existing[0].score >= 0.95):
+            if acao == "update":
                 # Update existing entity's linked_memory_ids
-                match = existing[0]
+                match = alvo
                 payload = match.payload or {}
                 raw_linked = payload.get("linked_memory_ids")
                 linked_ids = normalize_linked_memory_ids(raw_linked)
@@ -1959,6 +2306,14 @@ class Memory(MemoryBase):
             entities = extract_entities(text, language=self.config.language)
             if not entities:
                 return
+            search_filters = {k: v for k, v in filters.items()
+                              if k in SCOPE_KEYS and v}
+            if vincular_entidades_em_lote(
+                    self.entity_store, self.embedding_model, memory_id,
+                    entities, search_filters):
+                return
+            # Lote recusou (falha de embed): serial, que refaz o lookup por
+            # conta própria sob a MESMA regra de identidade.
             seen = set()
             for entity_type, entity_text in entities:
                 key = normalize_entity_key(entity_text)
@@ -2126,17 +2481,21 @@ class Memory(MemoryBase):
 
     def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None, temporal_context="conversation"):
         if not infer:
-            returned_memories = []
-            for message_dict in messages:
-                if (
-                    not isinstance(message_dict, dict)
-                    or message_dict.get("role") is None
-                    or message_dict.get("content") is None
-                ):
-                    logger.warning(f"Skipping invalid message format: {message_dict}")
-                    continue
+            # Um embed POR MENSAGEM custava uma ida ao embedder cada — e o custo
+            # é dominado pela CHAMADA, não pelo item (medido contra bge-m3:
+            # ~500 ms de overhead por chamada, ~12 ms por item curto). Aqui o
+            # embed sai do laço; `_create_memory` já aceita vetor pré-computado.
+            validas = _mensagens_validas_para_add(messages)
+            embed_map = _embed_map_de(
+                self.embedding_model, [m["content"] for m in validas])
 
-                if message_dict["role"] == "system":
+            returned_memories = []
+            for message_dict in validas:
+                msg_content = message_dict["content"]
+                if msg_content not in embed_map:
+                    # Fallback por item já falhou para esta mensagem: pular UMA
+                    # é o comportamento de antes; derrubar o lote inteiro seria
+                    # regressão introduzida pelo próprio hoist.
                     continue
 
                 per_msg_meta = deepcopy(metadata)
@@ -2146,9 +2505,7 @@ class Memory(MemoryBase):
                 if actor_name:
                     per_msg_meta["actor_id"] = actor_name
 
-                msg_content = message_dict["content"]
-                msg_embeddings = self.embedding_model.embed(msg_content, "add")
-                mem_id = self._create_memory(msg_content, {msg_content: msg_embeddings}, per_msg_meta)
+                mem_id = self._create_memory(msg_content, embed_map, per_msg_meta)
 
                 returned_memories.append(
                     {
@@ -2484,22 +2841,83 @@ class Memory(MemoryBase):
                     valid_indices, valid_keys = zip(*valid)
                     valid_vectors = [entity_embeddings[i] for i in valid_indices]
 
-                    # 7c: Batch search for existing entities
+                    # 7c: lookup EXATO por chave, em lote, e SÓ ENTÃO a sonda.
+                    # A Fase 7 rodava só com a sonda vetorial — a regra
+                    # probabilística que o cutover de 30/07 substituiu em
+                    # `_upsert_entity` e que aqui ficou. Duas regras de
+                    # identidade no mesmo corpus, e a mais fraca no caminho
+                    # mais quente (todo `add` com infer=True).
                     valid_texts = [global_entities[k][1] for k in valid_keys]
-                    existing_matches = self.entity_store.search_batch(
-                        queries=valid_texts,
-                        vectors_list=valid_vectors,
-                        top_k=1,
-                        filters=search_filters,
-                    )
+                    try:
+                        por_chave, _amb = entidades_por_chaves(
+                            self.entity_store, valid_keys, search_filters)
+                    except Exception as exc:
+                        # FAIL-CLOSED. "trata tudo como novo" converteria falha
+                        # de infraestrutura em escrita destrutiva: o insert usa
+                        # o id determinístico e SUBSTITUI o payload alheio.
+                        logger.warning(
+                            "lookup exato de entidade falhou (%s) — Fase 7 "
+                            "abortada; o caminho serial reconcilia depois", exc)
+                        raise
+
+                    # Chave AMBÍGUA sai do processamento inteiro. Sem isto ela
+                    # cai em `faltantes`, vai para a sonda, e acaba atualizando
+                    # uma das duplicatas ou INSERINDO no id determinístico —
+                    # apagando payload alheio. A guarda de multiplicidade
+                    # existia só no caminho serial; aqui, o mais quente, ela
+                    # estava pela metade, o que é o mesmo que não existir.
+                    if _amb:
+                        logger.warning(
+                            "Fase 7: %d chave(s) ambígua(s) puladas — %s",
+                            len(_amb), sorted(_amb))
+                    processar = [j for j, k in enumerate(valid_keys)
+                                 if k not in _amb]
+
+                    faltantes = [j for j in processar
+                                 if valid_keys[j] not in por_chave]
+                    existing_matches = [[] for _ in valid_keys]
+                    if faltantes:
+                        sondados = self.entity_store.search_batch(
+                            queries=[valid_texts[j] for j in faltantes],
+                            vectors_list=[valid_vectors[j] for j in faltantes],
+                            top_k=1,
+                            filters=search_filters,
+                        )
+                        # Forma validada, e FECHA se não bater. Resposta curta
+                        # ou de outro tipo era lida como "não achou" — e não
+                        # achar leva a inserir no id determinístico.
+                        if (not isinstance(sondados, list)
+                                or len(sondados) != len(faltantes)
+                                # CADA entrada tem de ser a lista de matches
+                                # daquela consulta. Validar só a externa deixa
+                                # passar `[<objeto>]`, que é iterável, rende
+                                # zero matches e portanto INSERE — silencioso,
+                                # ao contrário da lista curta, que ao menos
+                                # estoura IndexError.
+                                or not all(isinstance(x, list) for x in sondados)):
+                            raise RuntimeError(
+                                f"search_batch devolveu {type(sondados).__name__} "
+                                f"com {len(sondados) if isinstance(sondados, list) else '?'} "
+                                f"entradas para {len(faltantes)} consultas")
+                        for pos, j in enumerate(faltantes):
+                            existing_matches[j] = sondados[pos]
 
                     # 7d: Separate into inserts vs updates
                     to_insert_vectors, to_insert_ids, to_insert_payloads = [], [], []
-                    for j, key in enumerate(valid_keys):
+                    for j in processar:
+                        key = valid_keys[j]
                         entity_type, entity_text, memory_ids = global_entities[key]
                         matches = existing_matches[j] if j < len(existing_matches) else []
+                        # a sonda herda o filtro por SUBCONJUNTO: recusa o que
+                        # não for deste escopo exato (ver `escopo_exato`).
+                        matches = [m for m in matches
+                                   if escopo_exato(getattr(m, "payload", None) or {},
+                                                   search_filters)]
+                        exata = por_chave.get(key)
+                        if exata is not None:
+                            matches = [exata]
 
-                        if matches and matches[0].score >= 0.95:
+                        if matches and (exata is not None or matches[0].score >= 0.95):
                             # Update existing entity
                             match = matches[0]
                             payload = match.payload or {}
@@ -2547,6 +2965,13 @@ class Memory(MemoryBase):
                                 vectors=to_insert_vectors,
                                 ids=to_insert_ids,
                                 payloads=to_insert_payloads,
+                                # leitura-após-escrita: o default do Qdrant NÃO
+                                # espera, e escrita confirmada mas ainda
+                                # invisível é o que fez o escritor seguinte
+                                # recriar a linha e apagar vínculos alheios
+                                # (30/07). `_upsert_entity` já esperava; este
+                                # caminho, o mais quente, não.
+                                wait=True,
                             )
                         except Exception as e:
                             logger.warning(f"Batch entity insert failed: {e}")
@@ -4163,20 +4588,19 @@ class AsyncMemory(MemoryBase):
             # ⚠️ O gêmeo assíncrono ficou para trás quando o síncrono ganhou
             # identidade normalizada, e um gêmeo que diverge é pior que nenhum:
             # o mesmo corpus passa a ter duas regras de identidade dependendo de
-            # qual caminho escreveu. Mesma ordem do síncrono — chave exata
-            # primeiro, sonda vetorial só para linha LEGADA.
-            exata = await asyncio.to_thread(
-                self._entidade_por_chave, chave, search_filters)
-            existing = [exata] if exata is not None else await asyncio.to_thread(
-                self.entity_store.search,
-                query=entity_text,
-                vectors=entity_embedding,
-                top_k=1,
-                filters=search_filters,
-            )
+            # qual caminho escreveu. A decisão agora é UMA — a função de módulo
+            # `resolver_linha_de_entidade` —, então não há o que divergir:
+            # escopo exato, multiplicidade e fail-closed valem nos dois.
+            acao, alvo = await asyncio.to_thread(
+                resolver_linha_de_entidade, self.entity_store, entity_text,
+                chave, entity_embedding, search_filters)
+            if acao == "skip":
+                logger.warning("entidade %r: upsert pulado — %s",
+                               entity_text, alvo)
+                return
 
-            if existing and (exata is not None or existing[0].score >= 0.95):
-                match = existing[0]
+            if acao == "update":
+                match = alvo
                 payload = match.payload or {}
                 raw_linked = payload.get("linked_memory_ids")
                 linked_ids = normalize_linked_memory_ids(raw_linked)
@@ -4264,6 +4688,14 @@ class AsyncMemory(MemoryBase):
             entities = await asyncio.to_thread(
                 extract_entities, text, self.config.language)
             if not entities:
+                return
+            search_filters = {k: v for k, v in filters.items()
+                              if k in SCOPE_KEYS and v}
+            # Mesma função de módulo do gêmeo síncrono: a orquestração do lote
+            # não pode divergir mais do que as regras de identidade divergiram.
+            if await asyncio.to_thread(
+                    vincular_entidades_em_lote, self.entity_store,
+                    self.embedding_model, memory_id, entities, search_filters):
                 return
             seen = set()
             for entity_type, entity_text in entities:
@@ -4415,16 +4847,17 @@ class AsyncMemory(MemoryBase):
     ):
         if not infer:
             returned_memories = []
-            for message_dict in messages:
-                if (
-                    not isinstance(message_dict, dict)
-                    or message_dict.get("role") is None
-                    or message_dict.get("content") is None
-                ):
-                    logger.warning(f"Skipping invalid message format (async): {message_dict}")
-                    continue
+            # Espelho do gêmeo síncrono: o embed sai do laço. Mesma função de
+            # módulo nos dois, para a regra de descarte e a semântica de falha
+            # não divergirem — que é como os gêmeos de entidade divergiram.
+            validas = _mensagens_validas_para_add(messages)
+            embed_map = await asyncio.to_thread(
+                _embed_map_de, self.embedding_model,
+                [m["content"] for m in validas])
 
-                if message_dict["role"] == "system":
+            for message_dict in validas:
+                msg_content = message_dict["content"]
+                if msg_content not in embed_map:
                     continue
 
                 per_msg_meta = deepcopy(metadata)
@@ -4434,9 +4867,7 @@ class AsyncMemory(MemoryBase):
                 if actor_name:
                     per_msg_meta["actor_id"] = actor_name
 
-                msg_content = message_dict["content"]
-                msg_embeddings = await asyncio.to_thread(self.embedding_model.embed, msg_content, "add")
-                mem_id = await self._create_memory(msg_content, {msg_content: msg_embeddings}, per_msg_meta)
+                mem_id = await self._create_memory(msg_content, embed_map, per_msg_meta)
 
                 returned_memories.append(
                     {
@@ -4753,23 +5184,65 @@ class AsyncMemory(MemoryBase):
                     valid_indices, valid_keys = zip(*valid)
                     valid_vectors = [entity_embeddings[i] for i in valid_indices]
 
-                    # 7c: Batch search for existing entities
+                    # 7c: lookup EXATO por chave, em lote, e SÓ ENTÃO a sonda —
+                    # espelho do gêmeo síncrono. Rodava só com a sonda vetorial,
+                    # a regra probabilística que o cutover de 30/07 substituiu.
                     valid_texts = [global_entities[k][1] for k in valid_keys]
-                    existing_matches = await asyncio.to_thread(
-                        self.entity_store.search_batch,
-                        queries=valid_texts,
-                        vectors_list=valid_vectors,
-                        top_k=1,
-                        filters=search_filters,
-                    )
+                    try:
+                        por_chave, _amb = await asyncio.to_thread(
+                            entidades_por_chaves, self.entity_store,
+                            valid_keys, search_filters)
+                    except Exception as exc:
+                        # FAIL-CLOSED: "trata tudo como novo" converteria falha
+                        # de infraestrutura em escrita destrutiva no id
+                        # determinístico.
+                        logger.warning(
+                            "lookup exato de entidade falhou (%s) — Fase 7 "
+                            "async abortada", exc)
+                        raise
+
+                    if _amb:
+                        logger.warning(
+                            "Fase 7 async: %d chave(s) ambígua(s) puladas — %s",
+                            len(_amb), sorted(_amb))
+                    processar = [j for j, k in enumerate(valid_keys)
+                                 if k not in _amb]
+
+                    faltantes = [j for j in processar
+                                 if valid_keys[j] not in por_chave]
+                    existing_matches = [[] for _ in valid_keys]
+                    if faltantes:
+                        sondados = await asyncio.to_thread(
+                            self.entity_store.search_batch,
+                            queries=[valid_texts[j] for j in faltantes],
+                            vectors_list=[valid_vectors[j] for j in faltantes],
+                            top_k=1,
+                            filters=search_filters,
+                        )
+                        if (not isinstance(sondados, list)
+                                or len(sondados) != len(faltantes)
+                                or not all(isinstance(x, list) for x in sondados)):
+                            raise RuntimeError(
+                                f"search_batch devolveu {type(sondados).__name__} "
+                                f"com {len(sondados) if isinstance(sondados, list) else '?'} "
+                                f"entradas para {len(faltantes)} consultas")
+                        for pos, j in enumerate(faltantes):
+                            existing_matches[j] = sondados[pos]
 
                     # 7d: Separate into inserts vs updates
                     to_insert_vectors, to_insert_ids, to_insert_payloads = [], [], []
-                    for j, key in enumerate(valid_keys):
+                    for j in processar:
+                        key = valid_keys[j]
                         entity_type, entity_text, memory_ids = global_entities[key]
                         matches = existing_matches[j] if j < len(existing_matches) else []
+                        matches = [m for m in matches
+                                   if escopo_exato(getattr(m, "payload", None) or {},
+                                                   search_filters)]
+                        exata = por_chave.get(key)
+                        if exata is not None:
+                            matches = [exata]
 
-                        if matches and matches[0].score >= 0.95:
+                        if matches and (exata is not None or matches[0].score >= 0.95):
                             match = matches[0]
                             payload = match.payload or {}
                             # normalize_* is load-bearing here: a str payload fed
@@ -4813,7 +5286,13 @@ class AsyncMemory(MemoryBase):
                     if to_insert_vectors:
                         try:
                             await asyncio.to_thread(
-                                self.entity_store.insert,
+                                # leitura-após-escrita, igual ao gêmeo síncrono:
+                                # o default do Qdrant NÃO espera, e escrita
+                                # confirmada mas invisível é o que fez o
+                                # escritor seguinte recriar a linha e apagar
+                                # vínculos alheios (30/07).
+                                functools.partial(self.entity_store.insert,
+                                                  wait=True),
                                 vectors=to_insert_vectors,
                                 ids=to_insert_ids,
                                 payloads=to_insert_payloads,
