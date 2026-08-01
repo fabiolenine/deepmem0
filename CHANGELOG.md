@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.14.0
+
+A minor version because entity identity changes behaviour, not because anything
+new is exposed. The theme: a lookup that disagreed with the id it would write to.
+
+### Entity scope matched by subset, and it corrupted a real corpus
+
+A Qdrant filter on `{user_id: U}` also matches rows that carry a `run_id`, and
+both entity writers validated only the keys they had SEARCHED for — never the
+absence of the others. Measured in production: an entity row scoped to a test
+run accumulated **12 links from memories in the broad scope**, written by the
+production worker, while the correct broad-scope row sat untouched. The
+deterministic point id was already exact — `f({user_id})` differs from
+`f({user_id, run_id})` — so finding and writing disagreed by construction.
+
+`escopo_exato()` now requires equality on all three scope keys, in both
+directions, which realigns the two.
+
+### Two identity rules in one corpus, the weaker one on the hottest path
+
+Phase 7 — the writer that runs on every `add` with `infer=True` — was still on
+the vector-probe-only rule that the exact-key lookup had replaced in
+`_upsert_entity`. Both writers now share the same primitives, and the
+single-entity decision lives in one module function that the sync and async
+twins call, because those twins have already diverged on exactly this decision
+once.
+
+### Every uncertain outcome fails closed
+
+Insert uses the deterministic id and REPLACES the payload, so "I don't know"
+that turns into a write is data loss. A store error on the exact lookup skips
+the entity instead of probe-then-insert; more than one row for a key is
+reported, never silently chosen; a saturated lookup limit raises, because a
+bounded `top_k` is consumed before the Python-side scope validation and the
+exact row may have fallen outside it; and `search_batch` must return one LIST
+per query — an entry that is merely iterable yields zero matches and would
+therefore insert.
+
+Batch insert now passes `wait=True` on both twins.
+
+### Batched entity linking on the update path
+
+The update path did one embed per entity, and the embedder's cost is dominated
+by the CALL (~450-590 ms) rather than the item (~12 ms short, ~62 ms at ~1.8k
+chars). `vincular_entidades_em_lote` does one embed, one lookup, one insert.
+
+Measured on the UPDATE branch with the same harness on both sides, 11
+repetitions, warm-up discarded, dispersion max/min 1.1-1.9x, and links re-read
+from the store to confirm the write: **N=2 2.1x, N=4 3.5x, N=8 5.5x, N=16 7.0x**
+(8844 -> 1268 ms). No gain at N=1, as expected. The insert branch is a different
+animal — it pays `wait=True` plus reconciliation — and measuring that one to
+draw conclusions about this one was a real error along the way.
+
+### `embed_batch` is chunked for Ollama
+
+`MEM0_EMBED_MAX_BATCH`, default 256. It was the only provider sending an
+unbounded list. The justification is not what one would assume: there is no
+reachable failure boundary — measured OK at **32768 items in a single request**,
+`ms/item` flat at 20-23, model VRAM constant. The run stopped on a chosen
+wall-time threshold (744 s per call), not on an error.
+
+What the cap limits is call latency and the blast radius of one dead request.
+`ms/item` flattens at ~256 and does not improve above it, so a larger batch buys
+risk for nothing, and chunking costs about 1%.
+
+Counts are validated PER CHUNK: a short chunk compensated by a long one would
+pass a total-only check, and callers match vector to text by POSITION.
+
+### `infer=False` embeds once, not once per message
+
+Discard rules (system role, malformed dict) and per-item failure semantics are
+preserved — one bad embed drops one message, never the batch.
+
 ## v0.13.0
 
 A minor version because ranking constants change value, not because anything new
