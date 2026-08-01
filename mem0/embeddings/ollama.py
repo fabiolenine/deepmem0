@@ -1,9 +1,38 @@
+import logging
+import os
 import subprocess
 import sys
 from typing import Literal, Optional
 
 from mem0.configs.embeddings.base import BaseEmbedderConfig
 from mem0.embeddings.base import EmbeddingBase
+
+logger = logging.getLogger(__name__)
+
+# Teto de itens por requisição ao `/api/embed`.
+#
+# Era o ÚNICO provider sem teto — openai/azure/gemini fatiam em 100, vertexai em
+# 250 — e o motivo aqui NÃO é o que se supõe. MEDIDO contra bge-m3 real
+# (GPU de 8 GB, 01/08/2026): nenhum ponto de quebra até 1024 itens, sem erro, sem
+# timeout, e a VRAM do modelo não cresce com o lote. O que cresce é a LATÊNCIA de
+# uma única chamada — 1024 chunks de ~1,8k chars levaram 63,8 s, contra 16,0 s em
+# 256 — e o RAIO de uma falha: uma requisição que estoura derruba o lote inteiro
+# e joga o chamador no fallback item a item.
+#
+# 256 é onde `ms/item` já estabilizou nos dois perfis medidos (12,0 ms/item em
+# texto curto, 62,7 ms/item em ~1,8k chars), então o teto não custa vazão — ele
+# só limita quanto se perde de uma vez.
+DEFAULT_MAX_BATCH = 256
+
+
+def _max_batch() -> int:
+    """Lido por chamada: um teto que só o processo enxerga no boot é um teto que
+    não dá para ajustar sem restart."""
+    try:
+        n = int(os.environ.get("MEM0_EMBED_MAX_BATCH", DEFAULT_MAX_BATCH))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_BATCH
+    return n if n > 0 else DEFAULT_MAX_BATCH
 
 try:
     from ollama import Client
@@ -65,11 +94,34 @@ class OllamaEmbedding(EmbeddingBase):
         return embeddings[0]
 
     def embed_batch(self, texts, memory_action="add"):
-        """Embed multiple texts in a single Ollama API call."""
+        """Embed multiple texts, chunked at `MEM0_EMBED_MAX_BATCH` per call.
+
+        A ordem de saída acompanha a de entrada: o `/api/embed` do Ollama
+        devolve os vetores na ordem do `input`, e os pedaços são concatenados na
+        ordem em que foram enviados. Isso importa porque o chamador casa vetor
+        com texto por POSIÇÃO — trocar a ordem colaria o embedding de um fato em
+        outro, em silêncio.
+
+        A contagem é conferida POR PEDAÇO, não só no fim: com um único total, um
+        pedaço curto compensado por outro longo passaria, e o desalinhamento
+        seria exatamente o defeito acima.
+        """
         if not texts:
             return []
-        response = self.client.embed(model=self.config.model, input=texts)
-        embeddings = response.get("embeddings") or []
-        if len(embeddings) != len(texts):
-            raise ValueError(f"Ollama embed() returned {len(embeddings)} embeddings for {len(texts)} texts using model '{self.config.model}'")
-        return embeddings
+        limite = _max_batch()
+        todos = []
+        for i in range(0, len(texts), limite):
+            pedaco = texts[i:i + limite]
+            response = self.client.embed(model=self.config.model, input=pedaco)
+            embeddings = response.get("embeddings") or []
+            if len(embeddings) != len(pedaco):
+                raise ValueError(
+                    f"Ollama embed() returned {len(embeddings)} embeddings for "
+                    f"{len(pedaco)} texts (chunk {i}..{i + len(pedaco)} of "
+                    f"{len(texts)}) using model '{self.config.model}'")
+            todos.extend(embeddings)
+        if len(todos) != len(texts):
+            raise ValueError(
+                f"Ollama embed() returned {len(todos)} embeddings for "
+                f"{len(texts)} texts using model '{self.config.model}'")
+        return todos
