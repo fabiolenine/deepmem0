@@ -12,16 +12,21 @@ logger = logging.getLogger(__name__)
 # Teto de itens por requisição ao `/api/embed`.
 #
 # Era o ÚNICO provider sem teto — openai/azure/gemini fatiam em 100, vertexai em
-# 250 — e o motivo aqui NÃO é o que se supõe. MEDIDO contra bge-m3 real
-# (GPU de 8 GB, 01/08/2026): nenhum ponto de quebra até 1024 itens, sem erro, sem
-# timeout, e a VRAM do modelo não cresce com o lote. O que cresce é a LATÊNCIA de
-# uma única chamada — 1024 chunks de ~1,8k chars levaram 63,8 s, contra 16,0 s em
-# 256 — e o RAIO de uma falha: uma requisição que estoura derruba o lote inteiro
-# e joga o chamador no fallback item a item.
+# 250.
 #
-# 256 é onde `ms/item` já estabilizou nos dois perfis medidos (12,0 ms/item em
-# texto curto, 62,7 ms/item em ~1,8k chars), então o teto não custa vazão — ele
-# só limita quanto se perde de uma vez.
+# ⚠️ A justificativa NÃO é prevenir falha, e a medição diz por quê: contra um
+# bge-m3 real (GPU de 8 GB, 01/08/2026) a chamada NÃO falhou em nenhum tamanho
+# tentado — 32768 itens numa única requisição, `ms/item` plano em 20-23 e VRAM do
+# modelo constante. ⚠️ A medição PAROU num limiar de wall-time escolhido por mim
+# (744 s por chamada), não numa falha: portanto o que se pode afirmar é "nenhuma
+# falha ATÉ 32768", não "não há fronteira".
+#
+# O que cresce é a LATÊNCIA de uma chamada (743,6 s em 32768; 63,8 s em 1024 de
+# ~1,8k chars contra 16,0 s em 256) e o RAIO de uma requisição que morre, que
+# derruba o lote inteiro para o fallback item a item do chamador.
+#
+# 256 fica no platô de `ms/item` nos dois perfis medidos (12,0 ms/item em texto
+# curto, 62,7 ms/item em ~1,8k chars), então o teto não custa vazão.
 DEFAULT_MAX_BATCH = 256
 
 

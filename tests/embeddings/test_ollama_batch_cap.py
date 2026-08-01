@@ -1,12 +1,15 @@
 """Teto de lote do `OllamaEmbedding.embed_batch` (P2).
 
 ⚠️ A justificativa NÃO é a que se supõe, e isso é o registro que importa.
-MEDIDO contra o `bge-m3` real (GPU de 8 GB, 01/08/2026): **nenhum ponto de quebra
-até 1024 itens** — sem erro, sem timeout — e a VRAM do modelo não cresce com o
-lote. O teto não previne falha de payload. O que ele limita é:
+MEDIDO contra o `bge-m3` real (GPU de 8 GB, 01/08/2026): **nenhuma falha até
+32768 itens numa única requisição** — sem erro, sem timeout — e a VRAM do modelo
+não cresce com o lote. ⚠️ A medição parou num limiar de wall-time escolhido
+(744 s/chamada), NÃO numa falha; logo o que se afirma é "nenhuma falha até
+32768", não "não existe fronteira". O teto não previne falha de payload. O que
+ele limita é:
 
-* **latência de uma chamada** — 1024 chunks de ~1,8k chars = 63,8 s, contra
-  16,0 s em 256 (um cliente MCP estoura muito antes disso);
+* **latência de uma chamada** — 743,6 s em 32768 itens curtos; 63,8 s em 1024
+  chunks de ~1,8k chars contra 16,0 s em 256 (cliente MCP estoura antes disso);
 * **raio de uma falha** — uma requisição que morre derruba o lote inteiro e joga
   o chamador no fallback item a item.
 
