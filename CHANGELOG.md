@@ -101,9 +101,16 @@ the next startup.
 ### Config
 
 `MEM0_SPEAKER_ATTRIBUTION` (default on) disables the suffix, the write, and the
-scope rule together. Read per call, so a service restart is enough. An
-unrecognized value falls back to ON: a typo must not silently disable a feature
-the operator believes is running.
+write together. Read per call, so a service restart is enough. An unrecognized
+value falls back to ON: a typo must not silently disable a feature the operator
+believes is running.
+
+⚠️ It does NOT disable the ownership-scope rule on update. That rule closes a
+forgery hole that exists independently of attribution — a caller could stamp
+`user_id`/`agent_id`/`run_id`/`actor_id` onto a memory that had none — and a kill
+switch for a feature must not double as a switch that reopens a security fix.
+Turning attribution off leaves the field unwritten; it does not make ownership
+writable again.
 
 ### Measured
 
@@ -126,6 +133,13 @@ once the prompt also carried existing memories. What fixed it was an explicit
 mapping example plus making the field required-when-a-speaker-is-shown. Worth
 recording because the mechanism was already correct at that point — only the
 model's compliance was not, and a suffix the extractor ignores delivers nothing.
+
+⚠️ Coverage is NOT uniform across conversation shapes. In a MIXED conversation
+(one named turn, one anonymous) the measured result is no attribution at all —
+not even for the named speaker's own fact. That is the designed failure
+direction, and it is safe, but it means attribution is close to all-or-nothing:
+name every participant or expect very little. A speaker label on some turns and
+not others is the worst input for this feature, not a partial one.
 
 ⚠️ Existing memories are NOT back-filled. Retroactive attribution would need the
 original messages, which are not kept.

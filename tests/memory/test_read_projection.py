@@ -117,58 +117,65 @@ def _memoria(mocker, cls):
     return _build_memory_instance(mocker, cls)
 
 
-class TestPromocaoChegaAoChamador:
-    """Comportamento, um caso por sítio de leitura.
+#: As SEIS leituras públicas, como dados. Um só teste percorre todas: cobertura
+#: por construção, e um sítio novo (ou removido) muda esta tabela, não some.
+#: São os métodos PÚBLICOS de propósito — testar `_search_vector_store` provaria
+#: a projeção e deixaria de fora a validação de escopo e o over-fetch que o
+#: público envolve, que é justamente por onde um cliente real passa.
+LEITURAS = ["get", "get_all", "search"]
 
-    `get` é público; `_get_all_from_vector_store` e `_search_vector_store` são os
-    métodos onde a projeção de fato mora (os públicos os envolvem com validação
-    de escopo e over-fetch, que não é o que está sob teste aqui).
-    """
 
-    # ---------- sync ----------
-
-    def test_get_sync(self, mocker):
-        mem = _memoria(mocker, Memory)
-        mem.vector_store.get.return_value = _ponto({**BASE, "attributed_to": "user"})
+async def _ler(mem, qual, ponto, assincrono):
+    """Executa a leitura pública `qual` devolvendo um resultado do `ponto`."""
+    if qual == "get":
+        mem.vector_store.get.return_value = ponto
         r = mem.get("mem-1")
-        assert r["attributed_to"] == "user"
-        # `metadata` vem None quando não sobra nada — não ausente.
-        assert "attributed_to" not in (r.get("metadata") or {})
+        return (await r) if assincrono else r
+    if qual == "get_all":
+        mem.vector_store.list.return_value = [[ponto]]
+        r = mem.get_all(filters={"user_id": "U"}, top_k=10)
+        saida = (await r) if assincrono else r
+        return (saida["results"] if isinstance(saida, dict) else saida)[0]
+    mem.vector_store.search.return_value = [ponto]
+    r = mem.search("q", filters={"user_id": "U"}, top_k=10)
+    saida = (await r) if assincrono else r
+    return (saida["results"] if isinstance(saida, dict) else saida)[0]
 
-    def test_get_all_sync(self, mocker):
-        mem = _memoria(mocker, Memory)
-        mem.vector_store.list.return_value = [[_ponto({**BASE, "attributed_to": "document"})]]
-        r = mem._get_all_from_vector_store(filters={"user_id": "U"}, limit=10)
-        assert r[0]["attributed_to"] == "document"
 
-    def test_search_sync(self, mocker):
-        mem = _memoria(mocker, Memory)
-        mem.vector_store.search.return_value = [_ponto({**BASE, "attributed_to": "assistant"})]
-        r = mem._search_vector_store("q", filters={"user_id": "U"}, limit=10)
-        assert r[0]["attributed_to"] == "assistant"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("qual", LEITURAS)
+@pytest.mark.parametrize("cls,assincrono", [(Memory, False), (AsyncMemory, True)],
+                         ids=["sync", "async"])
+@pytest.mark.parametrize("valor", ["user", "assistant", "document"])
+async def test_projecao_publica_devolve_atribuicao(mocker, qual, cls, assincrono, valor):
+    """Os 3 valores REAIS do vocabulário, nas 6 leituras públicas.
 
-    # ---------- async ----------
+    `document` está aqui porque o corpus tem 171 memórias com ele e o contrato do
+    prompt só menciona duas — um teste que cobrisse só `user`/`assistant`
+    documentaria uma ficção.
+    """
+    mem = _memoria(mocker, cls)
+    r = await _ler(mem, qual, _ponto({**BASE, "attributed_to": valor,
+                                      "actor_id": "Maria"}), assincrono)
+    assert r["attributed_to"] == valor
+    assert r["actor_id"] == "Maria"
+    # promovido ao topo E fora do balde `metadata` — nunca nos dois lugares,
+    # senão clientes divergem conforme onde leiam.
+    assert "attributed_to" not in (r.get("metadata") or {})
+    assert "actor_id" not in (r.get("metadata") or {})
 
-    @pytest.mark.asyncio
-    async def test_get_async(self, mocker):
-        mem = _memoria(mocker, AsyncMemory)
-        mem.vector_store.get.return_value = _ponto({**BASE, "attributed_to": "user"})
-        r = await mem.get("mem-1")
-        assert r["attributed_to"] == "user"
 
-    @pytest.mark.asyncio
-    async def test_get_all_async(self, mocker):
-        mem = _memoria(mocker, AsyncMemory)
-        mem.vector_store.list.return_value = [[_ponto({**BASE, "attributed_to": "document"})]]
-        r = await mem._get_all_from_vector_store(filters={"user_id": "U"}, limit=10)
-        assert r[0]["attributed_to"] == "document"
-
-    @pytest.mark.asyncio
-    async def test_search_async(self, mocker):
-        mem = _memoria(mocker, AsyncMemory)
-        mem.vector_store.search.return_value = [_ponto({**BASE, "attributed_to": "assistant"})]
-        r = await mem._search_vector_store("q", filters={"user_id": "U"}, limit=10)
-        assert r[0]["attributed_to"] == "assistant"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("qual", LEITURAS)
+@pytest.mark.parametrize("cls,assincrono", [(Memory, False), (AsyncMemory, True)],
+                         ids=["sync", "async"])
+async def test_projecao_publica_sem_atribuicao_nao_quebra(mocker, qual, cls, assincrono):
+    """Ausência é estado VÁLIDO e permanente: 1218 memórias legadas sem
+    `actor_id`, 139 sem `attributed_to`."""
+    mem = _memoria(mocker, cls)
+    r = await _ler(mem, qual, _ponto(BASE), assincrono)
+    assert "attributed_to" not in r and "actor_id" not in r
+    assert r["memory"] == BASE["data"]
 
 
 class TestMemoriaSemOCampoNaoQuebra:
