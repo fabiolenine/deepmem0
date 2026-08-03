@@ -114,6 +114,18 @@ markers = [
 ]
 addopts = "-m 'not live_model'"
 
+[tool.hatch.metadata]
+# Os extras `nlp-en`/`nlp-pt` apontam para as wheels dos modelos spaCy por URL —
+# eles NÃO estão no PyPI, então não há como declará-los de outra forma. Sem esta
+# autorização o hatch recusa a referência direta e o pacote simplesmente NÃO
+# constrói: `python -m build --wheel` falha com
+# "Dependency #2 of option `nlp-en` ... cannot be a direct reference".
+#
+# Isso passou despercebido porque a instalação de produção é EDITÁVEL (um .pth
+# apontando para a árvore) e nunca precisou empacotar. Instalação editável
+# mascara o que só aparece na hora de distribuir.
+allow-direct-references = true
+
 [tool.hatch.build]
 include = [
     "mem0/**/*.py",
