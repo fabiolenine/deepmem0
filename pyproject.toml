@@ -28,6 +28,12 @@ dependencies = [
 Homepage = "https://github.com/fabiolenine/deepmem0"
 Repository = "https://github.com/fabiolenine/deepmem0"
 
+[project.scripts]
+# A superfície própria do engine. Até aqui a camada-base só era alcançável por
+# outro programa (o servidor MCP) — sem isto, "biblioteca que roda sozinha" era
+# afirmação sem verificação possível.
+deepmem0 = "mem0.cli:main"
+
 [project.optional-dependencies]
 nlp = [
     "spacy>=3.7.0",
