@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+### Extraction failures raise instead of storing nothing
+
+`add` with `infer=True` used to turn every extraction failure into "no new
+facts": the LLM call raising, an empty reply, invalid JSON, and an object
+without the `memory` list all returned `[]`. Measured on 01–06/10/2026 in a
+production queue: **23 of 145 adds** ended "done, no new facts" because the
+model's reply had been cut at the context limit. The input had facts; the
+truncated JSON was read as "nothing to store", and the queue had no way to see
+it.
+
+Extraction now raises `mem0.exceptions.ExtractionError` with a `cause`
+(`llm_call`, `empty`, `unparseable`, `schema`) and a `retryable` flag:
+
+- A provider exception keeps its own `retryable` when it declares one; otherwise
+  it is treated as retryable.
+- A malformed reply is not retryable: at temperature 0 it repeats.
+- `{"memory": []}`, `{}` and `{"memory": null}` still mean "nothing new".
+- An object with content under another key (`{"facts": [...]}`) is a `schema`
+  failure, because that content used to vanish.
+
+Neither the message nor `details` carries the reply text.
+
+`MEM0_EXTRACTION_ERRORS=swallow` restores the upstream behaviour. Any other
+value, typos included, keeps the strict default.
+
+### Gemini: explicit controls, usage, and no silent `""`
+
+`GeminiConfig` gained `thinking_level`, `thinking_budget`, `safety_threshold`
+(applied to the four standard harm categories), `timeout_s`, and
+`http_retry_attempts`. Each one is sent only when set.
+
+Every response now records `usage_metadata` in `last_usage` and notifies the
+listeners registered with `mem0.llms.gemini.add_usage_listener`. Blocked and
+truncated responses are reported too, because they are billed.
+
+Some responses are not usable completions:
+
+- a prompt blocked before generation;
+- a finish reason other than `STOP` (`MAX_TOKENS`, `SAFETY`, `RECITATION`, …);
+- no candidates at all.
+
+These raise `mem0.exceptions.LLMResponseError` with `kind`, `reason`, and
+`retryable`, instead of returning `""`.
+
+SDK HTTP errors are tagged `retryable`: true for 408, 429, and 5xx; false for
+other 4xx.
+
+### Reranker: Vertex AI Ranking API (`vertex_ranking`)
+
+REST over Application Default Credentials, with a 3 s timeout. It raises on HTTP
+errors and when a candidate is missing from the reply, instead of writing
+`0.0`.
+
+- **Scores.** Scores fall in [0, 1]. A record that comes back without a score
+  field scored 0.0, because proto3 JSON omits zero.
+- **Absolute score, measured live.** A record scores the same alone, with its
+  peers, among 25 distractors, and in reversed order (max |Δ| 0.0). That is why
+  pools larger than the API limit of 200 can be split across requests.
+- ⚠️ **Quantization.** Scores come in 4-decimal steps. A tie band of 0.008
+  swallows a whole group of near-duplicates.
+- ⚠️ **Axis.** A relevant record can score anywhere from 0.25 to 0.9, so the
+  constants calibrated on bge-reranker-v2-m3 do not carry over.
+
 ## v0.15.0
 
 Speaker attribution: **who said this**, per extracted fact. A minor version
