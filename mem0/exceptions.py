@@ -363,6 +363,68 @@ class LLMError(MemoryError):
         super().__init__(message, error_code, details, suggestion, debug_info)
 
 
+class ExtractionError(LLMError):
+    """DeepMem0: fact extraction produced no usable answer.
+
+    Upstream ``add`` turns every extraction failure into "no new facts": the LLM
+    call raising, an empty reply, a reply that is not JSON, and a JSON object
+    without the ``memory`` list all return ``[]``. The caller cannot tell any of
+    them from a model that judged the input redundant, so facts are lost with a
+    log line at most. Measured on 01-06/10/2026: 23 of 145 queued adds ended
+    "done, no new facts" after a runaway generation was cut at the context
+    limit -- the input had facts; the reply was truncated JSON.
+
+    ``cause`` says which of the four it was, and ``retryable`` tells a queue
+    whether trying again can help: a provider hiccup can, a deterministic
+    malformed reply (temperature 0) cannot, and retrying it only delays the
+    dead-letter that makes it visible. Neither the message nor ``details``
+    carries the reply text, which is user content.
+    """
+
+    CAUSES = ("llm_call", "empty", "unparseable", "schema")
+
+    def __init__(self, cause: str, *, retryable: bool, details: dict = None):
+        if cause not in self.CAUSES:
+            raise ValueError(f"unknown extraction failure cause: {cause!r}")
+        self.cause = cause
+        self.retryable = retryable
+        super().__init__(
+            message=f"fact extraction failed ({cause})",
+            error_code=f"LLM_EXTRACT_{cause.upper()}",
+            details=details,
+            suggestion=("Retry later; the LLM provider failed." if retryable else
+                        "The model's reply was not usable; see the cause and the provider logs."),
+        )
+
+
+class LLMResponseError(LLMError):
+    """DeepMem0: the provider answered, but not with a usable completion.
+
+    A safety block, a prompt rejected before generation, a completion cut at the
+    output limit: upstream providers returned ``""`` for these, which the
+    extraction parser then read as "no new facts". ``kind`` names the failure,
+    ``reason`` carries the provider's own code (e.g. ``SAFETY``, ``MAX_TOKENS``),
+    and ``retryable`` says whether the same request can succeed later -- a block
+    or a truncation is deterministic for the same input, so retrying only delays
+    the dead-letter that makes it visible.
+    """
+
+    KINDS = ("prompt_blocked", "blocked", "truncated", "no_candidates")
+
+    def __init__(self, provider: str, kind: str, reason: str = "", *, retryable: bool):
+        if kind not in self.KINDS:
+            raise ValueError(f"unknown LLM response failure kind: {kind!r}")
+        self.provider = provider
+        self.kind = kind
+        self.reason = reason
+        self.retryable = retryable
+        super().__init__(
+            message=f"{provider} returned no usable completion ({kind}{': ' + reason if reason else ''})",
+            error_code=f"LLM_RESPONSE_{kind.upper()}",
+            details={"provider": provider, "kind": kind, "reason": reason},
+        )
+
+
 class DatabaseError(MemoryError):
     """Raised when database operations fail.
     

@@ -1,15 +1,64 @@
+import logging
 import os
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 try:
     from google import genai
+    from google.genai import errors as genai_errors
     from google.genai import types
 except ImportError:
     raise ImportError("The 'google-genai' library is required. Please install it using 'pip install google-genai'.")
 
 from mem0.configs.llms.base import BaseLlmConfig
 from mem0.configs.llms.gemini import GeminiConfig
+from mem0.exceptions import LLMResponseError
 from mem0.llms.base import LLMBase
+
+logger = logging.getLogger(__name__)
+
+#: DeepMem0: called as fn(model, usage) after every response, including blocked
+#: or truncated ones -- those tokens are billed too. A daily cost cap built on
+#: this must see every call, so a listener error is logged, never raised.
+_USAGE_LISTENERS: List[Callable[[str, Dict[str, int]], None]] = []
+
+_USAGE_FIELDS = ("prompt_token_count", "candidates_token_count", "thoughts_token_count",
+                 "cached_content_token_count", "total_token_count")
+
+_SAFETY_CATEGORIES = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                      "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
+
+
+def add_usage_listener(fn: Callable[[str, Dict[str, int]], None]) -> None:
+    if fn not in _USAGE_LISTENERS:
+        _USAGE_LISTENERS.append(fn)
+
+
+def remove_usage_listener(fn: Callable[[str, Dict[str, int]], None]) -> None:
+    if fn in _USAGE_LISTENERS:
+        _USAGE_LISTENERS.remove(fn)
+
+
+def _usage_dict(usage) -> Dict[str, int]:
+    out = {}
+    for name in _USAGE_FIELDS:
+        value = getattr(usage, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[name] = value
+    return out
+
+
+def _enum_name(value) -> Optional[str]:
+    """Name of a google.genai enum, or of the raw string the SDK keeps for a value it does not know."""
+    if value is None:
+        return None
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    return value if isinstance(value, str) else None
+
+
+def _http_retryable(code) -> bool:
+    return isinstance(code, int) and (code in (408, 429) or code >= 500)
 
 
 class GeminiLLM(LLMBase):
@@ -36,11 +85,60 @@ class GeminiLLM(LLMBase):
         if not self.config.model:
             self.config.model = "gemini-2.0-flash"
 
+        self.last_usage: Dict[str, int] = {}
+        http_options = self._http_options()
+        client_kwargs = {"http_options": http_options} if http_options is not None else {}
         if self.config.vertexai:
-            self.client = genai.Client(vertexai=True, project=self.config.project, location=self.config.location)
+            self.client = genai.Client(
+                vertexai=True, project=self.config.project, location=self.config.location, **client_kwargs
+            )
         else:
             api_key = self.config.api_key or os.getenv("GOOGLE_API_KEY")
-            self.client = genai.Client(api_key=api_key)
+            self.client = genai.Client(api_key=api_key, **client_kwargs)
+
+    def _http_options(self):
+        timeout_s = getattr(self.config, "timeout_s", None)
+        attempts = getattr(self.config, "http_retry_attempts", None)
+        if timeout_s is None and attempts is None:
+            return None
+        kwargs = {}
+        if timeout_s is not None:
+            kwargs["timeout"] = int(timeout_s * 1000)  # the SDK takes milliseconds
+        if attempts is not None:
+            kwargs["retry_options"] = types.HttpRetryOptions(attempts=attempts)
+        return types.HttpOptions(**kwargs)
+
+    def _record_usage(self, response) -> None:
+        self.last_usage = _usage_dict(getattr(response, "usage_metadata", None))
+        for fn in list(_USAGE_LISTENERS):
+            try:
+                fn(self.config.model, dict(self.last_usage))
+            except Exception as exc:  # a broken listener must not fail the call
+                logger.warning("Gemini usage listener %r failed: %s", fn, exc)
+
+    @staticmethod
+    def _check_complete(response) -> None:
+        """Raise LLMResponseError unless the response carries a finished completion.
+
+        Upstream returned "" for a blocked or empty response, and the extraction
+        parser read "" as "no new facts". Only STOP (or no reason at all, from
+        an SDK or a mock that does not set it) counts as finished.
+        """
+        feedback = getattr(response, "prompt_feedback", None)
+        block = _enum_name(getattr(feedback, "block_reason", None)) if feedback is not None else None
+        if block and block != "BLOCKED_REASON_UNSPECIFIED":
+            raise LLMResponseError("gemini", "prompt_blocked", block, retryable=False)
+        candidates = getattr(response, "candidates", None)
+        if isinstance(candidates, (list, tuple)) and not candidates:
+            raise LLMResponseError("gemini", "no_candidates", retryable=True)
+        if not candidates:
+            return
+        finish = _enum_name(getattr(candidates[0], "finish_reason", None))
+        if finish in (None, "STOP", "FINISH_REASON_UNSPECIFIED"):
+            return
+        if finish == "MAX_TOKENS":
+            raise LLMResponseError("gemini", "truncated", finish, retryable=False)
+        raise LLMResponseError("gemini", "blocked", finish, retryable=False)
 
     def _parse_response(self, response, tools):
         """
@@ -187,6 +285,18 @@ class GeminiLLM(LLMBase):
             config_params["max_output_tokens"] = self.config.max_tokens
         if self.config.top_p is not None:
             config_params["top_p"] = self.config.top_p
+        thinking_level = getattr(self.config, "thinking_level", None)
+        thinking_budget = getattr(self.config, "thinking_budget", None)
+        if thinking_level is not None or thinking_budget is not None:
+            config_params["thinking_config"] = types.ThinkingConfig(
+                thinking_level=thinking_level, thinking_budget=thinking_budget
+            )
+        safety_threshold = getattr(self.config, "safety_threshold", None)
+        if safety_threshold is not None:
+            config_params["safety_settings"] = [
+                types.SafetySetting(category=category, threshold=safety_threshold)
+                for category in _SAFETY_CATEGORIES
+            ]
 
         # Add system instruction to config if present
         if system_instruction:
@@ -221,8 +331,15 @@ class GeminiLLM(LLMBase):
 
         generation_config = types.GenerateContentConfig(**config_params)
 
-        response = self.client.models.generate_content(
-            model=self.config.model, contents=contents, config=generation_config
-        )
+        try:
+            response = self.client.models.generate_content(
+                model=self.config.model, contents=contents, config=generation_config
+            )
+        except genai_errors.APIError as exc:
+            # Tag for the caller's queue: 408/429/5xx can succeed later, a 4xx cannot.
+            exc.retryable = _http_retryable(getattr(exc, "code", None))
+            raise
 
+        self._record_usage(response)
+        self._check_complete(response)
         return self._parse_response(response, tools)

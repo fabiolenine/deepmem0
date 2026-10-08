@@ -27,6 +27,12 @@ class GeminiConfig(BaseLlmConfig):
         vertexai: Optional[bool] = None,
         project: Optional[str] = None,
         location: Optional[str] = None,
+        # DeepMem0: explicit generation controls (None = provider default)
+        thinking_level: Optional[str] = None,
+        thinking_budget: Optional[int] = None,
+        safety_threshold: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        http_retry_attempts: Optional[int] = None,
     ):
         """
         Initialize Gemini configuration.
@@ -44,6 +50,14 @@ class GeminiConfig(BaseLlmConfig):
             vertexai: Whether to use Vertex AI backend. If None, checks GOOGLE_GENAI_USE_VERTEXAI env var.
             project: GCP project ID for Vertex AI. If None, checks GOOGLE_CLOUD_PROJECT env var.
             location: GCP location for Vertex AI. If None, checks GOOGLE_CLOUD_LOCATION env var.
+            thinking_level: Gemini 3 thinking level (MINIMAL, LOW, MEDIUM, HIGH). None = model default.
+            thinking_budget: Gemini 2.5 thinking token budget (0 disables). None = model default.
+            safety_threshold: one HarmBlockThreshold (e.g. OFF, BLOCK_NONE, BLOCK_ONLY_HIGH) applied to the
+                harassment, hate, sexual and dangerous categories. None = provider default -- which
+                changes between model generations, so a pipeline that must be reproducible sets it.
+            timeout_s: per-request timeout in seconds. None = SDK default.
+            http_retry_attempts: SDK-level attempts per request. None = SDK default; 1 leaves retrying
+                to the caller (a queue that already backs off should not stack a second retry loop).
         """
         super().__init__(
             model=model,
@@ -62,3 +76,8 @@ class GeminiConfig(BaseLlmConfig):
         self.vertexai = vertexai
         self.project = project or os.getenv("GOOGLE_CLOUD_PROJECT")
         self.location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        self.thinking_level = thinking_level
+        self.thinking_budget = thinking_budget
+        self.safety_threshold = safety_threshold
+        self.timeout_s = timeout_s
+        self.http_retry_attempts = http_retry_attempts

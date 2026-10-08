@@ -189,6 +189,58 @@ def speaker_attribution_enabled() -> bool:
             not in ("0", "false", "no", "off"))
 
 
+def extraction_errors_swallowed() -> bool:
+    """Kill switch: `MEM0_EXTRACTION_ERRORS=swallow` restores upstream behaviour.
+
+    Default is to RAISE `ExtractionError` when extraction yields no usable answer
+    (see its docstring for why "no new facts" was the wrong answer). Read on every
+    call, like `MEM0_SPEAKER_ATTRIBUTION`, so an operator can flip it with a
+    restart. Only the exact value "swallow" disables it: a typo falls back to the
+    strict default instead of silently re-opening the loss.
+    """
+    import os
+    return os.environ.get("MEM0_EXTRACTION_ERRORS", "").strip().lower() == "swallow"
+
+
+def parse_extraction_response(response):
+    """Facts list from the extraction reply, or `ExtractionError`.
+
+    `{"memory": []}`, `{}` and `{"memory": null}` are a legitimate "nothing new"
+    and return `[]`. An empty reply, a reply that is not JSON even after
+    `extract_json`, and a JSON value that is anything else (another key, a bare
+    list, a non-list `memory`) are failures: the model did not answer the
+    question, so the input's facts are unknown, not absent.
+    """
+    import json
+    from mem0.exceptions import ExtractionError
+
+    text = remove_code_blocks(response) if isinstance(response, str) else None
+    if not text or not text.strip():
+        raise ExtractionError("empty", retryable=False,
+                              details={"reply_type": type(response).__name__})
+    try:
+        data = json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(extract_json(text), strict=False)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ExtractionError("unparseable", retryable=False,
+                                  details={"reply_chars": len(text), "error": type(exc).__name__}) from exc
+    # `{}` and `{"memory": null}` say "nothing": an empty object cannot hide
+    # facts (truncation yields invalid JSON, not `{}`). What CAN hide them is an
+    # object with content under another key (`{"facts": [...]}`) -- that is the
+    # schema failure upstream read as "no new facts".
+    if isinstance(data, dict) and (data == {} or ("memory" in data and data["memory"] is None)):
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("memory"), list):
+        # key COUNT, not names: a model can put content in a key
+        raise ExtractionError("schema", retryable=False, details={
+            "reply_chars": len(text),
+            "n_keys": len(data) if isinstance(data, dict) else None,
+            "reply_type": type(data).__name__})
+    return data["memory"]
+
+
 def precisa_de_atribuicao_por_llm(rotulos, uniforme) -> bool:
     """Há locutor a decidir que o código sozinho não decide?
 

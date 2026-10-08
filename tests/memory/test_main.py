@@ -47,8 +47,13 @@ class TestAddToVectorStoreErrors:
 
         return memory
 
-    def test_empty_llm_response_fact_extraction(self, mocker, mock_memory, caplog):
-        """Test invalid JSON response from LLM during extraction"""
+    def test_empty_llm_response_fact_extraction(self, mocker, mock_memory, caplog, monkeypatch):
+        """Invalid JSON during extraction, under the kill switch (upstream behaviour).
+
+        DeepMem0 raises ExtractionError by default (tests/memory/test_extraction_errors.py);
+        MEM0_EXTRACTION_ERRORS=swallow is the contract that keeps this assertion true.
+        """
+        monkeypatch.setenv("MEM0_EXTRACTION_ERRORS", "swallow")
         # Setup
         mock_memory.llm.generate_response.return_value = "invalid json"
         mocker.patch("mem0.memory.main.capture_event")
@@ -64,8 +69,9 @@ class TestAddToVectorStoreErrors:
         assert result == []
         assert any("Error parsing extraction response" in record.message for record in caplog.records), "Expected error message not found in logs"
 
-    def test_empty_llm_response_memory_actions(self, mock_memory, caplog):
-        """Test empty response from LLM during memory actions (v3: single-pass, 1 LLM call)"""
+    def test_empty_llm_response_memory_actions(self, mock_memory, caplog, monkeypatch):
+        """Empty reply, under the kill switch (upstream behaviour; see the test above)."""
+        monkeypatch.setenv("MEM0_EXTRACTION_ERRORS", "swallow")
         # Setup — v3 pipeline does a single LLM call that returns empty/invalid response
         mock_memory.llm.generate_response.return_value = ""
 
@@ -188,8 +194,9 @@ class TestAsyncAddToVectorStoreErrors:
         return memory
 
     @pytest.mark.asyncio
-    async def test_async_empty_llm_response_fact_extraction(self, mock_async_memory, caplog, mocker):
-        """Test invalid JSON response from LLM during extraction (async)"""
+    async def test_async_empty_llm_response_fact_extraction(self, mock_async_memory, caplog, mocker, monkeypatch):
+        """Invalid JSON during extraction (async), under the kill switch (upstream behaviour)."""
+        monkeypatch.setenv("MEM0_EXTRACTION_ERRORS", "swallow")
         mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=MagicMock())
         mock_async_memory.llm.generate_response.return_value = "invalid json"
         mocker.patch("mem0.memory.main.capture_event")
@@ -203,8 +210,9 @@ class TestAsyncAddToVectorStoreErrors:
         assert any("Error parsing extraction response" in record.message for record in caplog.records), "Expected error message not found in logs"
 
     @pytest.mark.asyncio
-    async def test_async_empty_llm_response_memory_actions(self, mock_async_memory, caplog, mocker):
-        """Test empty response in AsyncMemory._add_to_vector_store (v3: single-pass, 1 LLM call)"""
+    async def test_async_empty_llm_response_memory_actions(self, mock_async_memory, caplog, mocker, monkeypatch):
+        """Empty reply (async), under the kill switch (upstream behaviour)."""
+        monkeypatch.setenv("MEM0_EXTRACTION_ERRORS", "swallow")
         mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=MagicMock())
         mock_async_memory.llm.generate_response.return_value = ""
         mock_capture_event = mocker.MagicMock()

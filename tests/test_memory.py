@@ -316,9 +316,12 @@ def test_add_infer_with_malformed_llm_facts(mock_sqlite, mock_llm_factory, mock_
     mock_vector_store.search.return_value = []
     mock_vector_factory.return_value = mock_vector_store
 
-    # LLM returns malformed facts: dicts instead of strings
+    # LLM returns malformed facts: dicts instead of strings.
+    # DeepMem0: under the v3 additive pipeline the reply key is "memory"; the
+    # legacy "facts" key made this test pass by extracting NOTHING, so the
+    # malformed items were never exercised (and now it is a schema error).
     malformed_response = json.dumps({
-        "facts": [
+        "memory": [
             {"fact": "User likes Python"},
             {"text": "User is a developer"},
         ]

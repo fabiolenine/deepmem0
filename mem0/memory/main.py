@@ -31,6 +31,7 @@ from mem0.configs.prompts import (
     build_temporality_suffix,
     generate_additive_extraction_prompt,
 )
+from mem0.exceptions import ExtractionError
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from mem0.memory.base import MemoryBase
 from mem0.memory.setup import mem0_dir, setup_config
@@ -69,11 +70,13 @@ from mem0.memory.utils import (
     normalize_scope_id,
     normalize_speaker_label,
     extract_json,
+    extraction_errors_swallowed,
     normalize_linked_memory_ids,
     parse_messages,
     parse_vision_messages,
     precisa_de_atribuicao_por_llm,
     process_telemetry_filters,
+    parse_extraction_response,
     remove_code_blocks,
     resolver_locutor_do_fato,
     speaker_attribution_enabled,
@@ -2642,6 +2645,10 @@ class Memory(MemoryBase):
             use_input_language=(getattr(self.config, "language", "en") != "en"),
         )
 
+        # DeepMem0: a failed extraction RAISES (ExtractionError) instead of
+        # returning [] -- "no new facts" was indistinguishable from "the model
+        # never answered". MEM0_EXTRACTION_ERRORS=swallow restores upstream.
+        swallow = extraction_errors_swallowed()
         try:
             response = self.llm.generate_response(
                 messages=[
@@ -2651,21 +2658,18 @@ class Memory(MemoryBase):
                 response_format={"type": "json_object"},
             )
         except Exception as e:
+            if not swallow:
+                raise ExtractionError("llm_call", retryable=getattr(e, "retryable", True),
+                                      details={"error": type(e).__name__}) from e
             logger.error(f"LLM extraction failed: {e}")
             return []
 
         # Parse response
         try:
-            response = remove_code_blocks(response)
-            if not response or not response.strip():
-                extracted_memories = []
-            else:
-                try:
-                    extracted_memories = json.loads(response, strict=False).get("memory", [])
-                except json.JSONDecodeError:
-                    extracted_json = extract_json(response)
-                    extracted_memories = json.loads(extracted_json, strict=False).get("memory", [])
-        except Exception as e:
+            extracted_memories = parse_extraction_response(response)
+        except ExtractionError as e:
+            if not swallow:
+                raise
             logger.error(f"Error parsing extraction response: {e}")
             extracted_memories = []
 
@@ -5031,6 +5035,10 @@ class AsyncMemory(MemoryBase):
             use_input_language=(getattr(self.config, "language", "en") != "en"),
         )
 
+        # DeepMem0: a failed extraction RAISES (ExtractionError) instead of
+        # returning [] -- "no new facts" was indistinguishable from "the model
+        # never answered". MEM0_EXTRACTION_ERRORS=swallow restores upstream.
+        swallow = extraction_errors_swallowed()
         try:
             response = await asyncio.to_thread(
                 self.llm.generate_response,
@@ -5041,21 +5049,18 @@ class AsyncMemory(MemoryBase):
                 response_format={"type": "json_object"},
             )
         except Exception as e:
+            if not swallow:
+                raise ExtractionError("llm_call", retryable=getattr(e, "retryable", True),
+                                      details={"error": type(e).__name__}) from e
             logger.error(f"LLM extraction failed (async): {e}")
             return []
 
         # Parse response
         try:
-            response = remove_code_blocks(response)
-            if not response or not response.strip():
-                extracted_memories = []
-            else:
-                try:
-                    extracted_memories = json.loads(response, strict=False).get("memory", [])
-                except json.JSONDecodeError:
-                    extracted_json = extract_json(response)
-                    extracted_memories = json.loads(extracted_json, strict=False).get("memory", [])
-        except Exception as e:
+            extracted_memories = parse_extraction_response(response)
+        except ExtractionError as e:
+            if not swallow:
+                raise
             logger.error(f"Error parsing extraction response (async): {e}")
             extracted_memories = []
 

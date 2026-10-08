@@ -7,6 +7,7 @@ from .cohere_reranker import CohereReranker
 from .huggingface_reranker import HuggingFaceReranker
 from .llm_reranker import LLMReranker
 from .sentence_transformer_reranker import SentenceTransformerReranker
+from .vertex_ranking_reranker import VertexRankingReranker
 from .zero_entropy_reranker import ZeroEntropyReranker
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "HuggingFaceReranker",
     "LLMReranker",
     "SentenceTransformerReranker",
+    "VertexRankingReranker",
     "ZeroEntropyReranker",
 ]
